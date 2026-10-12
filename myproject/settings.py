@@ -99,14 +99,14 @@ ASGI_APPLICATION = 'myproject.asgi.application'
 
 # Database Configuration
 
+import dj_database_url
+import os
+
 DATABASES = {
     'default': dj_database_url.config(
-        default=os.environ.get(
-            'DATABASE_URL',
-            'postgres://postgres:Thaguru@8876@localhost:5432/retail_management'
-        ),
+        default='postgres://postgres:Thaguru@8876@localhost:5432/retail_management',
         conn_max_age=600,
-        conn_health_checks=True,
+        ssl_require=False if os.environ.get('DEBUG') == 'True' else True
     )
 }
 
