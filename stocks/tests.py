@@ -1,0 +1,95 @@
+from django.test import TestCase
+
+# Create your tests here.
+from stocks.models import Item  # Replace 'your_app' with your actual Django app name
+
+items_data = [
+    { 'name': 'Foam sheet 1MD', 'unit_cost_price': '509.00', 'unit_retail_price': '600.00' },
+    { 'name': 'Foam sheet 2MD', 'unit_cost_price': '1018.00', 'unit_retail_price': '1150.00' },
+    { 'name': 'Foam sheet 3MD', 'unit_cost_price': '1518.00', 'unit_retail_price': '1100.00' },
+    { 'name': 'Foam sheet 1.5MD', 'unit_cost_price': '759.00', 'unit_retail_price': '1100.00' },
+    { 'name': 'Foam sheet 4MD', 'unit_cost_price': '2036.00', 'unit_retail_price': '1100.00' },
+    { 'name': 'Foam sheet 1/4STD', 'unit_cost_price': '120.00', 'unit_retail_price': '160.00' },
+    { 'name': 'Foam sheet 1/2STD', 'unit_cost_price': '161.00', 'unit_retail_price': '200.00' },
+    { 'name': 'Foam sheet 1STD', 'unit_cost_price': '321.00', 'unit_retail_price': '400.00' },
+    { 'name': 'Foam sheet 2STD', 'unit_cost_price': '642.00', 'unit_retail_price': '800.00' },
+    { 'name': 'Foam sheet 3STD', 'unit_cost_price': '963.00', 'unit_retail_price': '1100.00' },
+    { 'name': 'Foam sheet 4STD', 'unit_cost_price': '1283.00', 'unit_retail_price': '1500.00' },
+    { 'name': 'Foam sheet 1.5 pink', 'unit_cost_price': '765.00', 'unit_retail_price': '900.00' },
+    { 'name': 'Foam sheet 1 pink', 'unit_cost_price': '510.00', 'unit_retail_price': '600.00' },
+    { 'name': 'Foam sheet 2 pink', 'unit_cost_price': '1020.00', 'unit_retail_price': '600.00' },
+    { 'name': 'Foam Sheet 1 bonded"', 'unit_cost_price': '700.00', 'unit_retail_price': '880.00' },
+    { 'name': 'Foam Sheet 2 bonded"', 'unit_cost_price': '1400.00', 'unit_retail_price': '1880.00' },
+    { 'name': 'Foam Sheet 3 bonded"', 'unit_cost_price': '2100.00', 'unit_retail_price': '1880.00' },
+    { 'name': 'Pink cushion 27*5', 'unit_cost_price': '435.00', 'unit_retail_price': '550.00' },
+    { 'name': 'Pink cushion 20*4', 'unit_cost_price': '259.00', 'unit_retail_price': '350.00' },
+    { 'name': 'Reacon 20*3.5', 'unit_cost_price': '300.00', 'unit_retail_price': '400.00' },
+    { 'name': 'Reacon 20*4', 'unit_cost_price': '320.00', 'unit_retail_price': '400.00' },
+    { 'name': 'Reacon 20*5', 'unit_cost_price': '425.00', 'unit_retail_price': '500.00' },
+    { 'name': 'Reacon 22*5', 'unit_cost_price': '465.00', 'unit_retail_price': '550.00' },
+    { 'name': 'Reacon 22*6', 'unit_cost_price': '567.00', 'unit_retail_price': '650.00' },
+    { 'name': 'Reacon 22*4', 'unit_cost_price': '361.00', 'unit_retail_price': '500.00' },
+    { 'name': 'Reacon 27*4', 'unit_cost_price': '445.00', 'unit_retail_price': '550.00' },
+    { 'name': 'Reacon 20*6', 'unit_cost_price': '550.00', 'unit_retail_price': '600.00' },
+    { 'name': 'Reacon 27*5', 'unit_cost_price': '567.00', 'unit_retail_price': '630.00' },
+    { 'name': 'Reacon 27*6', 'unit_cost_price': '670.00', 'unit_retail_price': '730.00' },
+    { 'name': 'Conta 250ml', 'unit_cost_price': '120.00', 'unit_retail_price': '160.00' },
+    { 'name': 'Conta 500ml', 'unit_cost_price': '220.00', 'unit_retail_price': '200.00' },
+    { 'name': 'Conta 1l', 'unit_cost_price': '380.00', 'unit_retail_price': '450.00' },
+    { 'name': 'Conta 2.5l', 'unit_cost_price': '800.00', 'unit_retail_price': '900.00' },
+    { 'name': 'Conta 5l', 'unit_cost_price': '1600.00', 'unit_retail_price': '1700.00' },
+    { 'name': 'Tacknails/packet', 'unit_cost_price': '93.00', 'unit_retail_price': '120.00' },
+    { 'name': 'Tacknails/carton', 'unit_cost_price': '5200.00', 'unit_retail_price': '120.00' },
+    { 'name': 'Foamchips/bag', 'unit_cost_price': '1170.00', 'unit_retail_price': '1250.00' },
+    { 'name': 'Small pipping/roll', 'unit_cost_price': '2500.00', 'unit_retail_price': '200.00' },
+    { 'name': 'Big pipping/roll', 'unit_cost_price': '2800.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Fiber/bag', 'unit_cost_price': '730.00', 'unit_retail_price': '800.00' },
+    { 'name': 'Spring 20*4', 'unit_cost_price': '440.00', 'unit_retail_price': '500.00' },
+    { 'name': 'Spring 22*4', 'unit_cost_price': '480.00', 'unit_retail_price': '550.00' },
+    { 'name': 'Spring 27*4', 'unit_cost_price': '590.00', 'unit_retail_price': '730.00' },
+    { 'name': 'Blacklining/roll', 'unit_cost_price': '1500.00', 'unit_retail_price': '1600.00' },
+    { 'name': 'Blacklining/meter', 'unit_cost_price': '25.00', 'unit_retail_price': '1600.00' },
+    { 'name': 'Webbing dacron/roll', 'unit_cost_price': '2500.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Webbing/meter', 'unit_cost_price': '250.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Webbing 100 meters', 'unit_cost_price': '2500.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Webbing 50 meters', 'unit_cost_price': '1080.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Shrink Film/roll', 'unit_cost_price': '1480.00', 'unit_retail_price': '3000.00' },
+    { 'name': '1 inch Gold Reaping', 'unit_cost_price': '2500.00', 'unit_retail_price': '3000.00' },
+    { 'name': '3/4 inch Gold Reaping', 'unit_cost_price': '2200.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Band Saw 101', 'unit_cost_price': '1500.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Band Saw 98', 'unit_cost_price': '1500.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Band Saw 94', 'unit_cost_price': '1500.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Tack Hammer', 'unit_cost_price': '350.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Big Cotton Code', 'unit_cost_price': '350.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Medium Cotton Code', 'unit_cost_price': '120.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Small Cotton Code', 'unit_cost_price': '100.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Hydraulic Mapha', 'unit_cost_price': '80.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Check Gold Stand', 'unit_cost_price': '180.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Gucci Deco Wallpaper', 'unit_cost_price': '450.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Gold Cups', 'unit_cost_price': '2500.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Gold Chrome', 'unit_cost_price': '200.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Gold Coccus', 'unit_cost_price': '400.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Silver Coccus', 'unit_cost_price': '400.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Ground Small Face', 'unit_cost_price': '300.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Zip Roll', 'unit_cost_price': '1800.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Mabati Buttons/packet', 'unit_cost_price': '750.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Uzi Hooking', 'unit_cost_price': '250.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Hacksaw Blade', 'unit_cost_price': '120.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Foot Pin/packet', 'unit_cost_price': '2000.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Rip Paper/roll', 'unit_cost_price': '7500.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Small Hooking Needle', 'unit_cost_price': '50.00', 'unit_retail_price': '3000.00' },
+    { 'name': 'Uzi Cherehani', 'unit_cost_price': '130.00', 'unit_retail_price': '3000.00' }
+]
+
+items_to_create = [
+    Item(
+        name=data['name'],
+        unit_cost_price=data['unit_cost_price'],
+        unit_retail_price=data['unit_retail_price'],
+        opening_stock=0  # Default initial stock
+    )
+    for data in items_data
+]
+
+Item.objects.bulk_create(items_to_create, ignore_conflicts=True)
+print("Successfully inserted all items into the database!")

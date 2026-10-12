@@ -1,0 +1,49 @@
+{% extends "admin/base_site.html" %}
+{% load i18n l10n admin_urls %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; <a href="{% url opts|admin_urlname:'changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+&rsaquo; Select Branch
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <form action="" method="post">
+        {% csrf_token %}
+        <p>You have selected the following <strong>{{ items.count }}</strong> item(s):</p>
+        
+        <ul>
+            {% for item in items %}
+                <li>
+                    <strong>{{ item.name }}</strong> (SKU: {{ item.sku|default:"N/A" }})
+                    <input type="hidden" name="{{ action_checkbox_name }}" value="{{ item.pk }}" />
+                </li>
+            {% endfor %}
+        </ul>
+
+        <div class="form-row" style="margin: 20px 0; padding: 15px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 4px;">
+            <label for="branch_select" style="font-weight: bold; display: block; margin-bottom: 8px;">
+                Target Branch:
+            </label>
+            <select name="branch" id="branch_select" required style="padding: 6px 12px; min-width: 250px;">
+                <option value="">-- Choose a Branch --</option>
+                {% for branch in branches %}
+                    <option value="{{ branch.id }}">{{ branch.name }} ({{ branch.location }})</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <input type="hidden" name="action" value="bulk_add_to_branch" />
+        <input type="hidden" name="apply" value="1" />
+
+        <div>
+            <input type="submit" value="Add Items to Branch" class="default" style="background: #417690; color: #fff; padding: 10px 15px; border: none; cursor: pointer; border-radius: 4px;" />
+            <a href="{% url opts|admin_urlname:'changelist' %}" class="button cancel-link" style="margin-left: 10px; padding: 10px 15px; background: #ccc; color: #333; text-decoration: none; border-radius: 4px;">Cancel</a>
+        </div>
+    </form>
+</div>
+{% endblock %}
