@@ -2529,7 +2529,7 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
-    
+
 
     def get_queryset(self):
         """
@@ -2854,6 +2854,33 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
 # CASHBOOK
 
+def _authenticated_user(request):
+    return (
+        request.user
+        if getattr(request, "user", None) and request.user.is_authenticated
+        else None
+    )
+
+
+def _parse_business_date(date_str):
+    if not date_str:
+        return timezone.localdate()
+    try:
+        return datetime.strptime(str(date_str).split("T")[0], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return timezone.localdate()
+
+
+def _resolve_branch(branch_param):
+    if not branch_param:
+        return None
+    from stocks.models import RetailBranch
+
+    if str(branch_param).isdigit():
+        return RetailBranch.objects.filter(id=branch_param).first()
+    return RetailBranch.objects.filter(name=branch_param).first()
+
+
 class CashbookViewSet(viewsets.ViewSet):
     """ViewSet for managing and viewing cashbook entries, balancing cash in hand,
     and reconciling daily/monthly aggregated inflows and outflows per branch.
@@ -2920,31 +2947,14 @@ class CashbookViewSet(viewsets.ViewSet):
             sale_date__range=(start_dt, end_dt)
         ).prefetch_related("split_payments", "items")
 
-        if user:
-            sales_qs = sales_qs.filter(branch__retailer=user)
-        if branch_obj:
-            sales_qs = sales_qs.filter(branch=branch_obj)
-
         # 2. Fetch Expense Outflows
         expenses_qs = Expense.objects.filter(date__range=(start_date, end_date))
-        if user:
-            expenses_qs = expenses_qs.filter(retailer=user)
-        if branch_obj:
-            expenses_qs = expenses_qs.filter(branch=branch_obj)
 
         # 3. Fetch Credit Repayments Inflows
         repayments_qs = CreditRepayment.objects.filter(created_at__range=(start_dt, end_dt))
-        if user:
-            repayments_qs = repayments_qs.filter(customer__retailer=user)
-        if branch_obj:
-            repayments_qs = repayments_qs.filter(branch=branch_obj)
 
         # 4. Fetch Purchase Orders / Supplier Transactions
         purchases_qs = Purchase.objects.filter(purchase_date__range=(start_dt, end_dt))
-        if user:
-            purchases_qs = purchases_qs.filter(branch__retailer=user)
-        if branch_obj:
-            purchases_qs = purchases_qs.filter(branch=branch_obj)
 
         # 5. Fetch Inbound Stock Movements (Restocks, Transfers In, Adjustments In)
         inbound_types = [
@@ -2958,9 +2968,21 @@ class CashbookViewSet(viewsets.ViewSet):
             created_at__range=(start_dt, end_dt),
         ).select_related("item", "branch")
 
-        if user:
+        # --- USER SCOPE FILTERING ---
+        # Only enforce strict user scoping if the user is NOT staff or a superuser
+        if user and not (user.is_staff or user.is_superuser):
+            sales_qs = sales_qs.filter(branch__retailer=user)
+            expenses_qs = expenses_qs.filter(retailer=user)
+            repayments_qs = repayments_qs.filter(customer__retailer=user)
+            purchases_qs = purchases_qs.filter(branch__retailer=user)
             stock_movements_qs = stock_movements_qs.filter(branch__retailer=user)
+
+        # --- BRANCH SCOPE FILTERING ---
         if branch_obj:
+            sales_qs = sales_qs.filter(branch=branch_obj)
+            expenses_qs = expenses_qs.filter(branch=branch_obj)
+            repayments_qs = repayments_qs.filter(branch=branch_obj)
+            purchases_qs = purchases_qs.filter(branch=branch_obj)
             stock_movements_qs = stock_movements_qs.filter(branch=branch_obj)
 
         sales_by_method = {}
@@ -3238,6 +3260,33 @@ def _resolve_branch(branch_param, user=None):
         return None
 
 
+ZERO = Decimal("0.00")
+
+
+def quantize_money(val):
+    if val is None:
+        return ZERO
+    return Decimal(str(val)).quantize(Decimal("0.01"))
+
+
+def _authenticated_user(request):
+    return (
+        request.user
+        if getattr(request, "user", None) and request.user.is_authenticated
+        else None
+    )
+
+
+def _resolve_branch(branch_param):
+    if not branch_param:
+        return None
+    from stocks.models import RetailBranch
+
+    if str(branch_param).isdigit():
+        return RetailBranch.objects.filter(id=branch_param).first()
+    return RetailBranch.objects.filter(name=branch_param).first()
+
+
 class BalanceSheetViewSet(viewsets.ViewSet):
     """
     Statement of Financial Position as at the selected day/month/year.
@@ -3335,39 +3384,20 @@ class BalanceSheetViewSet(viewsets.ViewSet):
             datetime.combine(end_date, datetime.max.time())
         )
 
-        # 1. Sales Inflows
+        # 1. Base Querysets
         sales_qs = SaleTransaction.objects.filter(sale_date__lte=cutoff_dt).prefetch_related("split_payments")
-        if user:
-            sales_qs = sales_qs.filter(branch__retailer=user)
-        if branch_obj:
-            sales_qs = sales_qs.filter(branch=branch_obj)
 
-        # 2. Credit Repayments Inflows
         repayments_qs = CreditRepayment.objects.filter(
             Q(created_at__lte=cutoff_dt) | Q(date__lte=end_date)
         )
-        if user:
-            repayments_qs = repayments_qs.filter(customer__retailer=user)
-        if branch_obj:
-            repayments_qs = repayments_qs.filter(branch=branch_obj)
 
-        # 3. Expense Outflows
         expenses_qs = Expense.objects.filter(
             Q(date__lte=end_date) | Q(created_at__lte=cutoff_dt)
         )
-        if user:
-            expenses_qs = expenses_qs.filter(Q(retailer=user) | Q(branch__retailer=user))
-        if branch_obj:
-            expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-        # 4. Purchases & Stock Movements Outflows
         purchases_qs = Purchase.objects.filter(
             Q(purchase_date__lte=cutoff_dt) | Q(created_at__lte=cutoff_dt)
         )
-        if user:
-            purchases_qs = purchases_qs.filter(branch__retailer=user)
-        if branch_obj:
-            purchases_qs = purchases_qs.filter(branch=branch_obj)
 
         inbound_types = [
             StockMovement.MovementType.PURCHASE,
@@ -3379,19 +3409,28 @@ class BalanceSheetViewSet(viewsets.ViewSet):
             movement_type__in=inbound_types,
             created_at__lte=cutoff_dt,
         )
-        if user:
-            stock_movements_qs = stock_movements_qs.filter(branch__retailer=user)
-        if branch_obj:
-            stock_movements_qs = stock_movements_qs.filter(branch=branch_obj)
 
         customers_qs = Customer.objects.all()
         pricing_qs = BranchItemPricing.objects.all()
 
-        if user:
+        # --- USER SCOPE FILTERING ---
+        # Only enforce strict user scoping if the user is NOT staff or a superuser
+        if user and not (user.is_staff or user.is_superuser):
+            sales_qs = sales_qs.filter(branch__retailer=user)
+            repayments_qs = repayments_qs.filter(customer__retailer=user)
+            expenses_qs = expenses_qs.filter(Q(retailer=user) | Q(branch__retailer=user))
+            purchases_qs = purchases_qs.filter(branch__retailer=user)
+            stock_movements_qs = stock_movements_qs.filter(branch__retailer=user)
             customers_qs = customers_qs.filter(retailer=user)
             pricing_qs = pricing_qs.filter(branch__retailer=user)
 
+        # --- BRANCH SCOPE FILTERING ---
         if branch_obj:
+            sales_qs = sales_qs.filter(branch=branch_obj)
+            repayments_qs = repayments_qs.filter(branch=branch_obj)
+            expenses_qs = expenses_qs.filter(branch=branch_obj)
+            purchases_qs = purchases_qs.filter(branch=branch_obj)
+            stock_movements_qs = stock_movements_qs.filter(branch=branch_obj)
             pricing_qs = pricing_qs.filter(branch=branch_obj)
 
         # Calculate Inflows
@@ -3586,25 +3625,6 @@ from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-ZERO = Decimal("0.00")
-
-def quantize_money(amount):
-    if amount is None:
-        return ZERO
-    return Decimal(str(amount)).quantize(Decimal("0.01"))
-
-
-import calendar
-from datetime import datetime, date, timedelta
-from decimal import Decimal
-
-from django.db import models
-from django.db.models import Q, Sum, F
-from django.db.models.functions import Coalesce
-from django.utils import timezone
-from rest_framework import permissions, status, viewsets
-from rest_framework.decorators import action
-from rest_framework.response import Response
 
 ZERO = Decimal("0.00")
 
@@ -3628,6 +3648,40 @@ from rest_framework.response import Response
 # Assuming quantize_money, ZERO, RetailBranch, Expense, SaleTransaction,
 # StockMovement, CreditRepayment, Purchase, Item, BranchItemPricing, SaleItem
 # are defined in your module or imports.
+
+import calendar
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
+from django.db import models
+from django.db.models import Q, Sum
+from django.db.models.functions import Coalesce
+from django.utils import timezone
+from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+# Import models & helper constants from your application
+from stocks.models import (
+    BranchItemPricing,
+    CreditRepayment,
+    Expense,
+    Item,
+    Purchase,
+    RetailBranch,
+    SaleItem,
+    SaleTransaction,
+    StockMovement,
+)
+
+ZERO = Decimal("0.00")
+
+
+def quantize_money(val):
+    if val is None:
+        return ZERO
+    return Decimal(str(val)).quantize(Decimal("0.01"))
+
 
 class FinancialReportViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
@@ -4189,6 +4243,7 @@ class FinancialReportViewSet(viewsets.ViewSet):
             sales_qs = SaleTransaction.objects.all()
             movements_qs = StockMovement.objects.all()
             repayment_qs = CreditRepayment.objects.all()
+            items_qs = Item.objects.all()
 
             purchases_qs = (
                 Purchase.objects.all()
@@ -4200,7 +4255,8 @@ class FinancialReportViewSet(viewsets.ViewSet):
             # 3. USER SCOPE
             # ==========================================================
 
-            if user:
+            # Only enforce strict user scoping if the user is NOT staff or a superuser
+            if user and not (user.is_staff or user.is_superuser):
                 expense_qs = expense_qs.filter(
                     retailer=user
                 )
@@ -4211,6 +4267,10 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
                 movements_qs = movements_qs.filter(
                     branch__retailer=user
+                )
+
+                items_qs = items_qs.filter(
+                    retailer=user
                 )
 
                 repayment_filter = Q()
@@ -4856,13 +4916,6 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
             cutoff_dt = end_dt
 
-            items_qs = Item.objects.all()
-
-            if user:
-                items_qs = items_qs.filter(
-                    retailer=user
-                )
-
             stock_val = ZERO
             stock_qty = Decimal("0.000")
 
@@ -5355,7 +5408,7 @@ class FinancialReportViewSet(viewsets.ViewSet):
                 all_sales = SaleTransaction.objects.all()
                 all_repayments = CreditRepayment.objects.all()
 
-                if user:
+                if user and not (user.is_staff or user.is_superuser):
 
                     all_sales = all_sales.filter(
                         branch__retailer=user
