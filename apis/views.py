@@ -4181,7 +4181,7 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
             if branch_obj:
                 items_qs = Item.objects.filter(
-                    Q(branch_pricings__branch=branch_obj) | Q(stockmovement__branch=branch_obj)
+                    Q(branch_pricings__branch=branch_obj) | Q(stock_movements__branch=branch_obj)
                 ).distinct()
             else:
                 items_qs = Item.objects.all()
