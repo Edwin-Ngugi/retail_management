@@ -99,14 +99,18 @@ ASGI_APPLICATION = 'myproject.asgi.application'
 
 # Database Configuration
 
-import dj_database_url
 import os
+import dj_database_url
+from dotenv import load_dotenv
+
+# Explicitly load .env from BASE_DIR
+load_dotenv(BASE_DIR / '.env')
 
 DATABASES = {
     'default': dj_database_url.config(
-        default='postgres://postgres:Thaguru@8876@localhost:5432/retail_management',
+        default=os.getenv('DATABASE_URL'),
         conn_max_age=600,
-        ssl_require=False if os.environ.get('DEBUG') == 'True' else True
+        ssl_require=True
     )
 }
 
