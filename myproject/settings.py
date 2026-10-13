@@ -9,10 +9,12 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'LHi48kwW-AUcTjgstdxSJt2896Mea1qPO9lMM
 
 DEBUG = os.environ.get('DEBUG', 'False').lower() in ('true', '1', 't')
 
-ALLOWED_HOSTS_ENV = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1')
+# Host Security
+ALLOWED_HOSTS_ENV = os.environ.get(
+    'ALLOWED_HOSTS',
+    'api.melvexbusinesssolutions.com,.onrender.com,localhost,127.0.0.1'
+)
 ALLOWED_HOSTS = [host.strip() for host in ALLOWED_HOSTS_ENV.split(',') if host.strip()]
-
-
 
 
 INSTALLED_APPS = [
@@ -48,16 +50,15 @@ ROOT_URLCONF = 'myproject.urls'
 
 
 # CORS & CSRF Settings
-
 CORS_ALLOWED_ORIGINS_ENV = os.environ.get(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000'
+    'https://melvexbusinesssolutions.com,https://www.melvexbusinesssolutions.com,http://localhost:5173,http://127.0.0.1:5173'
 )
 CORS_ALLOWED_ORIGINS = [origin.strip() for origin in CORS_ALLOWED_ORIGINS_ENV.split(',') if origin.strip()]
 
 CSRF_TRUSTED_ORIGINS_ENV = os.environ.get(
     'CSRF_TRUSTED_ORIGINS',
-    'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000'
+    'https://melvexbusinesssolutions.com,https://www.melvexbusinesssolutions.com,http://localhost:5173,http://127.0.0.1:5173'
 )
 CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in CSRF_TRUSTED_ORIGINS_ENV.split(',') if origin.strip()]
 
@@ -98,9 +99,6 @@ ASGI_APPLICATION = 'myproject.asgi.application'
 
 
 # Database Configuration
-
-import os
-import dj_database_url
 from dotenv import load_dotenv
 
 # Explicitly load .env from BASE_DIR
@@ -172,8 +170,8 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
 # Application Host URLs
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
-BACKEND_URL = os.environ.get('BACKEND_URL', 'http://127.0.0.1:8000')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://melvexbusinesssolutions.com')
+BACKEND_URL = os.environ.get('BACKEND_URL', 'https://api.melvexbusinesssolutions.com')
 
 
 MANAGEMENT_EMAILS = [
