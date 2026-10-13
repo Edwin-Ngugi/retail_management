@@ -3008,10 +3008,13 @@ class CashbookViewSet(viewsets.ViewSet):
             start_date = business_date
             end_date = business_date
 
-        start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
-        end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+        tz = timezone.get_current_timezone()
+        start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
+        end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
 
-        branch_obj = _resolve_branch(branch_param, user)
+        branch_obj = None
+        if branch_param and str(branch_param).lower() != "all":
+            branch_obj = _resolve_branch(branch_param, user)
 
         # 1. Fetch Sales Inflows
         sales_qs = SaleTransaction.objects.filter(
@@ -3045,17 +3048,7 @@ class CashbookViewSet(viewsets.ViewSet):
             created_at__range=(start_dt, end_dt),
         ).select_related("item", "branch")
 
-        # --- USER SCOPE FILTERING ---
-        if user and not (user.is_staff or user.is_superuser):
-            sales_qs = sales_qs.filter(branch__retailer=user)
-            expenses_qs = expenses_qs.filter(Q(retailer=user) | Q(branch__retailer=user))
-            repayments_qs = repayments_qs.filter(
-                Q(customer__retailer=user) | Q(branch__retailer=user)
-            )
-            purchases_qs = purchases_qs.filter(branch__retailer=user)
-            stock_movements_qs = stock_movements_qs.filter(branch__retailer=user)
-
-        # --- BRANCH SCOPE FILTERING ---
+        # --- BRANCH SCOPE FILTERING (GLOBAL UNFILTERED BY USER) ---
         if branch_obj:
             sales_qs = sales_qs.filter(branch=branch_obj)
             expenses_qs = expenses_qs.filter(branch=branch_obj)
@@ -3388,13 +3381,16 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         )
 
         period_type, start_date, end_date = self._date_range(request)
-        branch_obj = _resolve_branch(branch_param, user)
+        branch_obj = None
+        if branch_param and str(branch_param).lower() != "all":
+            branch_obj = _resolve_branch(branch_param, user)
 
+        tz = timezone.get_current_timezone()
         cutoff_dt = timezone.make_aware(
-            datetime.combine(end_date, datetime.max.time())
+            datetime.combine(end_date, datetime.max.time()), tz
         )
 
-        # 1. Base Querysets
+        # 1. Base Querysets (Global Unfiltered by User)
         sales_qs = SaleTransaction.objects.filter(sale_date__lte=cutoff_dt).prefetch_related("split_payments")
 
         repayments_qs = CreditRepayment.objects.filter(
@@ -3429,19 +3425,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         else:
             pricing_qs = BranchItemPricing.objects.all()
 
-        # --- USER SCOPE FILTERING ---
-        if user and not (user.is_staff or user.is_superuser):
-            sales_qs = sales_qs.filter(branch__retailer=user)
-            repayments_qs = repayments_qs.filter(
-                Q(customer__retailer=user) | Q(branch__retailer=user)
-            )
-            expenses_qs = expenses_qs.filter(Q(retailer=user) | Q(branch__retailer=user))
-            purchases_qs = purchases_qs.filter(branch__retailer=user)
-            stock_movements_qs = stock_movements_qs.filter(branch__retailer=user)
-            customers_qs = customers_qs.filter(retailer=user)
-            pricing_qs = pricing_qs.filter(branch__retailer=user)
-
-        # --- BRANCH SCOPE FILTERING ---
+        # --- BRANCH SCOPE FILTERING (GLOBAL UNFILTERED BY USER) ---
         if branch_obj:
             sales_qs = sales_qs.filter(branch=branch_obj)
             repayments_qs = repayments_qs.filter(
