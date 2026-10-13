@@ -2981,14 +2981,19 @@ class CashbookViewSet(viewsets.ViewSet):
         user = _authenticated_user(request)
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
         date_param = request.query_params.get("date") or request.query_params.get("selectedDate")
-        period_type = request.query_params.get("period_type") or request.query_params.get("periodType", "day")
+        period_type = (
+            request.query_params.get("period_type")
+            or request.query_params.get("periodType")
+            or "day"
+        ).lower().strip()
+
         month_param = request.query_params.get("month")
         year_param = request.query_params.get("year")
         payment_method_param = request.query_params.get("payment_method")
 
         today = timezone.localdate()
 
-        if period_type == "month" and (year_param or month_param):
+        if period_type == "month" or (month_param and year_param):
             yr = int(year_param) if year_param else today.year
             mth = int(month_param) if month_param else today.month
             _, last_day = calendar.monthrange(yr, mth)
@@ -3020,7 +3025,7 @@ class CashbookViewSet(viewsets.ViewSet):
 
         # 3. Fetch Credit Repayments Inflows
         repayments_qs = CreditRepayment.objects.filter(
-            Q(created_at__range=(start_dt, end_dt)) | Q(date__range=(start_date, end_date))
+            Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
         )
 
         # 4. Fetch Purchase Orders / Supplier Transactions
@@ -3028,7 +3033,7 @@ class CashbookViewSet(viewsets.ViewSet):
             Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
         )
 
-        # 5. Fetch Inbound Stock Movements (Restocks, Transfers In, Adjustments In)
+        # 5. Fetch Inbound Stock Movements
         inbound_types = [
             StockMovement.MovementType.PURCHASE,
             StockMovement.MovementType.TRANSFER_IN,
@@ -3074,7 +3079,7 @@ class CashbookViewSet(viewsets.ViewSet):
         for line in sale_items:
             sale = line.transaction
             qty = Decimal(str(getattr(line, "quantity", getattr(line, "quantity_sold", 1)) or 1))
-            unit_cost = Decimal(str(line.unit_cost_price or getattr(line, "cost_price", ZERO) or ZERO))
+            unit_cost = Decimal(str(line.unit_cost_price or ZERO))
             line_cost = qty * unit_cost
 
             method = self._normalize_payment_method(sale.payment_method)
@@ -3131,7 +3136,7 @@ class CashbookViewSet(viewsets.ViewSet):
 
         # --- Aggregate Credit Repayments ---
         for repayment in repayments_qs:
-            raw_method = getattr(repayment, "payment_method", None) or getattr(repayment, "method", "CASH")
+            raw_method = getattr(repayment, "payment_method", None) or "CASH"
             method = self._normalize_payment_method(raw_method)
 
             if payment_method_param and method != self._normalize_payment_method(payment_method_param):
@@ -3147,7 +3152,7 @@ class CashbookViewSet(viewsets.ViewSet):
 
         # --- Aggregate Expenses Outflows ---
         for expense in expenses_qs:
-            raw_method = getattr(expense, "payment_method", None) or getattr(expense, "method", "CASH")
+            raw_method = getattr(expense, "payment_method", None) or "CASH"
             method = self._normalize_payment_method(raw_method)
 
             if payment_method_param and method != self._normalize_payment_method(payment_method_param):
@@ -3166,7 +3171,7 @@ class CashbookViewSet(viewsets.ViewSet):
 
         purchase_payment_map = {}
         for purchase in purchases_qs:
-            raw_method = getattr(purchase, "payment_method", None) or getattr(purchase, "method", "CASH")
+            raw_method = getattr(purchase, "payment_method", None) or "CASH"
             purchase_payment_map[purchase.pk] = self._normalize_payment_method(raw_method)
 
         for sm in stock_movements_qs:
@@ -3214,7 +3219,6 @@ class CashbookViewSet(viewsets.ViewSet):
         entries = []
         date_iso = end_date.isoformat()
 
-        # Build Response Inflow Entries
         for method, data in sales_by_method.items():
             entries.append(
                 {
@@ -3245,7 +3249,6 @@ class CashbookViewSet(viewsets.ViewSet):
                 }
             )
 
-        # Build Response Outflow Entries
         for method, data in purchases_by_method.items():
             entries.append(
                 {
