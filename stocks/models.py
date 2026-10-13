@@ -78,6 +78,7 @@ class RetailBranch(models.Model):
     def __str__(self):
         return f"{self.name} ({self.retailer.username})"
 
+
 # -----------------------------------------------------------------------------
 # Branch Stock Model (Fast Inventory Lookups & Branch Quantities)
 # -----------------------------------------------------------------------------
@@ -89,7 +90,7 @@ class BranchStock(models.Model):
         help_text="The branch holding this inventory record"
     )
     item = models.ForeignKey(
-        'Item',  # Quoted as string so Django resolves it lazily
+        'Item',
         on_delete=models.CASCADE,
         related_name="branch_stocks",
         help_text="The item tied to this branch stock"
@@ -112,7 +113,6 @@ class BranchStock(models.Model):
             )
         ]
         indexes = [
-            # Composite index for instant branch stock lookups
             models.Index(fields=["branch", "item"]),
             models.Index(fields=["branch", "quantity"]),
         ]
@@ -124,8 +124,6 @@ class BranchStock(models.Model):
             if self.item.retailer_id is None and self.branch.retailer_id is not None:
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
-            elif self.branch.retailer_id != self.item.retailer_id:
-                raise ValidationError("The branch and item must belong to the same retailer.")
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -169,8 +167,6 @@ class Customer(models.Model):
         ]
         ordering = ["name"]
 
-    # ... keep existing save() and _assign_next_customer_id() methods ...
-
     @property
     def total_outstanding_balance(self):
         credit_sales = self.sales.filter(
@@ -181,9 +177,6 @@ class Customer(models.Model):
 
     @property
     def debt_balance(self):
-        """
-        Alias for total_outstanding_balance to support code expecting debt_balance.
-        """
         return self.total_outstanding_balance
 
     def __str__(self):
@@ -344,11 +337,6 @@ class BranchItemPricing(models.Model):
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
 
-            elif self.branch.retailer_id != self.item.retailer_id:
-                raise ValidationError(
-                    "The branch and item must belong to the same retailer."
-                )
-
     def save(self, *args, **kwargs):
         if (not self.unit_cost_price or self.unit_cost_price == ZERO) and self.opening_stock_unit_cost_price:
             self.unit_cost_price = self.opening_stock_unit_cost_price
@@ -358,10 +346,6 @@ class BranchItemPricing(models.Model):
         recalculate_wac_sales_cost(self.branch, self.item)
 
     def get_effective_opening_stock(self, year=None, month=None):
-        """
-        Retrieves opening stock from MonthlyInventorySnapshot if available.
-        Falls back to the static opening_stock field if no snapshot exists.
-        """
         if year and month:
             return MonthlyInventorySnapshot.get_opening_stock_for_period(
                 self.branch, self.item, year, month
@@ -383,7 +367,6 @@ class BranchItemPricing(models.Model):
         if not pricing:
             return ZERO
 
-        # Determine opening quantity dynamically based on snapshot period or fallback baseline
         if year and month:
             opening_qty = Decimal(str(MonthlyInventorySnapshot.get_opening_stock_for_period(branch, item, year, month)))
         else:
@@ -623,11 +606,6 @@ class StockBatch(models.Model):
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
 
-            elif self.branch.retailer_id != self.item.retailer_id:
-                raise ValidationError(
-                    "The branch and item must belong to the same retailer."
-                )
-
         if self.quantity_remaining is not None and self.quantity_received is not None:
             if self.quantity_remaining > self.quantity_received:
                 raise ValidationError(
@@ -736,10 +714,6 @@ class MonthlyInventorySnapshot(models.Model):
 
     @classmethod
     def get_opening_stock_for_period(cls, branch, item, year, month):
-        """
-        Retrieves opening stock for a target period by finding the previous month's
-        closing stock snapshot. Falls back to BranchItemPricing.opening_stock if none exists.
-        """
         prev_year = year - 1 if month == 1 else year
         prev_month = 12 if month == 1 else month - 1
 
@@ -758,10 +732,6 @@ class MonthlyInventorySnapshot(models.Model):
 
     @classmethod
     def create_monthly_snapshot(cls, branch, item, year, month, closing_stock, unit_cost_price):
-        """
-        Creates or updates a monthly snapshot using the previous month's closing stock
-        as the new period's opening stock.
-        """
         opening_qty = cls.get_opening_stock_for_period(branch, item, year, month)
         
         snapshot, _ = cls.objects.update_or_create(
@@ -786,6 +756,7 @@ class MonthlyInventorySnapshot(models.Model):
             f"{self.year}/{self.month:02d}: "
             f"Opening {self.opening_stock} | Closing {self.closing_stock} units"
         )
+
 
 class MonthlyStockMovementArchive(models.Model):
     branch = models.ForeignKey(
@@ -821,6 +792,7 @@ class MonthlyStockMovementArchive(models.Model):
 
     def __str__(self):
         return f"Archived: {self.item.name} ({self.branch.name}) - {self.movement_type} - {self.quantity}"
+
 
 class MonthlyTransactionArchive(models.Model):
     transaction_id = models.IntegerField(db_index=True)
@@ -869,6 +841,8 @@ class MonthlyTransactionArchive(models.Model):
     def __str__(self):
         item_str = self.item.name if self.item else "General"
         return f"Archived Tx #{self.transaction_id}: {item_str} ({self.branch.name}) - KSh {self.amount}"    
+
+
 # -----------------------------------------------------------------------------
 # Stock Movement Ledger
 # -----------------------------------------------------------------------------
@@ -998,14 +972,6 @@ class StockMovement(models.Model):
             if item_retailer_id is None and branch_retailer_id is not None:
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
-            elif (
-                branch_retailer_id is not None
-                and item_retailer_id is not None
-                and branch_retailer_id != item_retailer_id
-            ):
-                raise ValidationError(
-                    "The branch and item must belong to the same retailer."
-                )
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -1025,6 +991,7 @@ class StockMovement(models.Model):
             f"{self.get_movement_type_display()} - "
             f"{self.quantity}"
         )
+
 
 # -----------------------------------------------------------------------------
 # Stock Transfer Model
@@ -1074,23 +1041,6 @@ class StockTransfer(models.Model):
                 raise ValidationError(
                     "Source and destination branches must be different."
                 )
-
-            if hasattr(self, "from_branch") and hasattr(self, "to_branch"):
-                if self.from_branch.retailer_id != self.to_branch.retailer_id:
-                    raise ValidationError(
-                        "Transfers are only allowed between branches "
-                        "of the same retailer."
-                    )
-
-            if hasattr(self, "item") and self.item and hasattr(self, "from_branch") and self.from_branch:
-                if self.item.retailer_id not in (
-                    None,
-                    self.from_branch.retailer_id,
-                ):
-                    raise ValidationError(
-                        "The item must belong to the same retailer "
-                        "as the branches."
-                    )
 
     @db_transaction.atomic
     def save(self, *args, **kwargs):
@@ -1283,17 +1233,6 @@ class Purchase(models.Model):
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
 
-            elif branch_retailer_id != item_retailer_id:
-                raise ValidationError(
-                    "The branch and item must belong to the same retailer."
-                )
-
-        if self.supplier and self.supplier.retailer_id and hasattr(self, "branch") and self.branch:
-            if self.supplier.retailer_id != self.branch.retailer_id:
-                raise ValidationError(
-                    "The selected supplier must belong to the same retailer as the branch."
-                )
-
     @db_transaction.atomic
     def save(self, *args, **kwargs):
         if isinstance(self.purchase_date, datetime) is False and isinstance(self.purchase_date, date):
@@ -1306,7 +1245,6 @@ class Purchase(models.Model):
         is_new = self.pk is None
 
         if not is_new:
-            # Revert old stock movement and batch before updating
             StockMovement.objects.filter(reference=f"PURCHASE-{self.pk}").delete()
             StockBatch.objects.filter(reference=f"PURCHASE-{self.pk}").delete()
 
@@ -1370,7 +1308,6 @@ class Purchase(models.Model):
             f"({self.branch.name}) - "
             f"Purchase ({self.quantity})"
         )
-
 
 
 # -----------------------------------------------------------------------------
@@ -1482,10 +1419,6 @@ class SaleTransaction(models.Model):
     class Meta:
         ordering = ["-sale_date", "-id"]
 
-    # ------------------------------------------------------------------
-    # TOTALS
-    # ------------------------------------------------------------------
-
     def recalculate_totals(self):
         """Aggregate sale items and update the transaction total."""
         if not self.pk:
@@ -1527,19 +1460,13 @@ class SaleTransaction(models.Model):
             self.total_amount or ZERO
         ) - self.total_cost
 
-    # ------------------------------------------------------------------
-    # CREDIT / RECEIVABLE CALCULATIONS
-    # ------------------------------------------------------------------
-
     @property
     def credit_payment_amount(self):
-        
         if self.payment_method == self.PaymentMethod.CREDIT:
             return quantize_money(
                 self.total_amount or ZERO
             )
 
-        # Split payment may contain a CREDIT component
         if self.payment_method == self.PaymentMethod.SPLIT:
             payments_qs = getattr(self, "payments", None)
 
@@ -1561,8 +1488,6 @@ class SaleTransaction(models.Model):
 
     @property
     def credit_repayments(self):
-        
-
         repayment_total = self.repayments.aggregate(
             total=Coalesce(
                 Sum("amount"),
@@ -1576,19 +1501,14 @@ class SaleTransaction(models.Model):
 
     @property
     def is_invoice(self):
-        
-        
         return self.credit_payment_amount > ZERO
 
     @property
     def total_repayments(self):
-        
         return self.credit_repayments
 
     @property
     def balance_due(self):
-
-
         credit_amount = self.credit_payment_amount
 
         if credit_amount <= ZERO:
@@ -1605,8 +1525,6 @@ class SaleTransaction(models.Model):
 
     @property
     def invoice_status(self):
-        
-
         if not self.is_invoice:
             return "PAID"
 
@@ -1618,14 +1536,9 @@ class SaleTransaction(models.Model):
 
         return "UNPAID"
 
-    # ------------------------------------------------------------------
-    # VALIDATION
-    # ------------------------------------------------------------------
-
     def clean(self):
         super().clean()
 
-        
         if self.payment_method == self.PaymentMethod.CREDIT:
             self.is_paid = False
         else:
@@ -1642,23 +1555,13 @@ class SaleTransaction(models.Model):
                 }
             )
 
-    # ------------------------------------------------------------------
-    # SAVE
-    # ------------------------------------------------------------------
-
     def save(self, *args, **kwargs):
-
         is_credit = (
             self.payment_method
             == self.PaymentMethod.CREDIT
         )
 
-        # --------------------------------------------------------------
-        # CREATE DEFAULT CUSTOMER FOR DIRECT CREDIT SALE
-        # --------------------------------------------------------------
-
         if is_credit and not self.customer:
-
             retailer_user = self.created_by
 
             if (
@@ -1668,7 +1571,6 @@ class SaleTransaction(models.Model):
             ):
                 if hasattr(self.branch, "retailer"):
                     retailer_user = self.branch.retailer
-
                 elif hasattr(self.branch, "user"):
                     retailer_user = self.branch.user
 
@@ -1707,18 +1609,10 @@ class SaleTransaction(models.Model):
 
             self.customer = default_customer
 
-        # --------------------------------------------------------------
-        # DOCUMENT NUMBER
-        # --------------------------------------------------------------
-
         if not self.receipt_number:
             self.receipt_number = generate_document_number(
                 is_credit=is_credit
             )
-
-        # --------------------------------------------------------------
-        # CREDIT DUE DATE
-        # --------------------------------------------------------------
 
         if (
             is_credit
@@ -1738,12 +1632,7 @@ class SaleTransaction(models.Model):
                 )
             )
 
-        # --------------------------------------------------------------
-        # FINAL VALIDATION AND SAVE
-        # --------------------------------------------------------------
-
         self.full_clean()
-
         super().save(*args, **kwargs)
 
 
@@ -1822,7 +1711,6 @@ class SaleItem(models.Model):
     def save(self, *args, **kwargs):
         is_new = self.pk is None
 
-        # 1. Fetch current WAC cost price if not set
         if (not self.unit_cost_price or self.unit_cost_price == ZERO) and self.item_id and self.transaction_id and self.transaction.branch_id:
             pricing = BranchItemPricing.objects.filter(
                 branch_id=self.transaction.branch_id,
@@ -1833,7 +1721,6 @@ class SaleItem(models.Model):
 
         super().save(*args, **kwargs)
 
-        # 2. Automatically record outbound StockMovement on creation
         if is_new and self.transaction.branch_id:
             StockMovement.objects.create(
                 branch_id=self.transaction.branch_id,
@@ -1848,10 +1735,8 @@ class SaleItem(models.Model):
                 created_by=self.transaction.created_by,
             )
 
-            # 3. Recalculate WAC & update unit costs across ledger
             recalculate_wac_sales_cost(self.transaction.branch, self.item)
 
-        # 4. Recalculate parent transaction totals
         self.transaction.recalculate_totals()
         SaleTransaction.objects.filter(pk=self.transaction.pk).update(
             total_amount=self.transaction.total_amount
@@ -1862,7 +1747,6 @@ class SaleItem(models.Model):
             branch = self.transaction.branch
             item = self.item
 
-            # Remove associated stock movement when sale item is deleted
             StockMovement.objects.filter(
                 reference=f"SALE-{self.transaction.pk}",
                 item=item,
@@ -1871,7 +1755,6 @@ class SaleItem(models.Model):
 
             result = super().delete(*args, **kwargs)
 
-            # Recalculate stock & WAC
             if branch and item:
                 recalculate_wac_sales_cost(branch, item)
 
@@ -2071,12 +1954,6 @@ class CreditRepayment(models.Model):
     def clean(self):
         super().clean()
 
-        if hasattr(self, "customer") and self.customer and hasattr(self, "branch") and self.branch:
-            if self.customer.retailer_id != self.branch.retailer_id:
-                raise ValidationError(
-                    "The customer and branch must belong to the same retailer."
-                )
-
         if hasattr(self, "transaction") and self.transaction and self.transaction.customer_id != self.customer_id:
             raise ValidationError(
                 "The selected invoice does not belong to this customer."
@@ -2140,11 +2017,6 @@ class CustomerReturn(models.Model):
             ):
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
-
-            elif self.branch.retailer_id != self.item.retailer_id:
-                raise ValidationError(
-                    "The branch and item must belong to the same retailer."
-                )
 
     @db_transaction.atomic
     def save(self, *args, **kwargs):
@@ -2272,11 +2144,6 @@ class SupplierReturn(models.Model):
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
 
-            elif self.branch.retailer_id != self.item.retailer_id:
-                raise ValidationError(
-                    "The branch and item must belong to the same retailer."
-                )
-
     @db_transaction.atomic
     def save(self, *args, **kwargs):
         if isinstance(self.date, datetime):
@@ -2400,11 +2267,6 @@ class DamageRecord(models.Model):
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
 
-            elif self.branch.retailer_id != self.item.retailer_id:
-                raise ValidationError(
-                    "The branch and item must belong to the same retailer."
-                )
-
     @db_transaction.atomic
     def save(self, *args, **kwargs):
         if isinstance(self.date, datetime):
@@ -2473,12 +2335,6 @@ class DamageRecord(models.Model):
 
 
 # -----------------------------------------------------------------------------
-# Stock Adjustment
-# -----------------------------------------------------------------------------
-
-
-
-# -----------------------------------------------------------------------------
 # Expense
 # -----------------------------------------------------------------------------
 class Expense(models.Model):
@@ -2510,12 +2366,6 @@ class Expense(models.Model):
 
     def clean(self):
         super().clean()
-
-        if hasattr(self, "branch") and self.branch and hasattr(self, "retailer") and self.retailer:
-            if self.branch.retailer_id != self.retailer_id:
-                raise ValidationError(
-                    "The branch must belong to the selected retailer."
-                )
 
     def save(self, *args, **kwargs):
         if isinstance(self.date, datetime):
@@ -2569,6 +2419,7 @@ class PendingApproval(models.Model):
     def __str__(self):
         return f"{self.get_request_type_display()} - {self.status} ({self.id})"
 
+
 # -----------------------------------------------------------------------------
 # Daily Financial Report
 # -----------------------------------------------------------------------------
@@ -2611,12 +2462,6 @@ class DailyFinancialReport(models.Model):
 
     def clean(self):
         super().clean()
-
-        if hasattr(self, "branch") and self.branch and hasattr(self, "retailer") and self.retailer:
-            if self.branch.retailer_id != self.retailer_id:
-                raise ValidationError(
-                    "The branch must belong to the selected retailer."
-                )
 
     def save(self, *args, **kwargs):
         if isinstance(self.date, datetime):
@@ -2673,6 +2518,47 @@ class DailyFinancialReport(models.Model):
             self.tax_rate_percentage / Decimal("100.00")
         )
         return self.gross_profit - self.total_expenses - tax
+
+    @property
+    def total_cash_inflows(self):
+        cash_sales = SalePayment.objects.filter(
+            method='CASH',
+            transaction__sale_date__date=self.date
+        )
+        if self.branch:
+            cash_sales = cash_sales.filter(transaction__branch=self.branch)
+        elif self.retailer:
+            cash_sales = cash_sales.filter(transaction__branch__retailer=self.retailer)
+        
+        cash_sales_amount = cash_sales.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+        repayments = CreditRepayment.objects.filter(date=self.date)
+        if self.branch:
+            repayments = repayments.filter(branch=self.branch)
+        elif self.retailer:
+            repayments = repayments.filter(customer__retailer=self.retailer)
+
+        repayments_amount = repayments.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+        return quantize_money(cash_sales_amount + repayments_amount)
+
+    @property
+    def total_cash_outflows(self):
+        expenses_amount = self.total_expenses
+
+        purchases = Purchase.objects.filter(purchase_date__date=self.date)
+        if self.branch:
+            purchases = purchases.filter(branch=self.branch)
+        elif self.retailer:
+            purchases = purchases.filter(branch__retailer=self.retailer)
+
+        purchases_amount = sum((p.total_cost for p in purchases), ZERO)
+
+        return quantize_money(expenses_amount + purchases_amount)
+
+    @property
+    def net_cash_flow(self):
+        return quantize_money(self.total_cash_inflows - self.total_cash_outflows)
 
     def __str__(self):
         branch_name = self.branch.name if self.branch else "All Branches"
@@ -2734,8 +2620,6 @@ def recalculate_wac_sales_cost(branch, item):
         StockMovement.MovementType.ADJUSTMENT_OUT,
     }
 
-    # Exclude OPENING_STOCK movement records if initial pricing.opening_stock is already set
-    # to avoid double-counting opening inventory.
     movements_qs = StockMovement.objects.filter(
         branch=branch,
         item=item,
@@ -2806,7 +2690,6 @@ def recalculate_wac_sales_cost(branch, item):
 
     final_wac = quantize_money(final_wac)
 
-    # Safely update ONLY unit_cost_price without touching opening_stock
     BranchItemPricing.objects.filter(pk=pricing.pk).update(unit_cost_price=final_wac)
 
     for sale_id, new_unit_cost in sales_to_update.items():
@@ -2818,52 +2701,3 @@ def recalculate_wac_sales_cost(branch, item):
         )
 
     return final_wac
-
-# Add these property methods inside DailyFinancialReport model in models.py:
-
-@property
-def total_cash_inflows(self):
-    """Calculates all actual cash received on this report's date."""
-    # 1. Direct and Split Cash Sales
-    cash_sales = SalePayment.objects.filter(
-        method='CASH',
-        transaction__sale_date__date=self.date
-    )
-    if self.branch:
-        cash_sales = cash_sales.filter(transaction__branch=self.branch)
-    elif self.retailer:
-        cash_sales = cash_sales.filter(transaction__branch__retailer=self.retailer)
-    
-    cash_sales_amount = cash_sales.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-
-    # 2. Customer Credit Repayments
-    repayments = CreditRepayment.objects.filter(date=self.date)
-    if self.branch:
-        repayments = repayments.filter(branch=self.branch)
-    elif self.retailer:
-        repayments = repayments.filter(customer__retailer=self.retailer)
-
-    repayments_amount = repayments.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-
-    return quantize_money(cash_sales_amount + repayments_amount)
-
-@property
-def total_cash_outflows(self):
-    """Calculates all cash paid out on this report's date."""
-    # 1. Expenses
-    expenses_amount = self.total_expenses
-
-    # 2. Purchases
-    purchases = Purchase.objects.filter(purchase_date__date=self.date)
-    if self.branch:
-        purchases = purchases.filter(branch=self.branch)
-    elif self.retailer:
-        purchases = purchases.filter(branch__retailer=self.retailer)
-
-    purchases_amount = sum((p.total_cost for p in purchases), ZERO)
-
-    return quantize_money(expenses_amount + purchases_amount)
-
-@property
-def net_cash_flow(self):
-    return quantize_money(self.total_cash_inflows - self.total_cash_outflows)

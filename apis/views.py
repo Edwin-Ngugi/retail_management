@@ -459,22 +459,15 @@ class RetailBranchViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
-        queryset = RetailBranch.objects.all().order_by("name")
-        user = _authenticated_user(self.request)
-
-        if user:
-            queryset = queryset.filter(retailer=user)
-
-        return queryset
+        # Return all branches so every user sees the complete branch list
+        return RetailBranch.objects.all().order_by("name")
 
     def perform_create(self, serializer):
         user = _authenticated_user(self.request)
 
-        # Fall back to logged-in request.user if _authenticated_user returned None
         if not user and self.request.user.is_authenticated:
             user = self.request.user
 
-        # Query the User model class (capitalized) for a fallback user
         if not user:
             user = User.objects.filter(is_superuser=True).first() or User.objects.first()
 
@@ -758,17 +751,12 @@ class ItemViewSet(viewsets.ModelViewSet):
         return context
 
     def get_queryset(self):
+        # Fetch all items across the business regardless of which user logged in
         queryset = Item.objects.select_related("retailer").all().order_by("-id")
 
-        # Authenticated user filtering
-        request = getattr(self, "request", None)
-        user = _authenticated_user(request) if request else None
-        if user:
-            queryset = queryset.filter(retailer=user)
-
-        query_params = getattr(request, "query_params", {}) if request else {}
+        query_params = getattr(self.request, "query_params", {}) if hasattr(self, "request") else {}
         try:
-            data = request.data if request and isinstance(getattr(request, "data", None), dict) else {}
+            data = self.request.data if hasattr(self, "request") and isinstance(getattr(self.request, "data", None), dict) else {}
         except Exception:
             data = {}
 
@@ -780,7 +768,6 @@ class ItemViewSet(viewsets.ModelViewSet):
             or data.get("branch_id")
         )
 
-        # Extract date/month parameters (defaults to current month if omitted, or optional)
         year_param = query_params.get("year") or data.get("year")
         month_param = query_params.get("month") or data.get("month")
 
@@ -789,15 +776,12 @@ class ItemViewSet(viewsets.ModelViewSet):
             try:
                 year = int(year_param)
                 month = int(month_param)
-                # Find the last day of the target month
                 _, last_day = calendar.monthrange(year, month)
                 start_date = datetime(year, month, 1, 0, 0, 0)
                 end_date = datetime(year, month, last_day, 23, 59, 59)
-
-                # Restrict transactions or pricing records within/up to the targeted month
                 date_filter = Q(created_at__gte=start_date, created_at__lte=end_date)
             except ValueError:
-                pass  # Handle invalid date inputs as needed
+                pass
 
         # Apply Branch and Date filtering
         if branch_param:
