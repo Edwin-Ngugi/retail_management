@@ -2,8 +2,12 @@ import os
 from datetime import timedelta
 from pathlib import Path
 import dj_database_url
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables early
+load_dotenv(BASE_DIR / '.env')
 
 SECRET_KEY = os.environ.get('SECRET_KEY', 'LHi48kwW-AUcTjgstdxSJt2896Mea1qPO9lMMKe24jpNr4oYGKeW6EUtSi4uFUyNKrY')
 
@@ -12,13 +16,13 @@ DEBUG = os.environ.get('DEBUG', 'False').lower() in ('true', '1', 't')
 # Host Security
 ALLOWED_HOSTS_ENV = os.environ.get(
     'ALLOWED_HOSTS',
-    'api.melvexbusinesssolutions.com,.onrender.com,localhost,127.0.0.1'
+    'api.melvexbusinesssolutions.com,melvexbusinesssolutions.com,www.melvexbusinesssolutions.com,.onrender.com,localhost,127.0.0.1'
 )
 ALLOWED_HOSTS = [host.strip() for host in ALLOWED_HOSTS_ENV.split(',') if host.strip()]
 
 
 INSTALLED_APPS = [
-    'daphne', 
+    'daphne',  # Must be first for Channels/ASGI
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -70,6 +74,7 @@ CORS_ALLOWED_ORIGIN_REGEXES = [
 CORS_ALLOW_CREDENTIALS = True
 
 
+# Celery Configuration
 from celery.schedules import crontab
 
 CELERY_BEAT_SCHEDULE = {
@@ -99,20 +104,16 @@ ASGI_APPLICATION = 'myproject.asgi.application'
 
 
 # Database Configuration
-from dotenv import load_dotenv
-
-# Explicitly load .env from BASE_DIR
-load_dotenv(BASE_DIR / '.env')
-
 DATABASES = {
     'default': dj_database_url.config(
-        default=os.getenv('DATABASE_URL'),
+        default=os.getenv('DATABASE_URL', f"sqlite:///{BASE_DIR / 'db.sqlite3'}"),
         conn_max_age=600,
-        ssl_require=True
+        ssl_require=not DEBUG
     )
 }
 
 
+# Channels & Redis Configuration
 REDIS_URL = os.environ.get('REDIS_URL')
 
 if REDIS_URL:
@@ -174,6 +175,7 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://melvexbusinesssolutions.c
 BACKEND_URL = os.environ.get('BACKEND_URL', 'https://api.melvexbusinesssolutions.com')
 
 
+# Email Configuration
 MANAGEMENT_EMAILS = [
     email.strip() for email in os.environ.get('MANAGEMENT_EMAILS', 'engugi922@gmail.com').split(',') if email.strip()
 ]
