@@ -535,6 +535,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 "transaction",
             )
             .all()
+            .order_by("-id")
         )
 
         customer_id = self.request.query_params.get("customer")
@@ -546,29 +547,23 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         if customer_id:
             queryset = queryset.filter(customer_id=customer_id)
 
-        if branch_id:
+        if branch_id and str(branch_id).lower() != "all":
             if str(branch_id).isdigit():
                 queryset = queryset.filter(branch_id=int(branch_id))
             else:
-                queryset = queryset.filter(branch__name__iexact=str(branch_id))
-
-        user = _authenticated_user(self.request)
-        if user:
-            queryset = queryset.filter(customer__retailer=user)
+                queryset = queryset.filter(branch__name__iexact=str(branch_id).strip())
 
         return queryset
 
     def perform_create(self, serializer):
         user = _authenticated_user(self.request)
         
-        # 1. Capture and format payment_method explicitly from input data
         raw_method = (
             self.request.data.get("payment_method") 
             or self.request.data.get("method") 
             or "CASH"
         )
         
-        # Standardize value (e.g. "Send Money" -> "SEND_MONEY")
         payment_method = (
             str(raw_method)
             .strip()
@@ -578,7 +573,6 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         )
 
         try:
-            # 2. Save repayment passing created_by and payment_method
             repayment = serializer.save(
                 created_by=user,
                 payment_method=payment_method
@@ -589,7 +583,6 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 e.message_dict if hasattr(e, "message_dict") else str(e)
             )
 
-        # 3. Broadcast real-time websocket analytics event
         if repayment.branch_id:
             channel_layer = get_channel_layer()
             if channel_layer:
@@ -1998,8 +1991,6 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
             if normalized in keys:
                 return target
 
-        # Accept common frontend labels/combined labels without sending valid
-        # Paybill or Send Money collections to ``other``.
         if "PAYBILL" in normalized or "PAY_BILL" in normalized:
             return "PAYBILL"
         if "SEND_MONEY" in normalized or "SENDMONEY" in normalized:
@@ -2024,10 +2015,6 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
             .order_by("-sale_date")
         )
 
-        user = getattr(self.request, "user", None)
-        if user and user.is_authenticated:
-            queryset = queryset.filter(branch__retailer=user)
-
         branch_param = (
             self.request.query_params.get("branch")
             or self.request.query_params.get("branch_id")
@@ -2035,11 +2022,11 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
         payment_method = self.request.query_params.get("payment_method")
         customer_id = self.request.query_params.get("customer")
 
-        if branch_param:
+        if branch_param and str(branch_param).lower() != "all":
             if str(branch_param).isdigit():
                 queryset = queryset.filter(branch_id=int(branch_param))
             else:
-                queryset = queryset.filter(branch__name__iexact=str(branch_param))
+                queryset = queryset.filter(branch__name__iexact=str(branch_param).strip())
 
         if payment_method:
             normalized_pm = self._normalize_payment_method(payment_method)
@@ -2058,233 +2045,6 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(customer_id=customer_id)
 
         return queryset
-
-    @action(detail=False, methods=["get"], url_path="payment-methods")
-    def payment_methods(self, request):
-        return Response(self.PAYMENT_METHODS, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=["get"], url_path="payment-summary")
-    def payment_summary(self, request):
-        queryset = self.get_queryset()
-
-        summary = {
-            "CASH": Decimal("0.00"),
-            "MPESA": Decimal("0.00"),
-            "PAYBILL": Decimal("0.00"),
-            "SEND_MONEY": Decimal("0.00"),
-            "BANK_TRANSFER": Decimal("0.00"),
-            "CREDIT": Decimal("0.00"),
-            "SPLIT": Decimal("0.00"),
-        }
-
-        for sale in queryset:
-            pm = self._normalize_payment_method(getattr(sale, "payment_method", None))
-            total_amount = Decimal(str(getattr(sale, "total_amount", 0) or 0))
-
-            if pm == "SPLIT":
-                split_payments = getattr(sale, "split_payments", None)
-                split_qs = split_payments.all() if hasattr(split_payments, "all") else []
-
-                if split_qs:
-                    for sp in split_qs:
-                        sp_method = self._normalize_payment_method(getattr(sp, "method", getattr(sp, "payment_method", None)))
-                        sp_amount = Decimal(str(getattr(sp, "amount", 0) or 0))
-
-                        if sp_method in summary and sp_method != "SPLIT":
-                            summary[sp_method] += sp_amount
-                        else:
-                            summary["CASH"] += sp_amount
-                    continue
-
-            if pm in summary:
-                summary[pm] += total_amount
-            else:
-                summary["CASH"] += total_amount
-
-        return Response({k: float(v) for k, v in summary.items()}, status=status.HTTP_200_OK)
-
-    def create(self, request, *args, **kwargs):
-        data = request.data.copy() if isinstance(request.data, dict) else request.data
-
-        if not isinstance(data, dict):
-            return Response(
-                {"error": "Invalid payload format. Expected a JSON object with transaction metadata and line items."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 1. Capture incoming receipt number explicitly from any potential payload key
-        incoming_receipt_number = (
-            data.get("receipt_number")
-            or data.get("receipt_no")
-            or data.get("receiptNumber")
-            or data.get("invoice_number")
-        )
-
-        if "payment_method" in data:
-            data["payment_method"] = self._normalize_payment_method(data["payment_method"])
-
-        split_payments_data = data.get("split_payments") or data.get("split_breakdown")
-        if split_payments_data and isinstance(split_payments_data, list):
-            cleaned_splits = []
-            for sp in split_payments_data:
-                if isinstance(sp, dict):
-                    sp_copy = sp.copy()
-                    sp_method = sp_copy.get("method") or sp_copy.get("payment_method")
-                    sp_copy["method"] = self._normalize_payment_method(sp_method)
-                    cleaned_splits.append(sp_copy)
-            data["split_payments"] = cleaned_splits
-
-        dict_date = (
-            data.pop("sale_date", None)
-            or data.pop("date", None)
-            or data.pop("transaction_date", None)
-        )
-        data["sale_date"] = self._normalize_sale_date(dict_date)
-
-        if "items" in data and isinstance(data["items"], list):
-            cleaned_items = []
-            for item_data in data["items"]:
-                if isinstance(item_data, dict):
-                    item_copy = item_data.copy()
-                    for field in ["unit_retail_price", "retail_price", "exception_type", "m2m"]:
-                        item_copy.pop(field, None)
-                    cleaned_items.append(item_copy)
-                else:
-                    cleaned_items.append(item_data)
-            data["items"] = cleaned_items
-
-        raw_customer = (
-            data.pop("customer", None)
-            or data.pop("customer_id", None)
-            or data.pop("customer_pk", None)
-        )
-        customer_id = None
-        if raw_customer:
-            if isinstance(raw_customer, dict):
-                customer_id = raw_customer.get("id") or raw_customer.get("pk") or raw_customer.get("customer_id")
-            else:
-                customer_id = raw_customer
-
-        customer_instance = None
-        if customer_id is not None:
-            try:
-                customer_instance = Customer.objects.filter(pk=int(customer_id)).first()
-            except (ValueError, TypeError):
-                customer_instance = None
-
-        serializer = self.get_serializer(data=data)
-        try:
-            serializer.is_valid(raise_exception=True)
-        except DRFValidationError as e:
-            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            with transaction.atomic():
-                user = request.user if request.user.is_authenticated else None
-
-                items_data = serializer.validated_data.get("items", [])
-                item_ids = [line["item"].id if hasattr(line["item"], "id") else line["item"] for line in items_data if "item" in line]
-
-                if item_ids:
-                    list(Item.objects.filter(id__in=item_ids).order_by("id").select_for_update())
-
-                save_kwargs = {}
-                if user:
-                    save_kwargs["created_by"] = user
-                if customer_instance:
-                    save_kwargs["customer"] = customer_instance
-
-                # Pass receipt_number explicitly into save_kwargs if present in payload or validated_data
-                final_receipt_no = (
-                    serializer.validated_data.get("receipt_number")
-                    or incoming_receipt_number
-                )
-                if final_receipt_no:
-                    save_kwargs["receipt_number"] = final_receipt_no
-
-                sale = serializer.save(**save_kwargs)
-
-                # Ensure DB record gets receipt_number updated if it was missed or saved blank
-                if final_receipt_no and getattr(sale, "receipt_number", None) != final_receipt_no:
-                    sale.receipt_number = final_receipt_no
-                    sale.save(update_fields=["receipt_number"])
-                elif not getattr(sale, "receipt_number", None):
-                    sale.receipt_number = f"REC-{sale.id}"
-                    sale.save(update_fields=["receipt_number"])
-
-                branch = sale.branch
-
-            if branch:
-                channel_layer = get_channel_layer()
-                if channel_layer:
-                    try:
-                        async_to_sync(channel_layer.group_send)(
-                            f"analytics_branch_{branch.id}",
-                            {"type": "analytics_update", "event": "SALE_RECORDED"},
-                        )
-                    except Exception:
-                        pass
-
-            return Response(self.get_serializer(sale).data, status=status.HTTP_201_CREATED)
-
-        except DjangoValidationError as e:
-            return Response(
-                e.message_dict if hasattr(e, "message_dict") else {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except Exception as e:
-            return Response(
-                {
-                    "error": "Unable to record sale.",
-                    "details": str(e),
-                    "exception_type": type(e).__name__,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-
-        branch = instance.branch
-        items_qs = list(instance.items.all())
-
-        try:
-            with transaction.atomic():
-                for item in items_qs:
-                    item.delete()
-
-                instance.delete()
-
-            if branch:
-                channel_layer = get_channel_layer()
-                if channel_layer:
-                    try:
-                        async_to_sync(channel_layer.group_send)(
-                            f"analytics_branch_{branch.id}",
-                            {"type": "analytics_update", "event": "SALE_CANCELLED"},
-                        )
-                    except Exception:
-                        pass
-
-            return Response(
-                {"detail": "Sale transaction voided and stock restored successfully."},
-                status=status.HTTP_200_OK,
-            )
-
-        except DjangoValidationError as e:
-            return Response(
-                e.message_dict if hasattr(e, "message_dict") else {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except Exception as e:
-            return Response(
-                {
-                    "error": "Unable to cancel sale transaction and restore inventory.",
-                    "details": str(e),
-                    "exception_type": type(e).__name__,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 # EXPENSE
 
 
@@ -2297,23 +2057,19 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             Expense.objects
             .select_related("branch")
             .all()
-            .order_by("-date")
+            .order_by("-date", "-id")
         )
-
-        user = _authenticated_user(self.request)
-        if user:
-            queryset = queryset.filter(retailer=user)
 
         branch_param = (
             self.request.query_params.get("branch")
             or self.request.query_params.get("branch_id")
         )
 
-        if branch_param:
+        if branch_param and str(branch_param).lower() != "all":
             if str(branch_param).isdigit():
                 queryset = queryset.filter(branch_id=int(branch_param))
             else:
-                queryset = queryset.filter(branch__name__iexact=str(branch_param))
+                queryset = queryset.filter(branch__name__iexact=str(branch_param).strip())
 
         return queryset
 
@@ -2345,13 +2101,13 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         if user:
             save_kwargs["retailer"] = user
 
-        if branch_param:
+        if branch_param and str(branch_param).lower() != "all":
             if str(branch_param).isdigit():
                 save_kwargs["branch_id"] = int(branch_param)
             else:
                 branch_obj = (
                     RetailBranch.objects
-                    .filter(name__iexact=str(branch_param))
+                    .filter(name__iexact=str(branch_param).strip())
                     .first()
                 )
                 if branch_obj:
