@@ -2881,6 +2881,72 @@ def _resolve_branch(branch_param):
     return RetailBranch.objects.filter(name=branch_param).first()
 
 
+import calendar
+from datetime import date, datetime
+from decimal import Decimal
+
+from django.db import models
+from django.db.models import Q, Sum
+from django.db.models.functions import Coalesce
+from django.utils import timezone
+from rest_framework import permissions, status, viewsets
+from rest_framework.response import Response
+
+from stocks.models import (
+    BranchItemPricing,
+    CreditRepayment,
+    Customer,
+    Expense,
+    Item,
+    Purchase,
+    RetailBranch,
+    SaleItem,
+    SaleTransaction,
+    StockMovement,
+)
+
+ZERO = Decimal("0.00")
+
+
+def quantize_money(val):
+    if val is None:
+        return ZERO
+    return Decimal(str(val)).quantize(Decimal("0.01"))
+
+
+def _authenticated_user(request):
+    return (
+        request.user
+        if getattr(request, "user", None) and request.user.is_authenticated
+        else None
+    )
+
+
+def _resolve_branch(branch_param, user=None):
+    if not branch_param:
+        return None
+
+    qs = RetailBranch.objects.all()
+    if user and getattr(user, "is_authenticated", False):
+        qs = qs.filter(retailer=user)
+
+    try:
+        if str(branch_param).isdigit():
+            return qs.filter(id=int(branch_param)).first()
+        return qs.filter(name__iexact=str(branch_param).strip()).first()
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_business_date(date_str):
+    if not date_str:
+        return timezone.localdate()
+    try:
+        return datetime.strptime(str(date_str).split("T")[0], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return timezone.localdate()
+
+
 class CashbookViewSet(viewsets.ViewSet):
     """ViewSet for managing and viewing cashbook entries, balancing cash in hand,
     and reconciling daily/monthly aggregated inflows and outflows per branch.
@@ -2940,7 +3006,7 @@ class CashbookViewSet(viewsets.ViewSet):
         start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
         end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
 
-        branch_obj = _resolve_branch(branch_param)
+        branch_obj = _resolve_branch(branch_param, user)
 
         # 1. Fetch Sales Inflows
         sales_qs = SaleTransaction.objects.filter(
@@ -2948,13 +3014,19 @@ class CashbookViewSet(viewsets.ViewSet):
         ).prefetch_related("split_payments", "items")
 
         # 2. Fetch Expense Outflows
-        expenses_qs = Expense.objects.filter(date__range=(start_date, end_date))
+        expenses_qs = Expense.objects.filter(
+            Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+        )
 
         # 3. Fetch Credit Repayments Inflows
-        repayments_qs = CreditRepayment.objects.filter(created_at__range=(start_dt, end_dt))
+        repayments_qs = CreditRepayment.objects.filter(
+            Q(created_at__range=(start_dt, end_dt)) | Q(date__range=(start_date, end_date))
+        )
 
         # 4. Fetch Purchase Orders / Supplier Transactions
-        purchases_qs = Purchase.objects.filter(purchase_date__range=(start_dt, end_dt))
+        purchases_qs = Purchase.objects.filter(
+            Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+        )
 
         # 5. Fetch Inbound Stock Movements (Restocks, Transfers In, Adjustments In)
         inbound_types = [
@@ -2969,11 +3041,12 @@ class CashbookViewSet(viewsets.ViewSet):
         ).select_related("item", "branch")
 
         # --- USER SCOPE FILTERING ---
-        # Only enforce strict user scoping if the user is NOT staff or a superuser
         if user and not (user.is_staff or user.is_superuser):
             sales_qs = sales_qs.filter(branch__retailer=user)
-            expenses_qs = expenses_qs.filter(retailer=user)
-            repayments_qs = repayments_qs.filter(customer__retailer=user)
+            expenses_qs = expenses_qs.filter(Q(retailer=user) | Q(branch__retailer=user))
+            repayments_qs = repayments_qs.filter(
+                Q(customer__retailer=user) | Q(branch__retailer=user)
+            )
             purchases_qs = purchases_qs.filter(branch__retailer=user)
             stock_movements_qs = stock_movements_qs.filter(branch__retailer=user)
 
@@ -2981,7 +3054,9 @@ class CashbookViewSet(viewsets.ViewSet):
         if branch_obj:
             sales_qs = sales_qs.filter(branch=branch_obj)
             expenses_qs = expenses_qs.filter(branch=branch_obj)
-            repayments_qs = repayments_qs.filter(branch=branch_obj)
+            repayments_qs = repayments_qs.filter(
+                Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+            )
             purchases_qs = purchases_qs.filter(branch=branch_obj)
             stock_movements_qs = stock_movements_qs.filter(branch=branch_obj)
 
@@ -3089,15 +3164,12 @@ class CashbookViewSet(viewsets.ViewSet):
         # --- Aggregate Supplier Purchases and Stock Movements ---
         has_explicit_purchases = False
 
-        # First map explicit purchase order payment methods
         purchase_payment_map = {}
         for purchase in purchases_qs:
             raw_method = getattr(purchase, "payment_method", None) or getattr(purchase, "method", "CASH")
             purchase_payment_map[purchase.pk] = self._normalize_payment_method(raw_method)
 
-        # Aggregate total cost from StockMovement ledger entries
         for sm in stock_movements_qs:
-            # Determine payment method using referenced Purchase ID or fallback to CASH
             method = "CASH"
             if sm.reference_id and sm.reference_id in purchase_payment_map:
                 method = purchase_payment_map[sm.reference_id]
@@ -3105,7 +3177,7 @@ class CashbookViewSet(viewsets.ViewSet):
             if payment_method_param and method != self._normalize_payment_method(payment_method_param):
                 continue
 
-            cost_amount = Decimal(str(sm.total_cost or ZERO))
+            cost_amount = Decimal(str(getattr(sm, "total_cost", ZERO) or ZERO))
             if cost_amount > ZERO:
                 has_explicit_purchases = True
                 total_outflow += cost_amount
@@ -3115,7 +3187,6 @@ class CashbookViewSet(viewsets.ViewSet):
                 purchases_by_method[method]["amount"] += cost_amount
                 purchases_by_method[method]["count"] += 1
 
-        # Fallback to direct Purchase entries if no StockMovement logs were captured
         if not has_explicit_purchases:
             for purchase in purchases_qs:
                 method = purchase_payment_map.get(purchase.pk, "CASH")
@@ -3132,7 +3203,6 @@ class CashbookViewSet(viewsets.ViewSet):
                     purchases_by_method[method]["amount"] += amount
                     purchases_by_method[method]["count"] += 1
 
-        # Fallback to COGS if no explicit purchases or stock movements exist for the period
         if not has_explicit_purchases and calculated_cogs > ZERO:
             calculated_cogs = calculated_cogs.quantize(Decimal("0.01"))
             total_outflow += calculated_cogs
@@ -3223,69 +3293,6 @@ class CashbookViewSet(viewsets.ViewSet):
             status=status.HTTP_200_OK,
         )
 
-import calendar
-from datetime import date, datetime
-from decimal import Decimal
-
-from django.utils import timezone
-from rest_framework import permissions, status, viewsets
-from rest_framework.response import Response
-
-from stocks.models import (
-    ZERO,
-    BranchItemPricing,
-    CreditRepayment,
-    Customer,
-    Expense,
-    Purchase,
-    RetailBranch,
-    SaleTransaction,
-    quantize_money,
-)
-
-
-def _resolve_branch(branch_param, user=None):
-    if not branch_param:
-        return None
-
-    qs = RetailBranch.objects.all()
-    if user and getattr(user, "is_authenticated", False):
-        qs = qs.filter(retailer=user)
-
-    try:
-        if str(branch_param).isdigit():
-            return qs.filter(id=int(branch_param)).first()
-        return qs.filter(name__iexact=str(branch_param).strip()).first()
-    except (TypeError, ValueError):
-        return None
-
-
-ZERO = Decimal("0.00")
-
-
-def quantize_money(val):
-    if val is None:
-        return ZERO
-    return Decimal(str(val)).quantize(Decimal("0.01"))
-
-
-def _authenticated_user(request):
-    return (
-        request.user
-        if getattr(request, "user", None) and request.user.is_authenticated
-        else None
-    )
-
-
-def _resolve_branch(branch_param):
-    if not branch_param:
-        return None
-    from stocks.models import RetailBranch
-
-    if str(branch_param).isdigit():
-        return RetailBranch.objects.filter(id=branch_param).first()
-    return RetailBranch.objects.filter(name=branch_param).first()
-
 
 class BalanceSheetViewSet(viewsets.ViewSet):
     """
@@ -3321,7 +3328,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
 
             else:
                 if date_param:
-                    start_date = datetime.strptime(str(date_param), "%Y-%m-%d").date()
+                    start_date = datetime.strptime(str(date_param).split("T")[0], "%Y-%m-%d").date()
                 else:
                     start_date = today
                 end_date = start_date
@@ -3378,7 +3385,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         )
 
         period_type, start_date, end_date = self._date_range(request)
-        branch_obj = _resolve_branch(branch_param)
+        branch_obj = _resolve_branch(branch_param, user)
 
         cutoff_dt = timezone.make_aware(
             datetime.combine(end_date, datetime.max.time())
@@ -3411,13 +3418,20 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         )
 
         customers_qs = Customer.objects.all()
-        pricing_qs = BranchItemPricing.objects.all()
+
+        if branch_obj:
+            pricing_qs = BranchItemPricing.objects.filter(branch=branch_obj)
+            if not pricing_qs.exists():
+                pricing_qs = BranchItemPricing.objects.all()
+        else:
+            pricing_qs = BranchItemPricing.objects.all()
 
         # --- USER SCOPE FILTERING ---
-        # Only enforce strict user scoping if the user is NOT staff or a superuser
         if user and not (user.is_staff or user.is_superuser):
             sales_qs = sales_qs.filter(branch__retailer=user)
-            repayments_qs = repayments_qs.filter(customer__retailer=user)
+            repayments_qs = repayments_qs.filter(
+                Q(customer__retailer=user) | Q(branch__retailer=user)
+            )
             expenses_qs = expenses_qs.filter(Q(retailer=user) | Q(branch__retailer=user))
             purchases_qs = purchases_qs.filter(branch__retailer=user)
             stock_movements_qs = stock_movements_qs.filter(branch__retailer=user)
@@ -3427,11 +3441,12 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         # --- BRANCH SCOPE FILTERING ---
         if branch_obj:
             sales_qs = sales_qs.filter(branch=branch_obj)
-            repayments_qs = repayments_qs.filter(branch=branch_obj)
+            repayments_qs = repayments_qs.filter(
+                Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+            )
             expenses_qs = expenses_qs.filter(branch=branch_obj)
             purchases_qs = purchases_qs.filter(branch=branch_obj)
             stock_movements_qs = stock_movements_qs.filter(branch=branch_obj)
-            pricing_qs = pricing_qs.filter(branch=branch_obj)
 
         # Calculate Inflows
         sales_cash, sales_receivable = self._sale_cash_and_receivable(sales_qs)
@@ -3461,7 +3476,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
             if sm.reference_id and sm.reference_id in purchase_payment_map:
                 method = purchase_payment_map[sm.reference_id]
 
-            cost_amount = Decimal(str(sm.total_cost or ZERO))
+            cost_amount = Decimal(str(getattr(sm, "total_cost", ZERO) or ZERO))
             if cost_amount > ZERO:
                 has_stock_outflows = True
                 if "CREDIT" in method or "DEBT" in method or "ON_ACCOUNT" in method:
@@ -3496,7 +3511,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         # Accounts Receivable
         try:
             accounts_receivable = sum(
-                (Decimal(str(c.total_outstanding_balance or ZERO)) for c in customers_qs),
+                (Decimal(str(getattr(c, "total_outstanding_balance", ZERO) or ZERO)) for c in customers_qs),
                 ZERO,
             )
         except Exception:
@@ -3504,10 +3519,14 @@ class BalanceSheetViewSet(viewsets.ViewSet):
 
         accounts_receivable = quantize_money(max(accounts_receivable, ZERO))
 
-        # Inventory Value
-        inventory_value = quantize_money(
-            sum((Decimal(str(p.remaining_stock_value or ZERO)) for p in pricing_qs), ZERO)
-        )
+        # Inventory Value with Fallback Pricing
+        inventory_value = ZERO
+        for p in pricing_qs:
+            rem_stock = Decimal(str(getattr(p, "remaining_stock", ZERO) or ZERO))
+            cost_p = Decimal(str(getattr(p, "unit_cost_price", ZERO) or ZERO))
+            inventory_value += (rem_stock * cost_p)
+
+        inventory_value = quantize_money(inventory_value)
 
         fixed_assets = ZERO
 
@@ -3888,14 +3907,16 @@ class FinancialReportViewSet(viewsets.ViewSet):
         target_date=None,
         period_type="day",
     ):
-        pricing = (
-            BranchItemPricing.objects.filter(
+        pricing = None
+        if branch_obj:
+            pricing = BranchItemPricing.objects.filter(
                 branch=branch_obj,
                 item=item_obj,
             ).first()
-            if branch_obj
-            else None
-        )
+
+        # Fallback to any available pricing record if branch pricing doesn't exist
+        if not pricing:
+            pricing = BranchItemPricing.objects.filter(item=item_obj).first()
 
         current_qty = (
             pricing.remaining_stock
@@ -4243,7 +4264,16 @@ class FinancialReportViewSet(viewsets.ViewSet):
             sales_qs = SaleTransaction.objects.all()
             movements_qs = StockMovement.objects.all()
             repayment_qs = CreditRepayment.objects.all()
-            items_qs = Item.objects.all()
+
+            if branch_obj:
+                items_qs = Item.objects.filter(
+                    Q(branch_pricings__branch=branch_obj) | Q(stockmovement__branch=branch_obj)
+                ).distinct()
+            else:
+                items_qs = Item.objects.all()
+
+            if not items_qs.exists():
+                items_qs = Item.objects.all()
 
             purchases_qs = (
                 Purchase.objects.all()
@@ -5024,6 +5054,9 @@ class FinancialReportViewSet(viewsets.ViewSet):
                     if branch_obj
                     else None
                 )
+
+                if not pricing:
+                    pricing = BranchItemPricing.objects.filter(item=item_obj).first()
 
                 c_price = (
                     pricing.unit_cost_price
