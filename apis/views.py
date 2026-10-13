@@ -3620,57 +3620,6 @@ class BalanceSheetViewSet(viewsets.ViewSet):
     
       
 
-from decimal import Decimal, ROUND_HALF_UP
-
-import calendar
-from datetime import date, datetime
-from decimal import Decimal
-
-from django.db import models
-from django.db.models import Q, Sum
-from django.db.models.functions import Coalesce
-from django.utils import timezone
-from rest_framework import permissions, status, viewsets
-from rest_framework.decorators import action
-from rest_framework.response import Response
-
-
-import calendar
-from datetime import datetime, date, timedelta
-from decimal import Decimal
-
-from django.db import models
-from django.db.models import Q, Sum, F
-from django.db.models.functions import Coalesce
-from django.utils import timezone
-from rest_framework import permissions, status, viewsets
-from rest_framework.decorators import action
-from rest_framework.response import Response
-
-
-ZERO = Decimal("0.00")
-
-def quantize_money(amount):
-    if amount is None:
-        return ZERO
-    return Decimal(str(amount)).quantize(Decimal("0.01"))
-
-
-from decimal import Decimal
-import calendar
-from datetime import datetime, date, timedelta
-from django.db import models
-from django.db.models import Q, Sum
-from django.db.models.functions import Coalesce
-from django.utils import timezone
-from rest_framework import viewsets, permissions, status
-from rest_framework.decorators import action
-from rest_framework.response import Response
-
-# Assuming quantize_money, ZERO, RetailBranch, Expense, SaleTransaction,
-# StockMovement, CreditRepayment, Purchase, Item, BranchItemPricing, SaleItem
-# are defined in your module or imports.
-
 import calendar
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -3813,11 +3762,9 @@ class FinancialReportViewSet(viewsets.ViewSet):
         ]
 
         for name in [
-            "date",
-            "payment_date",
             "sale_date",
             "purchase_date",
-            "transaction_date",
+            "date",
             "created_at",
             "updated_at",
         ]:
@@ -3917,7 +3864,6 @@ class FinancialReportViewSet(viewsets.ViewSet):
                 item=item_obj,
             ).first()
 
-        # Fallback to any available pricing record if branch pricing doesn't exist
         if not pricing:
             pricing = BranchItemPricing.objects.filter(item=item_obj).first()
 
@@ -3956,7 +3902,7 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
         mv_filter = Q(
             item=item_obj,
-            date__gt=cutoff_dt.date(),
+            created_at__gt=cutoff_dt,
         )
 
         if branch_obj:
@@ -4270,7 +4216,7 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
             if branch_obj:
                 items_qs = Item.objects.filter(
-                    Q(branch_pricings__branch=branch_obj) | Q(stockmovement__branch=branch_obj)
+                    Q(branch_pricings__branch=branch_obj) | Q(stock_movements__branch=branch_obj)
                 ).distinct()
             else:
                 items_qs = Item.objects.all()
@@ -4278,20 +4224,15 @@ class FinancialReportViewSet(viewsets.ViewSet):
             if not items_qs.exists():
                 items_qs = Item.objects.all()
 
-            purchases_qs = (
-                Purchase.objects.all()
-                if Purchase is not None
-                else None
-            )
+            purchases_qs = Purchase.objects.all()
 
             # ==========================================================
             # 3. USER SCOPE
             # ==========================================================
 
-            # Only enforce strict user scoping if the user is NOT staff or a superuser
             if user and not (user.is_staff or user.is_superuser):
                 expense_qs = expense_qs.filter(
-                    retailer=user
+                    Q(retailer=user) | Q(branch__retailer=user)
                 )
 
                 sales_qs = sales_qs.filter(
@@ -4306,49 +4247,15 @@ class FinancialReportViewSet(viewsets.ViewSet):
                     retailer=user
                 )
 
-                repayment_filter = Q()
+                repayment_qs = repayment_qs.filter(
+                    Q(customer__retailer=user)
+                    | Q(branch__retailer=user)
+                    | Q(transaction__branch__retailer=user)
+                )
 
-                if hasattr(
-                    CreditRepayment,
-                    "retailer",
-                ):
-                    repayment_filter |= Q(
-                        retailer=user
-                    )
-
-                if hasattr(
-                    CreditRepayment,
-                    "branch",
-                ):
-                    repayment_filter |= Q(
-                        branch__retailer=user
-                    )
-
-                if hasattr(
-                    CreditRepayment,
-                    "customer",
-                ):
-                    repayment_filter |= Q(
-                        customer__retailer=user
-                    )
-
-                if hasattr(
-                    CreditRepayment,
-                    "transaction",
-                ):
-                    repayment_filter |= Q(
-                        transaction__branch__retailer=user
-                    )
-
-                if repayment_filter:
-                    repayment_qs = repayment_qs.filter(
-                        repayment_filter
-                    )
-
-                if purchases_qs is not None:
-                    purchases_qs = purchases_qs.filter(
-                        branch__retailer=user
-                    )
+                purchases_qs = purchases_qs.filter(
+                    branch__retailer=user
+                )
 
             # ==========================================================
             # 4. BRANCH SCOPE
@@ -4367,24 +4274,14 @@ class FinancialReportViewSet(viewsets.ViewSet):
                     branch=branch_obj
                 )
 
-                if hasattr(
-                    CreditRepayment,
-                    "branch",
-                ):
-                    repayment_qs = repayment_qs.filter(
-                        Q(branch=branch_obj)
-                        | Q(
-                            transaction__branch=branch_obj
-                        )
-                        | Q(
-                            branch__isnull=True
-                        )
-                    )
+                repayment_qs = repayment_qs.filter(
+                    Q(branch=branch_obj)
+                    | Q(transaction__branch=branch_obj)
+                )
 
-                if purchases_qs is not None:
-                    purchases_qs = purchases_qs.filter(
-                        branch=branch_obj
-                    )
+                purchases_qs = purchases_qs.filter(
+                    branch=branch_obj
+                )
 
             # ==========================================================
             # 5. PERIOD RANGE
@@ -4427,21 +4324,18 @@ class FinancialReportViewSet(viewsets.ViewSet):
             repayment_scope_qs = repayment_qs
 
             repayment_qs = repayment_scope_qs.filter(
-                date__range=(
-                    start_dt.date(),
-                    end_dt.date(),
-                )
+                Q(date__range=(start_dt.date(), end_dt.date()))
+                | Q(created_at__range=(start_dt, end_dt))
             )
 
-            if purchases_qs is not None:
-                purchases_qs = self._filter_date_queryset(
-                    purchases_qs,
-                    Purchase,
-                    start_dt,
-                    end_dt,
-                    target_date,
-                    period_type,
-                )
+            purchases_qs = self._filter_date_queryset(
+                purchases_qs,
+                Purchase,
+                start_dt,
+                end_dt,
+                target_date,
+                period_type,
+            )
 
             # ==========================================================
             # 6. CREDIT TRANSACTION IDENTIFICATION
@@ -4463,10 +4357,7 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
             purchases_cost_val = ZERO
 
-            if (
-                purchases_qs is not None
-                and purchases_qs.exists()
-            ):
+            if purchases_qs.exists():
                 for purchase in purchases_qs:
                     amount = getattr(
                         purchase,
@@ -4536,18 +4427,7 @@ class FinancialReportViewSet(viewsets.ViewSet):
                 expenses_breakdown.append(
                     {
                         "id": exp.id,
-                        "name": (
-                            getattr(
-                                exp,
-                                "title",
-                                None,
-                            )
-                            or getattr(
-                                exp,
-                                "category",
-                                "Expense",
-                            )
-                        ),
+                        "name": exp.description or "Expense",
                         "amount": float(amt),
                         "receipt_number": (
                             f"EXP-{exp.id}"
@@ -4562,21 +4442,8 @@ class FinancialReportViewSet(viewsets.ViewSet):
                                 exp_date or ""
                             )
                         ),
-                        "description": (
-                            getattr(
-                                exp,
-                                "description",
-                                "",
-                            )
-                            or ""
-                        ),
-                        "payment_method": (
-                            getattr(
-                                exp,
-                                "payment_method",
-                                "CASH",
-                            )
-                        ),
+                        "description": exp.description or "",
+                        "payment_method": "CASH",
                     }
                 )
 
@@ -4849,7 +4716,6 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
                 sales_revenue_total += rep_amt
 
-                # Calculate proportional COGS for the repaid credit amount
                 if rep.transaction:
                     rep_sale = rep.transaction
                     rep_sale_total = Decimal(str(getattr(rep_sale, "total_amount", ZERO) or ZERO))
@@ -5258,7 +5124,6 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
                     cogs_val += paid_cost_share
 
-            # Include the recognized COGS additions from credit repayments
             cogs_val += cogs_repayment_additions
 
             # ==========================================================
@@ -5450,46 +5315,11 @@ class FinancialReportViewSet(viewsets.ViewSet):
                         branch__retailer=user
                     )
 
-                    repayment_scope = Q()
-
-                    if hasattr(
-                        CreditRepayment,
-                        "retailer",
-                    ):
-                        repayment_scope |= Q(
-                            retailer=user
-                        )
-
-                    if hasattr(
-                        CreditRepayment,
-                        "branch",
-                    ):
-                        repayment_scope |= Q(
-                            branch__retailer=user
-                        )
-
-                    if hasattr(
-                        CreditRepayment,
-                        "customer",
-                    ):
-                        repayment_scope |= Q(
-                            customer__retailer=user
-                        )
-
-                    if hasattr(
-                        CreditRepayment,
-                        "transaction",
-                    ):
-                        repayment_scope |= Q(
-                            transaction__branch__retailer=user
-                        )
-
-                    if repayment_scope:
-                        all_repayments = (
-                            all_repayments.filter(
-                                repayment_scope
-                            )
-                        )
+                    all_repayments = all_repayments.filter(
+                        Q(customer__retailer=user)
+                        | Q(branch__retailer=user)
+                        | Q(transaction__branch__retailer=user)
+                    )
 
                 if branch_obj:
 
@@ -5497,24 +5327,10 @@ class FinancialReportViewSet(viewsets.ViewSet):
                         branch=branch_obj
                     )
 
-                    if hasattr(
-                        CreditRepayment,
-                        "branch",
-                    ):
-                        all_repayments = (
-                            all_repayments.filter(
-                                Q(
-                                    branch=branch_obj
-                                )
-                                | Q(
-                                    transaction__branch=
-                                    branch_obj
-                                )
-                                | Q(
-                                    branch__isnull=True
-                                )
-                            )
-                        )
+                    all_repayments = all_repayments.filter(
+                        Q(branch=branch_obj)
+                        | Q(transaction__branch=branch_obj)
+                    )
 
                 all_credit_transaction_ids = set(
                     all_repayments
@@ -5526,40 +5342,9 @@ class FinancialReportViewSet(viewsets.ViewSet):
                     .distinct()
                 )
 
-                sales_date_field = (
-                    self._get_date_fieldname(
-                        SaleTransaction
-                    )
-                )
-
-                if sales_date_field:
-
-                    sales_field = (
-                        SaleTransaction._meta.get_field(
-                            sales_date_field
-                        )
-                    )
-
-                    if (
-                        sales_field.get_internal_type()
-                        == "DateTimeField"
-                    ):
-                        all_sales = all_sales.filter(
-                            **{
-                                f"{sales_date_field}__lte":
-                                    end_dt
-                            }
-                        )
-                    else:
-                        all_sales = all_sales.filter(
-                            **{
-                                f"{sales_date_field}__lte":
-                                    target_date
-                            }
-                        )
-
+                all_sales = all_sales.filter(sale_date__lte=end_dt)
                 all_repayments = all_repayments.filter(
-                    date__lte=target_date
+                    Q(date__lte=target_date) | Q(created_at__lte=end_dt)
                 )
 
                 cumulative_credit_sales = ZERO
