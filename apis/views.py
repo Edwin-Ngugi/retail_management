@@ -522,6 +522,10 @@ class CustomerViewSet(viewsets.ModelViewSet):
 # CREDIT REPAYMENT
 # ============================================================
 
+# ============================================================
+# CREDIT REPAYMENT
+# ============================================================
+
 class CreditRepaymentViewSet(viewsets.ModelViewSet):
     serializer_class = CreditRepaymentSerializer
     permission_classes = [permissions.AllowAny]
@@ -544,14 +548,59 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             or self.request.query_params.get("branch_id")
         )
 
+        month_param = self.request.query_params.get("month")
+        year_param = self.request.query_params.get("year")
+        date_param = self.request.query_params.get("date") or self.request.query_params.get("selectedDate")
+        period_type = (
+            self.request.query_params.get("period_type")
+            or self.request.query_params.get("periodType")
+            or "day"
+        ).lower().strip()
+
+        # 1. Branch Filter (Global Unfiltered by User)
+        if branch_id and str(branch_id).lower() != "all":
+            if str(branch_id).isdigit():
+                queryset = queryset.filter(
+                    Q(branch_id=int(branch_id)) | Q(transaction__branch_id=int(branch_id))
+                )
+            else:
+                queryset = queryset.filter(
+                    Q(branch__name__iexact=str(branch_id).strip())
+                    | Q(transaction__branch__name__iexact=str(branch_id).strip())
+                )
+
         if customer_id:
             queryset = queryset.filter(customer_id=customer_id)
 
-        if branch_id and str(branch_id).lower() != "all":
-            if str(branch_id).isdigit():
-                queryset = queryset.filter(branch_id=int(branch_id))
-            else:
-                queryset = queryset.filter(branch__name__iexact=str(branch_id).strip())
+        # 2. Date Range Filter
+        today = timezone.localdate()
+        if period_type == "month" or (month_param and year_param):
+            yr = int(year_param) if year_param else today.year
+            mth = int(month_param) if month_param else today.month
+            _, last_day = calendar.monthrange(yr, mth)
+            start_date = date(yr, mth, 1)
+            end_date = date(yr, mth, last_day)
+
+            tz = timezone.get_current_timezone()
+            start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
+            end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
+
+            queryset = queryset.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+
+        elif period_type == "year" and year_param:
+            yr = int(year_param)
+            start_date = date(yr, 1, 1)
+            end_date = date(yr, 12, 31)
+
+            tz = timezone.get_current_timezone()
+            start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
+            end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
+
+            queryset = queryset.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
 
         return queryset
 
@@ -2196,7 +2245,6 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             status=PendingApproval.Status.PENDING,
         )
 
-        # Offload non-blocking email notification to management
         send_management_review_email(approval)
 
         serializer = self.get_serializer(approval)
@@ -2209,7 +2257,6 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
         """
         instance = serializer.save()
 
-        # Resend email if request status is PENDING or reset to PENDING
         if instance.status == PendingApproval.Status.PENDING:
             send_management_review_email(instance)
 
@@ -2285,27 +2332,22 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
-
-
     def get_queryset(self):
         """
         Custom query filtering:
-        - Admins / Superusers / Management see ALL approval requests (including those by other admins).
-        - Regular non-staff users only see requests submitted by non-staff/regular users, 
-          excluding requests submitted by Admins (is_staff/is_superuser).
+        - Admins / Superusers / Management see ALL approval requests.
+        - Regular non-staff users only see requests submitted by non-staff/regular users.
         """
         user = self.request.user
         queryset = PendingApproval.objects.all().order_by("-created_at")
 
-        # Admins, superusers, and staff see everything
         if user.is_staff or user.is_superuser:
             return queryset
 
-        # Regular users: exclude any requests submitted by admin or superuser accounts
         return queryset.filter(
             submitted_by__is_staff=False,
             submitted_by__is_superuser=False
-        )    
+        )
 
     # ------------------------------------------------------------------
     # ONE-CLICK EMAIL ACTIONS (NO LOGIN REQUIRED)
@@ -2392,7 +2434,6 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             elif req_type == getattr(PendingApproval.RequestType, "SALE_ENTRY", "SALE_ENTRY"):
                 self._commit_sale_entry(approval.payload)
 
-            # Update status
             approval.status = PendingApproval.Status.APPROVED
             if reviewer:
                 approval.reviewed_by = reviewer
@@ -2419,11 +2460,9 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
         """
         items_data = payload.get("items", [])
         
-        # Single-item payload normalization
         if not items_data and ("name" in payload or "item_name" in payload or "item_id" in payload):
             items_data = [payload]
 
-        # Resolve target branch ID or Name
         branch_identifier = (
             payload.get("target_branch") 
             or payload.get("branch_id") 
@@ -2441,7 +2480,6 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             else:
                 target_branch = RetailBranch.objects.filter(name__iexact=str(branch_identifier).strip()).first()
 
-        # Fallback to the first available branch if branch_identifier wasn't found
         if not target_branch:
             target_branch = RetailBranch.objects.first()
 
@@ -2453,14 +2491,23 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             item_id = item_data.get("item_id") or item_data.get("id")
             item_name = item_data.get("name") or item_data.get("item_name")
 
-            # 1. Fetch existing item or create master Item
             if item_id:
                 item = Item.objects.filter(id=item_id).first()
 
+            unit_cost = Decimal(str(
+                item_data.get("unit_cost_price") 
+                or item_data.get("cost_price") 
+                or "0.00"
+            ))
+            
+            unit_retail = Decimal(str(
+                item_data.get("unit_retail_price") 
+                or item_data.get("unit_selling_price") 
+                or item_data.get("retail_price") 
+                or "0.00"
+            ))
+
             if not item and item_name:
-                unit_cost = Decimal(str(item_data.get("unit_cost_price") or item_data.get("cost_price") or "0.00"))
-                unit_retail = Decimal(str(item_data.get("unit_retail_price") or item_data.get("unit_selling_price") or item_data.get("retail_price") or "0.00"))
-                
                 item, _ = Item.objects.get_or_create(
                     name=item_name.strip(),
                     defaults={
@@ -2472,20 +2519,6 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             if not item:
                 continue
 
-            # 2. Extract values with full fallback aliases
-            unit_cost = Decimal(str(
-                item_data.get("unit_cost_price") 
-                or item_data.get("cost_price") 
-                or getattr(item, "unit_cost_price", 0)
-            ))
-            
-            unit_retail = Decimal(str(
-                item_data.get("unit_retail_price") 
-                or item_data.get("unit_selling_price") 
-                or item_data.get("retail_price") 
-                or getattr(item, "unit_retail_price", 0)
-            ))
-            
             opening_stock = int(
                 item_data.get("opening_stock") 
                 or item_data.get("remaining_stock") 
@@ -2495,14 +2528,12 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             
             min_threshold = int(item_data.get("min_stock_threshold", 5))
 
-            # 3. Save to BranchItemPricing (handling both possible column names)
             pricing_defaults = {
                 "unit_cost_price": unit_cost,
                 "remaining_stock": opening_stock,
                 "min_stock_threshold": min_threshold,
             }
 
-            # Account for model field naming variations (unit_selling_price vs unit_retail_price)
             if hasattr(BranchItemPricing, "unit_selling_price"):
                 pricing_defaults["unit_selling_price"] = unit_retail
             if hasattr(BranchItemPricing, "unit_retail_price"):
@@ -2512,44 +2543,6 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
                 branch=target_branch,
                 item=item,
                 defaults=pricing_defaults,
-            )
-
-            if not item:
-                continue
-
-            # 2. Parse prices and opening stock
-            unit_cost = Decimal(str(
-                item_data.get("unit_cost_price") 
-                or item_data.get("cost_price") 
-                or getattr(item, "unit_cost_price", 0)
-            ))
-            
-            unit_retail = Decimal(str(
-                item_data.get("unit_retail_price") 
-                or item_data.get("unit_selling_price") 
-                or item_data.get("retail_price") 
-                or getattr(item, "unit_retail_price", 0)
-            ))
-            
-            opening_stock = int(
-                item_data.get("opening_stock") 
-                or item_data.get("remaining_stock") 
-                or item_data.get("quantity") 
-                or 0
-            )
-            
-            min_threshold = int(item_data.get("min_stock_threshold", 5))
-
-            # 3. Create or update BranchItemPricing linking item -> target branch
-            BranchItemPricing.objects.update_or_create(
-                branch=target_branch,
-                item=item,
-                defaults={
-                    "unit_cost_price": unit_cost,
-                    "unit_selling_price": unit_retail,
-                    "remaining_stock": opening_stock,
-                    "min_stock_threshold": min_threshold,
-                },
             )
 
     def _commit_sale_entry(self, payload):
@@ -2595,15 +2588,21 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
                 },
             )
 
+            pricing_defaults = {
+                "unit_cost_price": unit_cost,
+                "remaining_stock": stock,
+                "min_stock_threshold": min_threshold,
+            }
+
+            if hasattr(BranchItemPricing, "unit_selling_price"):
+                pricing_defaults["unit_selling_price"] = unit_retail
+            if hasattr(BranchItemPricing, "unit_retail_price"):
+                pricing_defaults["unit_retail_price"] = unit_retail
+
             BranchItemPricing.objects.update_or_create(
                 branch=branch,
                 item=item,
-                defaults={
-                    "unit_cost_price": unit_cost,
-                    "unit_selling_price": unit_retail,
-                    "remaining_stock": stock,
-                    "min_stock_threshold": min_threshold,
-                },
+                defaults=pricing_defaults,
             )
 
 
