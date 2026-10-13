@@ -78,6 +78,62 @@ class RetailBranch(models.Model):
     def __str__(self):
         return f"{self.name} ({self.retailer.username})"
 
+# -----------------------------------------------------------------------------
+# Branch Stock Model (Fast Inventory Lookups & Branch Quantities)
+# -----------------------------------------------------------------------------
+class BranchStock(models.Model):
+    branch = models.ForeignKey(
+        RetailBranch,
+        on_delete=models.CASCADE,
+        related_name="branch_stocks",
+        help_text="The branch holding this inventory record"
+    )
+    item = models.ForeignKey(
+        'Item',  # Quoted as string so Django resolves it lazily
+        on_delete=models.CASCADE,
+        related_name="branch_stocks",
+        help_text="The item tied to this branch stock"
+    )
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        default=ZERO,
+        validators=[MinValueValidator(ZERO)],
+        help_text="Current real-time stock level at this branch"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["branch", "item"],
+                name="unique_stock_per_branch_item",
+            )
+        ]
+        indexes = [
+            # Composite index for instant branch stock lookups
+            models.Index(fields=["branch", "item"]),
+            models.Index(fields=["branch", "quantity"]),
+        ]
+        ordering = ["item__name"]
+
+    def clean(self):
+        super().clean()
+        if hasattr(self, "branch") and self.branch and hasattr(self, "item") and self.item:
+            if self.item.retailer_id is None and self.branch.retailer_id is not None:
+                self.item.retailer = self.branch.retailer
+                self.item.save(update_fields=["retailer"])
+            elif self.branch.retailer_id != self.item.retailer_id:
+                raise ValidationError("The branch and item must belong to the same retailer.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.item.name} @ {self.branch.name}: {self.quantity} in stock"
+
 
 class Customer(models.Model):
     retailer = models.ForeignKey(
