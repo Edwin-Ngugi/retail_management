@@ -4,6 +4,8 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (
     ItemViewSet,
+    PurchaseViewSet,
+    SupplierPaymentViewSet,
     SaleTransactionViewSet,
     CreditRepaymentViewSet,
     ExpenseViewSet,
@@ -25,6 +27,8 @@ from .views import (
 
 router = DefaultRouter()
 router.register(r'items', ItemViewSet, basename='item')
+router.register(r'purchases', PurchaseViewSet, basename='purchase')
+router.register(r'supplier-payments', SupplierPaymentViewSet, basename='supplier-payment')
 router.register(r'sales', SaleTransactionViewSet, basename='sale')
 router.register(r'expenses', ExpenseViewSet, basename='expense')
 router.register(r'reports', FinancialReportViewSet, basename='reports')

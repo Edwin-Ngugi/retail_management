@@ -1166,9 +1166,17 @@ class StockTransfer(models.Model):
 
 
 # -----------------------------------------------------------------------------
-# Purchase Entry Model
+# Purchase Entry & Supplier Payment Models
 # -----------------------------------------------------------------------------
 class Purchase(models.Model):
+    class PaymentMethod(models.TextChoices):
+        CASH = "CASH", "Cash"
+        MPESA = "MPESA", "M-Pesa"
+        PAYBILL = "PAYBILL", "Paybill"
+        SEND_MONEY = "SEND_MONEY", "Send Money"
+        BANK_TRANSFER = "BANK_TRANSFER", "Bank Transfer"
+        CREDIT = "CREDIT", "Credit / On Account"
+
     branch = models.ForeignKey(
         RetailBranch,
         on_delete=models.CASCADE,
@@ -1206,6 +1214,20 @@ class Purchase(models.Model):
         validators=[MinValueValidator(ZERO)],
     )
 
+    payment_method = models.CharField(
+        max_length=30,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.CASH,
+    )
+
+    amount_paid = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=ZERO,
+        validators=[MinValueValidator(ZERO)],
+        help_text="Total amount repaid so far for credit purchases",
+    )
+
     purchase_date = models.DateTimeField(default=timezone.now)
 
     created_by = models.ForeignKey(
@@ -1216,11 +1238,25 @@ class Purchase(models.Model):
         related_name="purchases_created",
     )
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_auto_now_add=True) if hasattr(models.DateTimeField, "auto_auto_now_add") else models.DateTimeField(auto_now_add=True)
 
     @property
     def total_cost(self):
         return quantize_money(Decimal(str(self.quantity)) * self.unit_cost_price)
+
+    @property
+    def balance_due(self):
+        return quantize_money(max(ZERO, self.total_cost - Decimal(str(self.amount_paid or ZERO))))
+
+    @property
+    def is_credit(self):
+        return self.payment_method == self.PaymentMethod.CREDIT
+
+    @property
+    def is_fully_paid(self):
+        if not self.is_credit:
+            return True
+        return self.balance_due <= ZERO
 
     def clean(self):
         super().clean()
@@ -1232,6 +1268,10 @@ class Purchase(models.Model):
             if item_retailer_id is None and branch_retailer_id is not None:
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
+
+        # Auto-set fully paid if payment method is non-credit cash/mobile
+        if self.payment_method != self.PaymentMethod.CREDIT and (not self.amount_paid or self.amount_paid == ZERO):
+            self.amount_paid = self.total_cost
 
     @db_transaction.atomic
     def save(self, *args, **kwargs):
@@ -1277,7 +1317,7 @@ class Purchase(models.Model):
             created_at=self.purchase_date,
             reference=f"PURCHASE-{self.pk}",
             reference_id=self.pk,
-            notes=f"Purchase from {supplier_disp_name}".strip(),
+            notes=f"Purchase ({self.get_payment_method_display()}) from {supplier_disp_name}".strip(),
             created_by=self.created_by,
         )
 
@@ -1306,8 +1346,72 @@ class Purchase(models.Model):
         return (
             f"{self.item.name} "
             f"({self.branch.name}) - "
-            f"Purchase ({self.quantity})"
+            f"Purchase ({self.quantity}) [{self.payment_method}]"
         )
+
+
+class SupplierPayment(models.Model):
+    class PaymentMethod(models.TextChoices):
+        CASH = "CASH", "Cash"
+        MPESA = "MPESA", "M-Pesa"
+        PAYBILL = "PAYBILL", "Paybill"
+        SEND_MONEY = "SEND_MONEY", "Send Money"
+        BANK_TRANSFER = "BANK_TRANSFER", "Bank Transfer"
+
+    purchase = models.ForeignKey(
+        Purchase,
+        on_delete=models.CASCADE,
+        related_name="supplier_payments",
+    )
+
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+
+    payment_method = models.CharField(
+        max_length=30,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.CASH,
+    )
+
+    notes = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def clean(self):
+        super().clean()
+        if self.purchase_id:
+            balance = self.purchase.balance_due
+            if self.amount > balance:
+                raise ValidationError(
+                    f"Repayment amount (KSh {self.amount}) exceeds outstanding balance (KSh {balance})."
+                )
+
+    @db_transaction.atomic
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+        # Update purchase model amount_paid field
+        p = self.purchase
+        p.amount_paid = Decimal(str(p.amount_paid or ZERO)) + Decimal(str(self.amount))
+        p.save(update_fields=["amount_paid"])
+
+        # Record expense entry for cashbook accounting
+        Expense.objects.create(
+            branch=p.branch,
+            retailer=p.branch.retailer if p.branch else None,
+            description=f"Supplier Repayment ({p.item.name}): {self.notes}".strip(),
+            amount=self.amount,
+            date=timezone.localdate(),
+        )
+
+    def __str__(self):
+        return f"Supplier Payment: KSh {self.amount} for PO #{self.purchase_id}"
 
 
 # -----------------------------------------------------------------------------
@@ -2379,10 +2483,16 @@ class Expense(models.Model):
         return f"{self.description} - KSh {self.amount} ({branch_name})"
 
 
+import uuid
+from django.db import models
+from django.conf import settings
+
 class PendingApproval(models.Model):
     class RequestType(models.TextChoices):
         SALE_ENTRY = "SALE_ENTRY", "Sale Entry"
         BRANCH_CREATION = "BRANCH_CREATION", "Branch & Items"
+        RESTOCK_PURCHASE = "RESTOCK_PURCHASE", "Restock / Purchase Order"
+        STOCK_OPERATION = "STOCK_OPERATION", "Inline Stock & Price Operations"
 
     class Status(models.TextChoices):
         PENDING = "PENDING", "Pending Approval"

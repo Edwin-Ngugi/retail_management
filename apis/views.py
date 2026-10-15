@@ -793,8 +793,8 @@ class ItemViewSet(viewsets.ModelViewSet):
         return context
 
     def get_queryset(self):
-        # Fetch all items across the business regardless of which user logged in
-        queryset = Item.objects.select_related("retailer").all().order_by("-id")
+        # Fetch all base items with retailer relation preloaded
+        queryset = Item.objects.select_related("retailer").all().order_by("name")
 
         query_params = getattr(self.request, "query_params", {}) if hasattr(self, "request") else {}
         try:
@@ -825,7 +825,7 @@ class ItemViewSet(viewsets.ModelViewSet):
             except ValueError:
                 pass
 
-        # Apply Branch and Date filtering
+        # Apply Branch and Date filtering with prefetching to avoid N+1 queries
         if branch_param:
             branch_param_str = str(branch_param).strip()
             pricing_filter = date_filter
@@ -1059,6 +1059,15 @@ class ItemViewSet(viewsets.ModelViewSet):
             except (TypeError, ValueError):
                 return Response({"opening_stock": "opening_stock must be a valid integer."}, status=status.HTTP_400_BAD_REQUEST)
 
+        remaining_stock_val = None
+        if "remaining_stock" in data and data.get("remaining_stock") not in (None, ""):
+            try:
+                remaining_stock_val = Decimal(str(data.get("remaining_stock")))
+                if remaining_stock_val < 0:
+                    return Response({"remaining_stock": "remaining_stock cannot be negative."}, status=status.HTTP_400_BAD_REQUEST)
+            except (TypeError, ValueError):
+                return Response({"remaining_stock": "remaining_stock must be a valid number."}, status=status.HTTP_400_BAD_REQUEST)
+
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         try:
             serializer.is_valid(raise_exception=True)
@@ -1084,15 +1093,43 @@ class ItemViewSet(viewsets.ModelViewSet):
                             pricing.unit_retail_price = unit_retail
                             pricing_changed = True
 
+                        if unit_cost is not None:
+                            pricing.unit_cost_price = unit_cost
+                            pricing_changed = True
+
                         has_movements = StockMovement.objects.filter(item=item, branch=branch_obj).exists()
 
                         if opening_stock is not None and not has_movements:
                             pricing.opening_stock = opening_stock
                             pricing_changed = True
 
-                        if unit_cost is not None and not has_movements:
-                            pricing.unit_cost_price = unit_cost
-                            pricing.opening_stock_unit_cost_price = unit_cost
+                        # Adjust remaining stock directly without affecting purchase restock movement counts
+                        if remaining_stock_val is not None:
+                            totals = StockMovement.objects.filter(
+                                branch=branch_obj, item=item
+                            ).aggregate(
+                                stock_in=Coalesce(
+                                    Sum("quantity", filter=Q(movement_type__in=[
+                                        StockMovement.MovementType.PURCHASE,
+                                        StockMovement.MovementType.CUSTOMER_RETURN,
+                                        StockMovement.MovementType.TRANSFER_IN,
+                                        StockMovement.MovementType.ADJUSTMENT_IN,
+                                    ])),
+                                    ZERO, output_field=DecimalField()
+                                ),
+                                stock_out=Coalesce(
+                                    Sum("quantity", filter=Q(movement_type__in=[
+                                        StockMovement.MovementType.SALE,
+                                        StockMovement.MovementType.SUPPLIER_RETURN,
+                                        StockMovement.MovementType.TRANSFER_OUT,
+                                        StockMovement.MovementType.DAMAGE,
+                                        StockMovement.MovementType.ADJUSTMENT_OUT,
+                                    ])),
+                                    ZERO, output_field=DecimalField()
+                                )
+                            )
+                            net_movements = Decimal(str(totals["stock_in"] or ZERO)) - Decimal(str(totals["stock_out"] or ZERO))
+                            pricing.opening_stock = remaining_stock_val - net_movements
                             pricing_changed = True
 
                         if pricing_changed:
@@ -1103,7 +1140,7 @@ class ItemViewSet(viewsets.ModelViewSet):
                         pricing = BranchItemPricing.objects.create(
                             item=item,
                             branch=branch_obj,
-                            opening_stock=opening_stock or 0,
+                            opening_stock=opening_stock or remaining_stock_val or 0,
                             opening_stock_unit_cost_price=unit_cost or Decimal("0.00"),
                             unit_cost_price=unit_cost or Decimal("0.00"),
                             unit_retail_price=unit_retail or Decimal("0.00"),
@@ -1136,6 +1173,116 @@ class ItemViewSet(viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         kwargs["partial"] = True
         return self.update(request, *args, **kwargs)
+
+    @action(
+        detail=False,
+        methods=["post", "patch"],
+        url_path="bulk-update",
+        permission_classes=[permissions.AllowAny],
+    )
+    def bulk_update(self, request):
+        """
+        Batch updates price (cost/retail) or modifies remaining stock across multiple items.
+        Modifying remaining stock recalculates opening stock baseline so restock history remains untouched.
+        """
+        branch_id = self._get_branch_id_from_request(request)
+        if not branch_id:
+            return Response(
+                {"error": "Branch ID is required for bulk update."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        branch_obj = _resolve_branch(branch_id)
+        if not branch_obj:
+            return Response(
+                {"error": "Valid branch is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        items_updates = request.data.get("items", [])
+        if not isinstance(items_updates, list) or not items_updates:
+            return Response(
+                {"error": "A list of item updates is required under key 'items'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        updated_items = []
+
+        try:
+            with transaction.atomic():
+                for update_data in items_updates:
+                    item_id = update_data.get("id") or update_data.get("item_id")
+                    if not item_id:
+                        continue
+
+                    pricing = BranchItemPricing.objects.select_for_update().filter(
+                        item_id=item_id, branch=branch_obj
+                    ).first()
+
+                    if not pricing:
+                        continue
+
+                    # Update Retail Price
+                    if "unit_retail_price" in update_data and update_data["unit_retail_price"] not in (None, ""):
+                        pricing.unit_retail_price = Decimal(str(update_data["unit_retail_price"]))
+
+                    # Update Cost Price
+                    if "unit_cost_price" in update_data and update_data["unit_cost_price"] not in (None, ""):
+                        pricing.unit_cost_price = Decimal(str(update_data["unit_cost_price"]))
+
+                    # Modify Remaining Stock directly without altering purchase restock history
+                    if "remaining_stock" in update_data and update_data["remaining_stock"] not in (None, ""):
+                        new_remaining = Decimal(str(update_data["remaining_stock"]))
+                        
+                        totals = StockMovement.objects.filter(
+                            branch=branch_obj, item_id=item_id
+                        ).aggregate(
+                            stock_in=Coalesce(
+                                Sum("quantity", filter=Q(movement_type__in=[
+                                    StockMovement.MovementType.PURCHASE,
+                                    StockMovement.MovementType.CUSTOMER_RETURN,
+                                    StockMovement.MovementType.TRANSFER_IN,
+                                    StockMovement.MovementType.ADJUSTMENT_IN,
+                                ])),
+                                ZERO, output_field=DecimalField()
+                            ),
+                            stock_out=Coalesce(
+                                Sum("quantity", filter=Q(movement_type__in=[
+                                    StockMovement.MovementType.SALE,
+                                    StockMovement.MovementType.SUPPLIER_RETURN,
+                                    StockMovement.MovementType.TRANSFER_OUT,
+                                    StockMovement.MovementType.DAMAGE,
+                                    StockMovement.MovementType.ADJUSTMENT_OUT,
+                                ])),
+                                ZERO, output_field=DecimalField()
+                            )
+                        )
+                        net_movements = Decimal(str(totals["stock_in"] or ZERO)) - Decimal(str(totals["stock_out"] or ZERO))
+                        pricing.opening_stock = new_remaining - net_movements
+
+                    pricing.save()
+
+                    refetched = self._fetch_item_with_pricing(item_id, branch_obj.id)
+                    serialized = self._serialize_item(refetched, branch_id=branch_obj.id)
+                    if serialized:
+                        updated_items.append(serialized)
+
+            self._broadcast_websocket_event(
+                branch_id=branch_obj.id,
+                event_type="ITEMS_BULK_UPDATED",
+                updated_items=updated_items,
+            )
+
+            return Response(
+                {"message": "Bulk updates applied successfully.", "items": updated_items},
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": "Failed to complete bulk update.", "details": str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
     @action(
         detail=False,
@@ -1239,9 +1386,6 @@ from stocks.models import Purchase
 from .serializers import PurchaseSerializer
 
 
-from .serializers import PurchaseSerializer
-
-
 def _authenticated_user(request):
     """Utility to retrieve the authenticated user from the request context."""
     return request.user if request and request.user and request.user.is_authenticated else None
@@ -1271,7 +1415,8 @@ def _parse_business_date(date_val):
 class PurchaseViewSet(viewsets.ModelViewSet):
     """
     ViewSet for recording, viewing, and managing inventory purchases/restocks.
-    Handles automated stock movements, batch tracking, expenses, and Weighted Average Cost (WAC) updates.
+    Handles single and batch purchase entries, payment methods, supplier linkages,
+    and automated Weighted Average Cost (WAC) updates.
     """
     serializer_class = PurchaseSerializer
     permission_classes = [permissions.AllowAny]
@@ -1375,139 +1520,144 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         if supplier_id and str(supplier_id).isdigit():
             queryset = queryset.filter(supplier_id=int(supplier_id))
 
+        payment_method = self.request.query_params.get("payment_method")
+        if payment_method:
+            queryset = queryset.filter(payment_method__iexact=payment_method.strip())
+
         return queryset
 
     def create(self, request, *args, **kwargs):
-        data = (
-            request.data.copy()
-            if hasattr(request.data, "copy")
-            else dict(request.data)
-        )
+        is_batch = isinstance(request.data, list)
+        items_payload = request.data if is_batch else [request.data]
 
-        item_id = data.get("item") or data.get("item_id")
-        if not item_id:
+        if not items_payload:
             return Response(
-                {"error": "Item ID is required for a purchase."},
+                {"error": "At least one purchase record is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        branch_param = (
-            data.get("branch")
-            or data.get("branch_id")
-            or self.request.query_params.get("branch")
-            or self.request.query_params.get("branch_id")
-        )
-
-        try:
-            quantity = Decimal(str(data.get("quantity", 0) or 0))
-        except (TypeError, ValueError):
-            return Response(
-                {"error": "Quantity must be a valid number."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if quantity <= ZERO:
-            return Response(
-                {"error": "Quantity must be greater than zero."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            unit_cost_raw = data.get("unit_cost_price") or data.get("cost_price") or data.get("unit_cost")
-            unit_cost = Decimal(str(unit_cost_raw if unit_cost_raw not in (None, "") else "0.00"))
-        except Exception:
-            return Response(
-                {"error": "unit_cost_price must be a valid number."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if unit_cost < 0:
-            return Response(
-                {"error": "unit_cost_price cannot be negative."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        purchase_date = _parse_business_date(
-            data.get("purchase_date")
-            or data.get("date")
-            or data.get("transaction_date")
-        )
-
-        supplier_id = data.get("supplier") or data.get("supplier_id")
-        supplier_obj = None
-        if supplier_id:
-            if str(supplier_id).isdigit():
-                supplier_obj = Supplier.objects.filter(id=int(supplier_id)).first()
-            else:
-                supplier_obj = Supplier.objects.filter(name__iexact=str(supplier_id).strip()).first()
+        created_purchases = []
+        user = _authenticated_user(request)
 
         try:
             with transaction.atomic():
-                item = Item.objects.select_for_update().get(id=item_id)
-                branch = _resolve_branch(branch_param)
+                for data in items_payload:
+                    item_id = data.get("item") or data.get("item_id")
+                    if not item_id:
+                        continue
 
-                if not branch:
-                    pricing = BranchItemPricing.objects.filter(item=item).first()
-                    if pricing:
-                        branch = pricing.branch
+                    branch_param = (
+                        data.get("branch")
+                        or data.get("branch_id")
+                        or self.request.query_params.get("branch")
+                        or self.request.query_params.get("branch_id")
+                    )
 
-                if not branch:
+                    quantity = Decimal(str(data.get("quantity", 0) or 0))
+                    if quantity <= ZERO:
+                        continue
+
+                    unit_cost_raw = (
+                        data.get("unit_cost_price")
+                        or data.get("cost_price")
+                        or data.get("unit_cost")
+                    )
+                    unit_cost = Decimal(
+                        str(unit_cost_raw if unit_cost_raw not in (None, "") else "0.00")
+                    )
+
+                    purchase_date = _parse_business_date(
+                        data.get("purchase_date")
+                        or data.get("date")
+                        or data.get("transaction_date")
+                    )
+
+                    payment_method = (
+                        str(data.get("payment_method") or "CASH")
+                        .strip()
+                        .upper()
+                        .replace(" ", "_")
+                        .replace("-", "_")
+                    )
+
+                    supplier_id = data.get("supplier") or data.get("supplier_id")
+                    supplier_obj = None
+                    if supplier_id:
+                        if str(supplier_id).isdigit():
+                            supplier_obj = Supplier.objects.filter(id=int(supplier_id)).first()
+                        else:
+                            supplier_obj = Supplier.objects.filter(name__iexact=str(supplier_id).strip()).first()
+
+                    item = Item.objects.select_for_update().get(id=item_id)
+                    branch = _resolve_branch(branch_param)
+
+                    if not branch:
+                        pricing = BranchItemPricing.objects.filter(item=item).first()
+                        if pricing:
+                            branch = pricing.branch
+
+                    if not branch:
+                        continue
+
+                    self._align_retailer(item, branch, supplier_obj)
+
+                    BranchItemPricing.objects.get_or_create(
+                        item=item,
+                        branch=branch,
+                        defaults={
+                            "opening_stock": ZERO,
+                            "unit_cost_price": unit_cost,
+                            "unit_selling_price": ZERO,
+                        },
+                    )
+
+                    supplier_name = (
+                        data.get("supplier_name")
+                        or (supplier_obj.name if supplier_obj else "")
+                    )
+
+                    purchase = Purchase(
+                        item=item,
+                        branch=branch,
+                        supplier=supplier_obj,
+                        supplier_name=supplier_name,
+                        quantity=quantity,
+                        unit_cost_price=unit_cost,
+                        payment_method=payment_method,
+                        purchase_date=purchase_date,
+                        created_by=user,
+                    )
+                    purchase.save()
+
+                    recalculate_wac_sales_cost(branch, item)
+                    created_purchases.append(purchase)
+
+                if not created_purchases:
                     return Response(
-                        {"error": "Valid Branch is required for recording purchases."},
+                        {"error": "No valid purchase entries were processed."},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
-                self._align_retailer(item, branch, supplier_obj)
-                user = _authenticated_user(request)
-
-                # Ensure pricing record exists for this branch/item combination
-                pricing, _ = BranchItemPricing.objects.get_or_create(
-                    item=item,
-                    branch=branch,
-                    defaults={
-                        "opening_stock": ZERO,
-                        "unit_cost_price": unit_cost,
-                        "unit_selling_price": ZERO,
-                    },
-                )
-
-                supplier_name = (
-                    data.get("supplier_name")
-                    or (supplier_obj.name if supplier_obj else "")
-                )
-
-                # 1. Create Purchase instance using Purchase model's save pipeline
-                # (Purchase.save natively handles StockBatch, StockMovement, Expense creation, & WAC recalculations)
-                purchase = Purchase(
-                    item=item,
-                    branch=branch,
-                    supplier=supplier_obj,
-                    supplier_name=supplier_name,
-                    quantity=quantity,
-                    unit_cost_price=unit_cost,
-                    purchase_date=purchase_date,
-                    created_by=user,
-                )
-                purchase.save()
-
-                # 2. Recalculate and fetch the new Weighted Average Cost (WAC)
-                new_wac = recalculate_wac_sales_cost(branch, item)
-
                 self._broadcast_websocket_event(
-                    branch_id=branch.id,
+                    branch_id=created_purchases[0].branch_id,
                     event_type="PURCHASE_RECORDED",
-                    purchase_id=purchase.id,
-                    item_id=item.id,
+                    purchase_id=created_purchases[0].id,
+                    item_id=created_purchases[0].item_id,
                 )
 
-                serializer = self.get_serializer(purchase)
-                response_data = serializer.data
-                response_data["calculated_wac"] = str(new_wac)
-
-                return Response(
-                    response_data,
-                    status=status.HTTP_201_CREATED,
-                )
+                if is_batch:
+                    serializer = self.get_serializer(created_purchases, many=True)
+                    return Response(serializer.data, status=status.HTTP_201_CREATED)
+                else:
+                    serializer = self.get_serializer(created_purchases[0])
+                    response_data = serializer.data
+                    response_data["calculated_wac"] = str(
+                        recalculate_wac_sales_cost(
+                            created_purchases[0].branch,
+                            created_purchases[0].item
+                        )
+                    )
+                    return Response(response_data, status=status.HTTP_201_CREATED)
 
         except Item.DoesNotExist:
             return Response(
@@ -1540,8 +1690,6 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         branch = instance.branch
         item = instance.item
 
-        # Purchase.delete() handles deletion of connected StockMovement, StockBatch, and Expense records,
-        # followed by recalculate_wac_sales_cost
         instance.delete()
 
         self._broadcast_websocket_event(
@@ -1550,7 +1698,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             item_id=item.id,
         )
 
-        return Response(status=status.HTTP_24_NO_CONTENT)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 # ============================================================
 # STOCK ADJUSTMENT
 # ============================================================
@@ -2094,6 +2242,37 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(customer_id=customer_id)
 
         return queryset
+
+
+class SupplierPaymentViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        purchase_id = request.data.get("purchase")
+        amount = Decimal(str(request.data.get("amount", 0)))
+        payment_method = request.data.get("payment_method", "CASH")
+        notes = request.data.get("notes", "")
+
+        try:
+            with transaction.atomic():
+                purchase = Purchase.objects.select_for_update().get(id=purchase_id)
+                purchase.amount_paid = Decimal(str(getattr(purchase, "amount_paid", 0))) + amount
+                purchase.save()
+
+                # Record an expense entry for ledger reconciliation
+                Expense.objects.create(
+                    branch=purchase.branch,
+                    title=f"Supplier Repayment: {purchase.item.name}",
+                    amount=amount,
+                    payment_method=payment_method,
+                    description=notes,
+                    date=timezone.localdate(),
+                )
+
+                return Response({"message": "Supplier payment recorded successfully"}, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 # EXPENSE
 
 
@@ -2230,7 +2409,7 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         """
-        Create a new pending approval request (e.g., NEW_REGISTERED_ITEMS, SALE_ENTRY, BRANCH_CREATION).
+        Create a new pending approval request (e.g., NEW_REGISTERED_ITEMS, SALE_ENTRY, BRANCH_CREATION, RESTOCK_PURCHASE, STOCK_OPERATION).
         """
         request_type = request.data.get(
             "request_type", 
@@ -2366,7 +2545,7 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
         approval = PendingApproval.objects.filter(pk=pk).first()
         if not approval:
-            return HttpResponse("<h1>Error:</h1><p>Approval request not found.</p>", status=404)
+            return HttpResponse("<h1>Error:</h1><p>Approval request not found.</p>", status=400)
 
         if approval.status != PendingApproval.Status.PENDING:
             return HttpResponse(
@@ -2398,7 +2577,7 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
         approval = PendingApproval.objects.filter(pk=pk).first()
         if not approval:
-            return HttpResponse("<h1>Error:</h1><p>Approval request not found.</p>", status=404)
+            return HttpResponse("<h1>Error:</h1><p>Approval request not found.</p>", status=400)
 
         if approval.status != PendingApproval.Status.PENDING:
             return HttpResponse(
@@ -2415,7 +2594,9 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             "</div>"
         )
 
+    # ------------------------------------------------------------------
     # INTERNAL PROCESSING LOGIC
+    # ------------------------------------------------------------------
 
     def _process_approval(self, approval, reviewer=None):
         """Core transactional logic for handling approval."""
@@ -2433,6 +2614,15 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
             elif req_type == getattr(PendingApproval.RequestType, "SALE_ENTRY", "SALE_ENTRY"):
                 self._commit_sale_entry(approval.payload)
+
+            elif req_type in [
+                getattr(PendingApproval.RequestType, "RESTOCK_PURCHASE", "RESTOCK_PURCHASE"),
+                getattr(PendingApproval.RequestType, "PURCHASE_ORDER", "PURCHASE_ORDER"),
+            ]:
+                self._commit_restock_purchase(approval.payload)
+
+            elif req_type == getattr(PendingApproval.RequestType, "STOCK_OPERATION", "STOCK_OPERATION"):
+                self._commit_stock_operation(approval.payload)
 
             approval.status = PendingApproval.Status.APPROVED
             if reviewer:
@@ -2452,7 +2642,102 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
         send_submitter_status_email(approval, approved=False, reason=reason)
 
+    # ------------------------------------------------------------------
     # COMMIT HELPER METHODS
+    # ------------------------------------------------------------------
+
+    def _get_target_branch(self, payload):
+        branch_identifier = (
+            payload.get("target_branch") 
+            or payload.get("branch_id") 
+            or payload.get("branch")
+        )
+        if not branch_identifier:
+            return RetailBranch.objects.first()
+
+        if isinstance(branch_identifier, dict):
+            b_id = branch_identifier.get("id")
+            b_name = branch_identifier.get("name")
+            return RetailBranch.objects.filter(id=b_id).first() or RetailBranch.objects.filter(name__iexact=b_name).first()
+        elif str(branch_identifier).isdigit():
+            return RetailBranch.objects.filter(id=int(branch_identifier)).first()
+        else:
+            return RetailBranch.objects.filter(name__iexact=str(branch_identifier).strip()).first()
+
+    def _commit_restock_purchase(self, payload):
+        """
+        Commits approved restock purchase orders to StockMovement and updates pricing.
+        """
+        purchases = payload.get("purchases", [])
+        if not purchases and "item" in payload:
+            purchases = [payload]
+
+        branch = self._get_target_branch(payload)
+        if not branch:
+            raise ValueError("No valid branch found to commit restock purchase order.")
+
+        for p_data in purchases:
+            item_id = p_data.get("item") or p_data.get("item_id")
+            item_obj = Item.objects.filter(id=item_id).first()
+            if not item_obj:
+                continue
+
+            quantity = int(p_data.get("quantity", 0))
+            cost_price = Decimal(str(p_data.get("unit_cost_price") or "0.00"))
+            payment_method = p_data.get("payment_method", "CASH")
+
+            # Create purchase movement record if StockMovement model is present
+            if 'StockMovement' in globals():
+                StockMovement.objects.create(
+                    branch=branch,
+                    item=item_obj,
+                    movement_type="PURCHASE",
+                    quantity=quantity,
+                    unit_cost_price=cost_price,
+                    payment_method=payment_method,
+                )
+
+            # Increase branch stock and update cost price
+            pricing, _ = BranchItemPricing.objects.get_or_create(
+                branch=branch,
+                item=item_obj,
+                defaults={"remaining_stock": 0, "unit_cost_price": cost_price}
+            )
+            pricing.remaining_stock += quantity
+            pricing.unit_cost_price = cost_price
+            pricing.save()
+
+    def _commit_stock_operation(self, payload):
+        """
+        Commits batch inline stock modifications and pricing updates.
+        """
+        items_data = payload.get("items", [])
+        branch = self._get_target_branch(payload)
+
+        if not branch:
+            raise ValueError("No valid branch found to perform stock operations.")
+
+        for item_data in items_data:
+            item_id = item_data.get("id") or item_data.get("item_id")
+            pricing = BranchItemPricing.objects.filter(branch=branch, item_id=item_id).first()
+
+            if not pricing:
+                continue
+
+            if "unit_retail_price" in item_data and str(item_data["unit_retail_price"]).strip() != "":
+                unit_retail = Decimal(str(item_data["unit_retail_price"]))
+                if hasattr(pricing, "unit_retail_price"):
+                    pricing.unit_retail_price = unit_retail
+                if hasattr(pricing, "unit_selling_price"):
+                    pricing.unit_selling_price = unit_retail
+
+            if "unit_cost_price" in item_data and str(item_data["unit_cost_price"]).strip() != "":
+                pricing.unit_cost_price = Decimal(str(item_data["unit_cost_price"]))
+
+            if "remaining_stock" in item_data and str(item_data["remaining_stock"]).strip() != "":
+                pricing.remaining_stock = int(item_data["remaining_stock"])
+
+            pricing.save()
 
     def _commit_new_registered_items(self, payload):
         """
@@ -2463,25 +2748,7 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
         if not items_data and ("name" in payload or "item_name" in payload or "item_id" in payload):
             items_data = [payload]
 
-        branch_identifier = (
-            payload.get("target_branch") 
-            or payload.get("branch_id") 
-            or payload.get("branch")
-        )
-
-        target_branch = None
-        if branch_identifier:
-            if isinstance(branch_identifier, dict):
-                b_id = branch_identifier.get("id")
-                b_name = branch_identifier.get("name")
-                target_branch = RetailBranch.objects.filter(id=b_id).first() or RetailBranch.objects.filter(name__iexact=b_name).first()
-            elif str(branch_identifier).isdigit():
-                target_branch = RetailBranch.objects.filter(id=int(branch_identifier)).first()
-            else:
-                target_branch = RetailBranch.objects.filter(name__iexact=str(branch_identifier).strip()).first()
-
-        if not target_branch:
-            target_branch = RetailBranch.objects.first()
+        target_branch = self._get_target_branch(payload)
 
         if not target_branch:
             raise ValueError("No valid branch found in system to assign items.")
@@ -2547,12 +2814,8 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
     def _commit_sale_entry(self, payload):
         items_data = payload.get("items", [])
-        branch_id = payload.get("branch_id") or payload.get("target_branch")
+        branch = self._get_target_branch(payload)
 
-        if not branch_id:
-            return
-
-        branch = RetailBranch.objects.filter(id=branch_id).first() or RetailBranch.objects.filter(name=branch_id).first()
         if not branch:
             return
 
@@ -3158,6 +3421,10 @@ class BalanceSheetViewSet(viewsets.ViewSet):
 
         purchases_qs = Purchase.objects.filter(
             Q(purchase_date__lte=cutoff_dt) | Q(created_at__lte=cutoff_dt)
+        ).select_related("item", "branch")
+
+        supplier_payments_qs = SupplierPayment.objects.filter(
+            created_at__lte=cutoff_dt
         )
 
         inbound_types = [
@@ -3180,7 +3447,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         else:
             pricing_qs = BranchItemPricing.objects.all()
 
-        # --- BRANCH SCOPE FILTERING (GLOBAL UNFILTERED BY USER) ---
+        # --- BRANCH SCOPE FILTERING ---
         if branch_obj:
             sales_qs = sales_qs.filter(branch=branch_obj)
             repayments_qs = repayments_qs.filter(
@@ -3188,9 +3455,10 @@ class BalanceSheetViewSet(viewsets.ViewSet):
             )
             expenses_qs = expenses_qs.filter(branch=branch_obj)
             purchases_qs = purchases_qs.filter(branch=branch_obj)
+            supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
             stock_movements_qs = stock_movements_qs.filter(branch=branch_obj)
 
-        # Calculate Inflows
+        # Calculate Customer Inflows
         sales_cash, sales_receivable = self._sale_cash_and_receivable(sales_qs)
 
         repayment_cash = sum(
@@ -3203,44 +3471,29 @@ class BalanceSheetViewSet(viewsets.ViewSet):
             ZERO,
         )
 
-        # Calculate Outflows from Purchases & Stock Movements
+        # Calculate Outflows & Liabilities from Purchases
         cash_purchases = ZERO
         accounts_payable = ZERO
-        has_stock_outflows = False
 
-        purchase_payment_map = {}
         for purchase in purchases_qs:
-            raw_method = getattr(purchase, "payment_method", None) or getattr(purchase, "method", "CASH")
-            purchase_payment_map[purchase.pk] = str(raw_method).upper()
+            total_cost = Decimal(str(getattr(purchase, "total_cost", ZERO) or ZERO))
+            amount_paid = Decimal(str(getattr(purchase, "amount_paid", ZERO) or ZERO))
+            method = str(getattr(purchase, "payment_method", "CASH") or "CASH").upper()
 
-        for sm in stock_movements_qs:
-            method = "CASH"
-            if sm.reference_id and sm.reference_id in purchase_payment_map:
-                method = purchase_payment_map[sm.reference_id]
+            if "CREDIT" in method or "ON_ACCOUNT" in method or "DEBT" in method:
+                # Add outstanding balance to Payables
+                balance = getattr(purchase, "balance_due", total_cost - amount_paid)
+                accounts_payable += Decimal(str(balance or ZERO))
+                # Add upfront down-payment/deposit paid to cash outflows
+                cash_purchases += amount_paid
+            else:
+                cash_purchases += total_cost
 
-            cost_amount = Decimal(str(getattr(sm, "total_cost", ZERO) or ZERO))
-            if cost_amount > ZERO:
-                has_stock_outflows = True
-                if "CREDIT" in method or "DEBT" in method or "ON_ACCOUNT" in method:
-                    accounts_payable += cost_amount
-                else:
-                    cash_purchases += cost_amount
-
-        if not has_stock_outflows:
-            for purchase in purchases_qs:
-                amount = Decimal(
-                    str(
-                        getattr(purchase, "total_cost", None)
-                        or getattr(purchase, "total_amount", None)
-                        or getattr(purchase, "amount", ZERO)
-                        or ZERO
-                    )
-                )
-                method = purchase_payment_map.get(purchase.pk, "CASH")
-                if "CREDIT" in method or "DEBT" in method or "ON_ACCOUNT" in method:
-                    accounts_payable += amount
-                else:
-                    cash_purchases += amount
+        # Calculate Supplier Repayments Outflow
+        supplier_repayments_cash = sum(
+            (Decimal(str(getattr(sp, "amount", ZERO) or ZERO)) for sp in supplier_payments_qs),
+            ZERO,
+        )
 
         # Net Closing Cash Position
         cash_balance = quantize_money(
@@ -3248,6 +3501,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
             + repayment_cash
             - cash_expenses
             - cash_purchases
+            - supplier_repayments_cash
         )
 
         # Accounts Receivable
@@ -3260,6 +3514,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
             accounts_receivable = sales_receivable
 
         accounts_receivable = quantize_money(max(accounts_receivable, ZERO))
+        accounts_payable = quantize_money(max(accounts_payable, ZERO))
 
         # Inventory Value with Fallback Pricing
         inventory_value = ZERO
@@ -3348,9 +3603,10 @@ class BalanceSheetViewSet(viewsets.ViewSet):
                 },
                 "cash_reconciliation": {
                     "sales_cash": float(quantize_money(sales_cash)),
-                    "credit_repayments": float(quantize_money(repayment_cash)),
+                    "customer_repayments": float(quantize_money(repayment_cash)),
                     "cash_expenses": float(quantize_money(cash_expenses)),
                     "cash_purchases": float(quantize_money(cash_purchases)),
+                    "supplier_repayments": float(quantize_money(supplier_repayments_cash)),
                     "closing_cash_before_overdraft": float(cash_balance),
                 },
             },
