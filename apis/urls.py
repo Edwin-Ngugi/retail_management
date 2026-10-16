@@ -23,6 +23,7 @@ from .views import (
     CustomerViewSet,
     CashbookViewSet,
     BalanceSheetViewSet,
+    FinancialReportViewSet,
 )
 
 router = DefaultRouter()
@@ -39,7 +40,7 @@ router.register(r'stock-movements', StockMovementViewSet, basename='stock-moveme
 # Registered under both paths to ensure frontend requests to /credit-sales/ succeed
 router.register(r'credit-sales', CreditRepaymentViewSet, basename='credit-sale')
 router.register(r'credit-repayments', CreditRepaymentViewSet, basename='credit-repayment')
-
+router.register(r'financial-reports', FinancialReportViewSet, basename='financial-reports')
 router.register(r'pending-approvals', PendingApprovalViewSet, basename='pending-approval')
 router.register(r"cashbook", CashbookViewSet, basename="cashbook")
 router.register(r"balance-sheet", BalanceSheetViewSet, basename="balance-sheet")

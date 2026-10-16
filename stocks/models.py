@@ -1603,6 +1603,45 @@ class SaleTransaction(models.Model):
             repayment_total or ZERO
         )
 
+    # models.py inside class SaleTransaction:
+
+    @property
+    def liquid_payments_breakdown(self):
+        """
+        Calculates channel totals for this transaction taking into account
+        split payments, actual amount paid, and normalization rules.
+        """
+        totals = {"MPESA": Decimal("0.00"), "PAYBILL": Decimal("0.00"), "CASH": Decimal("0.00"), "CREDIT": Decimal("0.00")}
+        
+        split_qs = self.split_payments.all()
+        if self.payment_method == self.PaymentMethod.SPLIT or split_qs.exists():
+            for sp in split_qs:
+                amt = Decimal(str(sp.amount or 0))
+                method = str(sp.method or "").upper()
+                if "PAYBILL" in method or "BANK" in method:
+                    totals["PAYBILL"] += amt
+                elif "MPESA" in method or "SEND_MONEY" in method or "TILL" in method:
+                    totals["MPESA"] += amt
+                elif "CREDIT" in method:
+                    totals["CREDIT"] += amt
+                else:
+                    totals["CASH"] += amt
+        else:
+            # Single payment method: Use amount_paid if present/less than total_amount
+            amt = Decimal(str(self.amount_paid if self.amount_paid is not None else self.total_amount or 0))
+            method = str(self.payment_method or "").upper()
+            
+            if self.payment_method == self.PaymentMethod.CREDIT:
+                totals["CREDIT"] += Decimal(str(self.total_amount or 0))
+            elif "PAYBILL" in method or "BANK" in method:
+                totals["PAYBILL"] += amt
+            elif "MPESA" in method or "SEND_MONEY" in method or "TILL" in method:
+                totals["MPESA"] += amt
+            else:
+                totals["CASH"] += amt
+
+        return totals    
+
     @property
     def is_invoice(self):
         return self.credit_payment_amount > ZERO
