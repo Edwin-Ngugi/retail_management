@@ -6065,33 +6065,78 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     # =========================================================================
     # DETAILED OPERATIONAL ENDPOINTS (FOR OPERATIONS TAB SUB-SECTIONS)
     # =========================================================================
-
     @action(detail=False, methods=['get'], url_path='operations-inventory')
     def operations_inventory(self, request):
-        """Returns itemized inventory stock levels, prices, and threshold statuses."""
-        branch, _, _ = self._get_branch_and_dates(request)
+        """Returns itemized inventory stock levels, period restocks, units sold, and pricing valuation."""
+        branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Fetch pricing records for the branch
         pricings = BranchItemPricing.objects.filter(branch=branch).select_related('item')
-        results = []
 
+        # 1. Inbound types according to StockMovement.MovementType
+        inbound_types = [
+            StockMovement.MovementType.PURCHASE,
+            StockMovement.MovementType.TRANSFER_IN,
+            StockMovement.MovementType.ADJUSTMENT_IN,
+            StockMovement.MovementType.CUSTOMER_RETURN,
+        ]
+
+        # 2. Filter StockMovements for Restocks
+        movements_qs = StockMovement.objects.filter(branch=branch, movement_type__in=inbound_types)
+        
+        # 3. Filter SaleItems for Units Sold (joining via SaleTransaction.branch & sale_date)
+        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
+
+        if start_date and end_date:
+            movements_qs = movements_qs.filter(created_at__date__range=(start_date, end_date))
+            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
+
+        # 4. Map total restocks per item
+        restocks_map = {}
+        for mv in movements_qs.values('item_id').annotate(total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))):
+            restocks_map[mv['item_id']] = Decimal(str(mv['total_qty']))
+
+        # 5. Map total units sold per item
+        sales_map = {}
+        for si in sale_items_qs.values('item_id').annotate(total_qty=Coalesce(Sum('quantity_sold'), Decimal("0.000"))):
+            sales_map[si['item_id']] = Decimal(str(si['total_qty']))
+
+        results = []
         for p in pricings:
-            rem_stock = float(p.remaining_stock or 0.0)
-            threshold = float(p.min_stock_threshold or 5.0)
-            unit_cost = float(p.unit_cost_price or 0.0)
-            unit_retail = float(p.unit_selling_price or 0.0)
+            item_id = p.item.id
+            
+            # Access pricing properties and methods directly from BranchItemPricing
+            effective_opening = Decimal(str(p.get_effective_opening_stock() or ZERO))
+            rem_stock = Decimal(str(p.remaining_stock or ZERO))
+            threshold = Decimal(str(p.min_stock_threshold or "5.000"))
+            unit_cost = Decimal(str(p.unit_cost_price or ZERO))
+            unit_retail = Decimal(str(p.unit_selling_price or ZERO))
+
+            restocks_qty = restocks_map.get(item_id, Decimal("0.000"))
+            units_sold_qty = sales_map.get(item_id, Decimal("0.000"))
+
+            # Calculate opening stock for period or fallback to effective opening stock
+            if start_date and end_date:
+                opening_stock = max(Decimal("0.000"), rem_stock - restocks_qty + units_sold_qty)
+            else:
+                opening_stock = effective_opening
 
             results.append({
                 "id": p.id,
-                "item_id": p.item.id,
+                "item_id": item_id,
                 "item_name": p.item.name,
                 "item_code": p.item.code or "",
-                "remaining_stock": rem_stock,
-                "min_stock_threshold": threshold,
-                "unit_cost_price": unit_cost,
-                "unit_selling_price": unit_retail,
-                "total_valuation": float(rem_stock * unit_cost),
+                "opening_stock": float(opening_stock),
+                "restocks": float(restocks_qty),
+                "units_sold": float(units_sold_qty),
+                "remaining_stock": float(rem_stock),
+                "min_stock_threshold": float(threshold),
+                "unit_cost_price": float(unit_cost),
+                "unit_selling_price": float(unit_retail),
+                "wac": float(unit_cost),
+                "total_valuation": float(quantize_money(rem_stock * unit_cost)),
                 "is_low_stock": rem_stock <= threshold
             })
 
