@@ -5635,3 +5635,353 @@ class FinancialReportViewSet(viewsets.ViewSet):
                 {"error": str(e)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+class ManagementAnalyticsViewSet(viewsets.ViewSet):
+    """
+    Lightweight, high-performance API endpoints for executive management dashboards.
+    Delegates calculation tasks directly to the database using Django ORM aggregations.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _get_branch_and_dates(self, request):
+        branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+
+        branch = None
+        if branch_id:
+            branch = RetailBranch.objects.filter(id=branch_id).first()
+
+        start_date = None
+        if start_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        end_date = None
+        if end_date_str:
+            try:
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        return branch, start_date, end_date
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        """
+        GET /api/management-analytics/summary/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+        Provides high-level performance cards for gross sales, expenses, and credit activity.
+        """
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sales_qs = SaleTransaction.objects.filter(branch=branch)
+        repayments_qs = CreditRepayment.objects.filter(branch=branch)
+        expenses_qs = Expense.objects.filter(branch=branch)
+
+        if start_date and end_date:
+            sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
+            repayments_qs = repayments_qs.filter(date__range=(start_date, end_date))
+            expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
+
+        # Gross sales & transaction metrics
+        sales_agg = sales_qs.aggregate(
+            gross_sales=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD),
+            transaction_count=Count('id'),
+            total_amount_paid=Coalesce(Sum('amount_paid'), ZERO, output_field=MONEY_FIELD)
+        )
+
+        # Credit Sales issued within period
+        credit_sales_sum = sales_qs.filter(
+            payment_method=SaleTransaction.PaymentMethod.CREDIT
+        ).aggregate(
+            total=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD)
+        )['total']
+
+        # Repayments & Expenses sums
+        repayments_sum = repayments_qs.aggregate(
+            total=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+        )['total']
+
+        expenses_sum = expenses_qs.aggregate(
+            total=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+        )['total']
+
+        return Response({
+            "branch_id": branch.id,
+            "branch_name": branch.name,
+            "sales": {
+                "gross_sales": float(sales_agg['gross_sales']),
+                "sales_cash_received": float(sales_agg['total_amount_paid']),
+                "credit_issued": float(credit_sales_sum),
+                "transaction_count": sales_agg['transaction_count'],
+            },
+            "credit": {
+                "repayments_received": float(repayments_sum),
+            },
+            "expenses": {
+                "total_expenses": float(expenses_sum),
+                "expense_count": expenses_qs.count(),
+            }
+        })
+
+    @action(detail=False, methods=['get'], url_path='profit-loss')
+    def profit_loss(self, request):
+        """
+        GET /api/management-analytics/profit-loss/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+        Generates structured P&L metrics: Revenue, COGS, Gross Profit, Expenses, and Net Profit.
+        """
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
+        expenses_qs = Expense.objects.filter(branch=branch)
+
+        if start_date and end_date:
+            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
+            expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
+
+        # Revenue & COGS calculation directly in DB
+        financials = sale_items_qs.aggregate(
+            revenue=Coalesce(
+                Sum(
+                    ExpressionWrapper(
+                        F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
+                        output_field=MONEY_FIELD
+                    )
+                ),
+                ZERO,
+                output_field=MONEY_FIELD
+            ),
+            cogs=Coalesce(
+                Sum(
+                    ExpressionWrapper(
+                        F('quantity_sold') * F('unit_cost_price'),
+                        output_field=MONEY_FIELD
+                    )
+                ),
+                ZERO,
+                output_field=MONEY_FIELD
+            )
+        )
+
+        total_expenses = expenses_qs.aggregate(
+            total=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+        )['total']
+
+        revenue = financials['revenue']
+        cogs = financials['cogs']
+        gross_profit = revenue - cogs
+        net_profit = gross_profit - total_expenses
+
+        return Response({
+            "revenue": float(revenue),
+            "cost_of_goods_sold": float(cogs),
+            "gross_profit": float(gross_profit),
+            "expenses": float(total_expenses),
+            "net_profit": float(net_profit),
+        })
+
+    @action(detail=False, methods=['get'], url_path='sales-performance')
+    def sales_performance(self, request):
+        """
+        GET /api/management-analytics/sales-performance/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+        Provides daily sales aggregations and top-performing products.
+        """
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sales_qs = SaleTransaction.objects.filter(branch=branch)
+        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
+
+        if start_date and end_date:
+            sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
+            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
+
+        # Group sales by day
+        daily_performance = sales_qs.annotate(
+            day=TruncDate('sale_date')
+        ).values('day').annotate(
+            gross_sales=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD),
+            transactions=Count('id')
+        ).order_by('day')
+
+        # Top 10 product performance
+        top_items = sale_items_qs.values(
+            'item_id', 'item__name'
+        ).annotate(
+            total_qty=Coalesce(Sum('quantity_sold'), ZERO),
+            total_revenue=Coalesce(
+                Sum(
+                    ExpressionWrapper(
+                        F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
+                        output_field=MONEY_FIELD
+                    )
+                ),
+                ZERO,
+                output_field=MONEY_FIELD
+            )
+        ).order_by('-total_revenue')[:10]
+
+        return Response({
+            "daily": [
+                {
+                    "date": str(entry['day']),
+                    "gross_sales": float(entry['gross_sales']),
+                    "transactions": entry['transactions']
+                } for entry in daily_performance
+            ],
+            "top_products": [
+                {
+                    "item_id": entry['item_id'],
+                    "item_name": entry['item__name'],
+                    "quantity_sold": float(entry['total_qty']),
+                    "revenue": float(entry['total_revenue'])
+                } for entry in top_items
+            ]
+        })
+
+    @action(detail=False, methods=['get'], url_path='payment-methods')
+    def payment_methods(self, request):
+        """
+        GET /api/management-analytics/payment-methods/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+        Breakdown of payment channels across single and split payment records.
+        """
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        split_payments_qs = SalePayment.objects.filter(transaction__branch=branch)
+        sales_qs = SaleTransaction.objects.filter(branch=branch)
+
+        if start_date and end_date:
+            split_payments_qs = split_payments_qs.filter(
+                transaction__sale_date__date__range=(start_date, end_date)
+            )
+            sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
+
+        # Group inline split payments
+        split_breakdown = split_payments_qs.values('method').annotate(
+            total_amount=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+        )
+
+        # Group parent transaction payment methods
+        transaction_breakdown = sales_qs.values('payment_method').annotate(
+            total_amount=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD)
+        )
+
+        return Response({
+            "split_payments": [
+                {"method": entry['method'], "amount": float(entry['total_amount'])}
+                for entry in split_breakdown
+            ],
+            "sale_payments": [
+                {"method": entry['payment_method'], "amount": float(entry['total_amount'])}
+                for entry in transaction_breakdown
+            ]
+        })
+
+    @action(detail=False, methods=['get'], url_path='inventory')
+    def inventory(self, request):
+        """
+        GET /api/management-analytics/inventory/?branch_id=<ID>
+        Provides live inventory quantities, stock valuation at cost, and low-stock count.
+        """
+        branch, _, _ = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        pricings = BranchItemPricing.objects.filter(branch=branch)
+
+        total_valuation = ZERO
+        low_stock_count = 0
+        total_quantity = Decimal("0.000")
+
+        # Iterate pricing records to calculate real-time remaining stock values
+        for pricing in pricings.select_related('item'):
+            rem_stock = pricing.remaining_stock
+            total_quantity += rem_stock
+            total_valuation += (rem_stock * pricing.unit_cost_price)
+
+            if rem_stock <= pricing.min_stock_threshold:
+                low_stock_count += 1
+
+        return Response({
+            "total_items": pricings.count(),
+            "total_quantity": float(total_quantity),
+            "inventory_value_at_cost": float(total_valuation),
+            "low_stock_count": low_stock_count
+        })
+
+    @action(detail=False, methods=['get'], url_path='credit')
+    def credit(self, request):
+        """
+        GET /api/management-analytics/credit/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+        Provides customer credit issuance and repayment summaries.
+        """
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        credit_sales_qs = SaleTransaction.objects.filter(
+            branch=branch,
+            payment_method=SaleTransaction.PaymentMethod.CREDIT
+        )
+
+        repayments_qs = CreditRepayment.objects.filter(branch=branch)
+
+        if start_date and end_date:
+            credit_sales_qs = credit_sales_qs.filter(sale_date__date__range=(start_date, end_date))
+            repayments_qs = repayments_qs.filter(date__range=(start_date, end_date))
+
+        new_credit_sales = credit_sales_qs.aggregate(
+            total=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD)
+        )['total']
+
+        repayments_received = repayments_qs.aggregate(
+            total=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+        )['total']
+
+        return Response({
+            "new_credit_sales": float(new_credit_sales),
+            "repayments_received_in_period": float(repayments_received)
+        })
+
+    @action(detail=False, methods=['get'], url_path='purchases')
+    def purchases(self, request):
+        """
+        GET /api/management-analytics/purchases/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+        Summarizes supplier purchase totals and restock invoice counts.
+        """
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        purchases_qs = Purchase.objects.filter(branch=branch)
+
+        if start_date and end_date:
+            purchases_qs = purchases_qs.filter(purchase_date__date__range=(start_date, end_date))
+
+        total_purchases_cost = purchases_qs.aggregate(
+            total=Coalesce(
+                Sum(
+                    ExpressionWrapper(
+                        F('quantity') * F('unit_cost_price'),
+                        output_field=MONEY_FIELD
+                    )
+                ),
+                ZERO,
+                output_field=MONEY_FIELD
+            )
+        )['total']
+
+        return Response({
+            "purchase_total": float(total_purchases_cost),
+            "purchase_count": purchases_qs.count()
+        })
+            

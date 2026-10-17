@@ -24,6 +24,7 @@ from .views import (
     CashbookViewSet,
     BalanceSheetViewSet,
     FinancialReportViewSet,
+    ManagementAnalyticsViewSet,
 )
 
 router = DefaultRouter()
@@ -36,8 +37,7 @@ router.register(r'reports', FinancialReportViewSet, basename='reports')
 router.register(r'branches', RetailBranchViewSet, basename='branch')
 router.register(r'customers', CustomerViewSet, basename='customer')
 router.register(r'stock-movements', StockMovementViewSet, basename='stock-movement')
-
-# Registered under both paths to ensure frontend requests to /credit-sales/ succeed
+router.register(r'management-analytics', ManagementAnalyticsViewSet, basename='management-analytics')
 router.register(r'credit-sales', CreditRepaymentViewSet, basename='credit-sale')
 router.register(r'credit-repayments', CreditRepaymentViewSet, basename='credit-repayment')
 router.register(r'financial-reports', FinancialReportViewSet, basename='financial-reports')
