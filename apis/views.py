@@ -5664,7 +5664,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
         branch = None
         if branch_id:
-            branch = RetailBranch.objects.filter(id=branch_id).first() if str(branch_id).isdigit() else RetailBranch.objects.filter(name__iexact=str(branch_id).strip()).first()
+            if str(branch_id).isdigit():
+                branch = RetailBranch.objects.filter(id=int(branch_id)).first()
+            else:
+                branch = RetailBranch.objects.filter(name__iexact=str(branch_id).strip()).first()
 
         start_date = None
         if start_date_str:
@@ -5741,12 +5744,12 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Updated line: changed sale__branch to match model relation
-        sale_items_qs = SaleItem.objects.filter(sale__branch=branch)
+        # Uses 'transaction__branch' to match SaleItem model field
+        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
         expenses_qs = Expense.objects.filter(branch=branch)
 
         if start_date and end_date:
-            sale_items_qs = sale_items_qs.filter(sale__sale_date__date__range=(start_date, end_date))
+            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
             expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
 
         financials = sale_items_qs.aggregate(
@@ -5798,11 +5801,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         sales_qs = SaleTransaction.objects.filter(branch=branch)
-        sale_items_qs = SaleItem.objects.filter(sale__branch=branch)
+        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
 
         if start_date and end_date:
             sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
-            sale_items_qs = sale_items_qs.filter(sale__sale_date__date__range=(start_date, end_date))
+            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
 
         daily_performance = sales_qs.annotate(
             day=TruncDate('sale_date')
@@ -5847,17 +5850,19 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         })
 
     @action(detail=False, methods=['get'], url_path='payment-methods')
-    def payment_methods_analytics(self, request):
+    def payment_methods(self, request):
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        split_payments_qs = SalePayment.objects.filter(sale__branch=branch) if hasattr(SalePayment, 'sale') else SalePayment.objects.filter(transaction__branch=branch)
+        # Uses 'transaction__branch' to match SalePayment model field
+        split_payments_qs = SalePayment.objects.filter(transaction__branch=branch)
         sales_qs = SaleTransaction.objects.filter(branch=branch)
 
         if start_date and end_date:
-            date_filter = Q(sale__sale_date__date__range=(start_date, end_date)) if hasattr(SalePayment, 'sale') else Q(transaction__sale_date__date__range=(start_date, end_date))
-            split_payments_qs = split_payments_qs.filter(date_filter)
+            split_payments_qs = split_payments_qs.filter(
+                transaction__sale_date__date__range=(start_date, end_date)
+            )
             sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
 
         split_breakdown = split_payments_qs.values('method').annotate(
