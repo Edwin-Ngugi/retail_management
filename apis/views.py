@@ -1,74 +1,87 @@
-from datetime import datetime, date, timedelta
-from decimal import Decimal
 import calendar
-from django.db.models.functions import Coalesce
+import logging
+from datetime import calendar, date, datetime, timedelta
+from decimal import Decimal
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
-from django.db import models
-from django.db.models import Q, Sum
-from django.db.models.functions import Coalesce
-from django.utils import timezone
-from rest_framework import permissions, viewsets
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from django.core.exceptions import FieldError, ValidationError as DjangoValidationError
-from django.db import IntegrityError, transaction
-from django.db.models import Prefetch, Q
-from django.db.models import DecimalField, Q, Sum, F
-from django.utils import timezone
-from rest_framework.views import APIView
-from rest_framework import status
-from django.http import HttpResponse
-from django.core.signing import TimestampSigner, BadSignature, SignatureExpired
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from rest_framework_simplejwt.views import TokenObtainPairView
 
-from rest_framework import permissions, status, viewsets, generics
+from django.contrib.auth import authenticate, get_user_model
+from django.core.exceptions import FieldError, ValidationError as DjangoValidationError
+from django.core.signing import BadSignature, SignatureExpired, TimestampSigner
+from django.db import IntegrityError, models, transaction
+from django.db.models import (
+    Count,
+    DecimalField,
+    ExpressionWrapper,
+    F,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+)
+from django.db.models.functions import Coalesce, TruncDate
+from django.http import HttpResponse
+from django.utils import timezone
+
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
-from django.contrib.auth import authenticate
+from rest_framework.views import APIView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 
-
-from django.contrib.auth import get_user_model
-from analytics.services import AnalyticsService, InventoryService   
-ZERO = Decimal("0.00")
+from analytics.services import AnalyticsService, InventoryService
 
 from stocks.models import (
     BranchItemPricing,
     CreditRepayment,
     Customer,
+    CustomerReturn,
+    DamageRecord,
     Expense,
     Item,
-    SaleItem,
+    MonthlyInventorySnapshot,
+    MonthlyStockMovementArchive,
+    PendingApproval,
     Purchase,
     RetailBranch,
+    Sale,
+    SaleItem,
+    SalePayment,
     SaleTransaction,
-    MonthlyStockMovementArchive,
     StockBatch,
     StockMovement,
-    MonthlyInventorySnapshot,
     StockTransfer,
     Supplier,
-    PendingApproval,
+    SupplierReturn,
     recalculate_wac_sales_cost,
 )
 
-
 from .serializers import (
+    BranchItemCopySerializer,
     CreditRepaymentSerializer,
     CustomerSerializer,
     ExpenseSerializer,
     ItemSerializer,
     RetailBranchSerializer,
     SaleTransactionSerializer,
-    UserRegistrationSerializer, 
-    UserSerializer,
     StockMovementSerializer,
-    BranchItemCopySerializer,
+    UserRegistrationSerializer,
+    UserSerializer,
 )
+
+logger = logging.getLogger(__name__)
+
+ZERO = Decimal("0.00")
+MONEY_FIELD = DecimalField(max_digits=12, decimal_places=2)
+
+
+
 
 User = get_user_model()
 
@@ -5650,7 +5663,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
         branch = None
         if branch_id:
-            branch = RetailBranch.objects.filter(id=branch_id).first()
+            branch = RetailBranch.objects.filter(id=branch_id).first() if str(branch_id).isdigit() else RetailBranch.objects.filter(name__iexact=str(branch_id).strip()).first()
 
         start_date = None
         if start_date_str:
@@ -5670,10 +5683,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='summary')
     def summary(self, request):
-        """
-        GET /api/management-analytics/summary/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
-        Provides high-level performance cards for gross sales, expenses, and credit activity.
-        """
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -5687,27 +5696,24 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             repayments_qs = repayments_qs.filter(date__range=(start_date, end_date))
             expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
 
-        # Gross sales & transaction metrics
         sales_agg = sales_qs.aggregate(
-            gross_sales=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD),
+            gross_sales=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD),
             transaction_count=Count('id'),
-            total_amount_paid=Coalesce(Sum('amount_paid'), ZERO, output_field=MONEY_FIELD)
+            total_amount_paid=Coalesce(Sum('amount_paid', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )
 
-        # Credit Sales issued within period
         credit_sales_sum = sales_qs.filter(
             payment_method=SaleTransaction.PaymentMethod.CREDIT
         ).aggregate(
-            total=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )['total']
 
-        # Repayments & Expenses sums
         repayments_sum = repayments_qs.aggregate(
-            total=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )['total']
 
         expenses_sum = expenses_qs.aggregate(
-            total=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )['total']
 
         return Response({
@@ -5730,29 +5736,26 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='profit-loss')
     def profit_loss(self, request):
-        """
-        GET /api/management-analytics/profit-loss/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
-        Generates structured P&L metrics: Revenue, COGS, Gross Profit, Expenses, and Net Profit.
-        """
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
+        # Updated line: changed sale__branch to match model relation
+        sale_items_qs = SaleItem.objects.filter(sale__branch=branch)
         expenses_qs = Expense.objects.filter(branch=branch)
 
         if start_date and end_date:
-            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
+            sale_items_qs = sale_items_qs.filter(sale__sale_date__date__range=(start_date, end_date))
             expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
 
-        # Revenue & COGS calculation directly in DB
         financials = sale_items_qs.aggregate(
             revenue=Coalesce(
                 Sum(
                     ExpressionWrapper(
                         F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
                         output_field=MONEY_FIELD
-                    )
+                    ),
+                    output_field=MONEY_FIELD
                 ),
                 ZERO,
                 output_field=MONEY_FIELD
@@ -5762,7 +5765,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     ExpressionWrapper(
                         F('quantity_sold') * F('unit_cost_price'),
                         output_field=MONEY_FIELD
-                    )
+                    ),
+                    output_field=MONEY_FIELD
                 ),
                 ZERO,
                 output_field=MONEY_FIELD
@@ -5770,7 +5774,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         )
 
         total_expenses = expenses_qs.aggregate(
-            total=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )['total']
 
         revenue = financials['revenue']
@@ -5788,30 +5792,24 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='sales-performance')
     def sales_performance(self, request):
-        """
-        GET /api/management-analytics/sales-performance/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
-        Provides daily sales aggregations and top-performing products.
-        """
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         sales_qs = SaleTransaction.objects.filter(branch=branch)
-        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
+        sale_items_qs = SaleItem.objects.filter(sale__branch=branch)
 
         if start_date and end_date:
             sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
-            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
+            sale_items_qs = sale_items_qs.filter(sale__sale_date__date__range=(start_date, end_date))
 
-        # Group sales by day
         daily_performance = sales_qs.annotate(
             day=TruncDate('sale_date')
         ).values('day').annotate(
-            gross_sales=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD),
+            gross_sales=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD),
             transactions=Count('id')
         ).order_by('day')
 
-        # Top 10 product performance
         top_items = sale_items_qs.values(
             'item_id', 'item__name'
         ).annotate(
@@ -5821,7 +5819,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     ExpressionWrapper(
                         F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
                         output_field=MONEY_FIELD
-                    )
+                    ),
+                    output_field=MONEY_FIELD
                 ),
                 ZERO,
                 output_field=MONEY_FIELD
@@ -5847,32 +5846,25 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         })
 
     @action(detail=False, methods=['get'], url_path='payment-methods')
-    def payment_methods(self, request):
-        """
-        GET /api/management-analytics/payment-methods/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
-        Breakdown of payment channels across single and split payment records.
-        """
+    def payment_methods_analytics(self, request):
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        split_payments_qs = SalePayment.objects.filter(transaction__branch=branch)
+        split_payments_qs = SalePayment.objects.filter(sale__branch=branch) if hasattr(SalePayment, 'sale') else SalePayment.objects.filter(transaction__branch=branch)
         sales_qs = SaleTransaction.objects.filter(branch=branch)
 
         if start_date and end_date:
-            split_payments_qs = split_payments_qs.filter(
-                transaction__sale_date__date__range=(start_date, end_date)
-            )
+            date_filter = Q(sale__sale_date__date__range=(start_date, end_date)) if hasattr(SalePayment, 'sale') else Q(transaction__sale_date__date__range=(start_date, end_date))
+            split_payments_qs = split_payments_qs.filter(date_filter)
             sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
 
-        # Group inline split payments
         split_breakdown = split_payments_qs.values('method').annotate(
-            total_amount=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+            total_amount=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )
 
-        # Group parent transaction payment methods
         transaction_breakdown = sales_qs.values('payment_method').annotate(
-            total_amount=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD)
+            total_amount=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )
 
         return Response({
@@ -5888,27 +5880,25 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='inventory')
     def inventory(self, request):
-        """
-        GET /api/management-analytics/inventory/?branch_id=<ID>
-        Provides live inventory quantities, stock valuation at cost, and low-stock count.
-        """
         branch, _, _ = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         pricings = BranchItemPricing.objects.filter(branch=branch)
 
-        total_valuation = ZERO
+        total_valuation = Decimal("0.00")
         low_stock_count = 0
         total_quantity = Decimal("0.000")
 
-        # Iterate pricing records to calculate real-time remaining stock values
         for pricing in pricings.select_related('item'):
-            rem_stock = pricing.remaining_stock
-            total_quantity += rem_stock
-            total_valuation += (rem_stock * pricing.unit_cost_price)
+            rem_stock = pricing.remaining_stock or Decimal("0.000")
+            unit_cost = pricing.unit_cost_price or ZERO
+            threshold = pricing.min_stock_threshold or Decimal("5.000")
 
-            if rem_stock <= pricing.min_stock_threshold:
+            total_quantity += rem_stock
+            total_valuation += (rem_stock * unit_cost)
+
+            if rem_stock <= threshold:
                 low_stock_count += 1
 
         return Response({
@@ -5920,10 +5910,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='credit')
     def credit(self, request):
-        """
-        GET /api/management-analytics/credit/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
-        Provides customer credit issuance and repayment summaries.
-        """
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -5940,11 +5926,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             repayments_qs = repayments_qs.filter(date__range=(start_date, end_date))
 
         new_credit_sales = credit_sales_qs.aggregate(
-            total=Coalesce(Sum('total_amount'), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )['total']
 
         repayments_received = repayments_qs.aggregate(
-            total=Coalesce(Sum('amount'), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
         )['total']
 
         return Response({
@@ -5954,10 +5940,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='purchases')
     def purchases(self, request):
-        """
-        GET /api/management-analytics/purchases/?branch_id=<ID>&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
-        Summarizes supplier purchase totals and restock invoice counts.
-        """
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -5973,7 +5955,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     ExpressionWrapper(
                         F('quantity') * F('unit_cost_price'),
                         output_field=MONEY_FIELD
-                    )
+                    ),
+                    output_field=MONEY_FIELD
                 ),
                 ZERO,
                 output_field=MONEY_FIELD
@@ -5984,4 +5967,3 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             "purchase_total": float(total_purchases_cost),
             "purchase_count": purchases_qs.count()
         })
-            
