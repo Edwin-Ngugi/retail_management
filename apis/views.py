@@ -5685,6 +5685,64 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
         return branch, start_date, end_date
 
+    def _normalize_payment_method(self, method_name):
+        if not method_name:
+            return "UNKNOWN"
+
+        clean = (
+            str(method_name)
+            .strip()
+            .upper()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+
+        if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
+            return "PAYBILL"
+
+        if any(k in clean for k in [
+            "SEND_MONEY",
+            "SENDMONEY",
+            "TILL",
+            "BUY_GOODS",
+            "BUYGOODS",
+            "P2P",
+        ]):
+            return "SEND_MONEY"
+
+        if "CASH" in clean:
+            return "CASH"
+
+        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT"]):
+            return "CREDIT"
+
+        if any(k in clean for k in ["BANK", "EFT", "TRANSFER"]):
+            return "BANK_TRANSFER"
+
+        if any(k in clean for k in ["MPESA", "M_PESA", "MOBILE"]):
+            return "MPESA"
+
+        if "SPLIT" in clean:
+            return "SPLIT"
+
+        return clean
+
+    def _get_split_payments(self, sale):
+        relation = getattr(sale, "split_payments", None)
+        if relation is not None:
+            try:
+                return list(relation.all())
+            except Exception:
+                pass
+        return []
+
+    def _extract_sp_method(self, sp):
+        for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
+            val = getattr(sp, attr, None)
+            if val:
+                return val
+        return None
+
     @action(detail=False, methods=['get'], url_path='summary')
     def summary(self, request):
         branch, start_date, end_date = self._get_branch_and_dates(request)
@@ -5744,7 +5802,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Uses 'transaction__branch' to match SaleItem model field
         sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
         expenses_qs = Expense.objects.filter(branch=branch)
 
@@ -5850,65 +5907,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         })
 
     @action(detail=False, methods=['get'], url_path='payment-methods')
-    def _normalize_payment_method(self, method_name):
-        if not method_name:
-            return "UNKNOWN"
-
-        clean = (
-            str(method_name)
-            .strip()
-            .upper()
-            .replace("-", "_")
-            .replace(" ", "_")
-        )
-
-        if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
-            return "PAYBILL"
-
-        if any(k in clean for k in [
-            "SEND_MONEY",
-            "SENDMONEY",
-            "TILL",
-            "BUY_GOODS",
-            "BUYGOODS",
-            "P2P",
-        ]):
-            return "SEND_MONEY"
-
-        if "CASH" in clean:
-            return "CASH"
-
-        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT"]):
-            return "CREDIT"
-
-        if any(k in clean for k in ["BANK", "EFT", "TRANSFER"]):
-            return "BANK_TRANSFER"
-
-        if any(k in clean for k in ["MPESA", "M_PESA", "MOBILE"]):
-            return "MPESA"
-
-        if "SPLIT" in clean:
-            return "SPLIT"
-
-        return clean
-
-    def _get_split_payments(self, sale):
-        relation = getattr(sale, "split_payments", None)
-        if relation is not None:
-            try:
-                return list(relation.all())
-            except Exception:
-                pass
-        return []
-
-    def _extract_sp_method(self, sp):
-        for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
-            val = getattr(sp, attr, None)
-            if val:
-                return val
-        return None
-
-    @action(detail=False, methods=['get'], url_path='payment-methods')
     def payment_methods(self, request):
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
@@ -5921,7 +5919,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
             repayments_qs = repayments_qs.filter(date__range=(start_date, end_date))
 
-        # Channel balance initializers matching FinancialReportViewSet
         totals = {
             "CASH": ZERO,
             "PAYBILL": ZERO,
@@ -5936,16 +5933,15 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             repayments_qs.exclude(transaction_id=None).values_list("transaction_id", flat=True).distinct()
         )
 
-        # 1. Process Sales Transactions
         for sale in sales_qs:
-            amt = quantize_money(sale.total_amount or ZERO)
+            amt = Decimal(str(sale.total_amount or ZERO)).quantize(Decimal("0.01"))
             method = self._normalize_payment_method(sale.payment_method)
             split_records = self._get_split_payments(sale)
 
             if method == "SPLIT" or split_records:
                 for sp in split_records:
                     sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
-                    sp_amount = quantize_money(sp.amount or ZERO)
+                    sp_amount = Decimal(str(sp.amount or ZERO)).quantize(Decimal("0.01"))
 
                     if sp_method in totals:
                         totals[sp_method] += sp_amount
@@ -5960,9 +5956,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 else:
                     totals["OTHER"] += amt
 
-        # 2. Process Credit Repayments (Adds recovered amounts into appropriate liquid channels)
         for rep in repayments_qs:
-            rep_amt = quantize_money(rep.amount or ZERO)
+            rep_amt = Decimal(str(rep.amount or ZERO)).quantize(Decimal("0.01"))
             if rep_amt <= ZERO:
                 continue
 
@@ -5973,9 +5968,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             else:
                 totals["OTHER"] += rep_amt
 
-        # Format breakdown array for the frontend
         formatted_payments = [
-            {"method": method, "amount": float(quantize_money(amount))}
+            {"method": method, "amount": float(amount)}
             for method, amount in totals.items()
             if amount > ZERO
         ]
