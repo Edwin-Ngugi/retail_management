@@ -5744,11 +5744,23 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='dashboard-cards')
     def dashboard_cards(self, request):
+        """Returns aggregated executive dashboard metric cards without runtime formatting exceptions."""
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             branch = RetailBranch.objects.first()
 
+        if not branch:
+            return Response({"error": "No valid branch found."}, status=status.HTTP_404_NOT_FOUND)
+
         today = timezone.localdate()
+
+        # Local helper for string currency formatting
+        def _fmt_curr(val):
+            try:
+                num = float(val or 0.0)
+                return f"KSh {num:,.2f}"
+            except Exception:
+                return "KSh 0.00"
 
         sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
         expenses_qs = Expense.objects.filter(branch=branch)
@@ -5771,33 +5783,39 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 Sum(
                     ExpressionWrapper(
                         F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
-                        output_field=MONEY_FIELD
+                        output_field=DecimalField(max_digits=12, decimal_places=2)
                     ),
-                    output_field=MONEY_FIELD
+                    output_field=DecimalField(max_digits=12, decimal_places=2)
                 ),
-                ZERO, output_field=MONEY_FIELD
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
             ),
             cogs=Coalesce(
                 Sum(
                     ExpressionWrapper(
                         F('quantity_sold') * F('unit_cost_price'),
-                        output_field=MONEY_FIELD
+                        output_field=DecimalField(max_digits=12, decimal_places=2)
                     ),
-                    output_field=MONEY_FIELD
+                    output_field=DecimalField(max_digits=12, decimal_places=2)
                 ),
-                ZERO, output_field=MONEY_FIELD
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
             )
         )
 
         total_expenses = expenses_qs.aggregate(
-            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(
+                Sum('amount', output_field=DecimalField(max_digits=12, decimal_places=2)),
+                ZERO,
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
         )['total']
 
-        revenue = fin_agg['revenue']
-        cogs = fin_agg['cogs']
+        revenue = Decimal(str(fin_agg['revenue'] or ZERO))
+        cogs = Decimal(str(fin_agg['cogs'] or ZERO))
+        expenses = Decimal(str(total_expenses or ZERO))
+
         gross_profit = revenue - cogs
-        net_profit = gross_profit - total_expenses
-        gross_margin = float((gross_profit / revenue * 100) if revenue > ZERO else Decimal("0.0"))
+        net_profit = gross_profit - expenses
+        gross_margin = float((gross_profit / revenue * Decimal("100.0")) if revenue > ZERO else Decimal("0.0"))
 
         pricings = BranchItemPricing.objects.filter(branch=branch).select_related('item')
 
@@ -5806,9 +5824,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         out_of_stock_count = 0
 
         for p in pricings:
-            rem_stock = p.remaining_stock
-            threshold = p.min_stock_threshold or Decimal("5.000")
-            unit_cost = p.unit_cost_price or ZERO
+            rem_stock = Decimal(str(p.remaining_stock or ZERO))
+            threshold = Decimal(str(p.min_stock_threshold or "5.000"))
+            unit_cost = Decimal(str(p.unit_cost_price or ZERO))
 
             total_stock_value += (rem_stock * unit_cost)
 
@@ -5828,9 +5846,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         ).aggregate(
             total=Coalesce(
                 Sum(
-                    ExpressionWrapper(F('quantity') * F('unit_cost_price'), output_field=MONEY_FIELD),
-                    output_field=MONEY_FIELD
-                ), ZERO, output_field=MONEY_FIELD
+                    ExpressionWrapper(
+                        F('quantity') * F('unit_cost_price'),
+                        output_field=DecimalField(max_digits=12, decimal_places=2)
+                    ),
+                    output_field=DecimalField(max_digits=12, decimal_places=2)
+                ),
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
             )
         )['total']
 
@@ -5844,9 +5866,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         ).aggregate(
             total=Coalesce(
                 Sum(
-                    ExpressionWrapper(F('quantity') * F('unit_cost_price'), output_field=MONEY_FIELD),
-                    output_field=MONEY_FIELD
-                ), ZERO, output_field=MONEY_FIELD
+                    ExpressionWrapper(
+                        F('quantity') * F('unit_cost_price'),
+                        output_field=DecimalField(max_digits=12, decimal_places=2)
+                    ),
+                    output_field=DecimalField(max_digits=12, decimal_places=2)
+                ),
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
             )
         )['total']
 
@@ -5861,27 +5887,39 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         today_sales_cash = SaleTransaction.objects.filter(
             branch=branch, sale_date__date=today
         ).aggregate(
-            total=Coalesce(Sum('amount_paid', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(
+                Sum('amount_paid', output_field=DecimalField(max_digits=12, decimal_places=2)),
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
         )['total']
 
         today_repayments = CreditRepayment.objects.filter(
             branch=branch, date=today
         ).aggregate(
-            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(
+                Sum('amount', output_field=DecimalField(max_digits=12, decimal_places=2)),
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
         )['total']
 
-        todays_receipts = today_sales_cash + today_repayments
+        todays_receipts = Decimal(str(today_sales_cash or ZERO)) + Decimal(str(today_repayments or ZERO))
 
         today_expenses = Expense.objects.filter(
             branch=branch, date=today
         ).aggregate(
-            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(
+                Sum('amount', output_field=DecimalField(max_digits=12, decimal_places=2)),
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
         )['total']
 
         today_supplier_payments = SupplierPayment.objects.filter(
             purchase__branch=branch, created_at__date=today
         ).aggregate(
-            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
+            total=Coalesce(
+                Sum('amount', output_field=DecimalField(max_digits=12, decimal_places=2)),
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
         )['total']
 
         today_cash_purchases = Purchase.objects.filter(
@@ -5891,85 +5929,104 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         ).aggregate(
             total=Coalesce(
                 Sum(
-                    ExpressionWrapper(F('quantity') * F('unit_cost_price'), output_field=MONEY_FIELD),
-                    output_field=MONEY_FIELD
-                ), ZERO, output_field=MONEY_FIELD
+                    ExpressionWrapper(
+                        F('quantity') * F('unit_cost_price'),
+                        output_field=DecimalField(max_digits=12, decimal_places=2)
+                    ),
+                    output_field=DecimalField(max_digits=12, decimal_places=2)
+                ),
+                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
             )
         )['total']
 
-        todays_payments = today_expenses + today_supplier_payments + today_cash_purchases
+        todays_payments = (
+            Decimal(str(today_expenses or ZERO)) +
+            Decimal(str(today_supplier_payments or ZERO)) +
+            Decimal(str(today_cash_purchases or ZERO))
+        )
         net_cash_movement = todays_receipts - todays_payments
 
         all_sales = SaleTransaction.objects.filter(branch=branch)
 
-        cash_balance = all_sales.filter(
-            Q(payment_method__iexact='CASH')
-        ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+        cash_balance = Decimal(str(
+            all_sales.filter(
+                Q(payment_method__iexact='CASH')
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
+        ))
 
-        total_outflows_historical = Expense.objects.filter(branch=branch).aggregate(
-            t=Coalesce(Sum('amount'), ZERO)
-        )['t']
+        total_outflows_historical = Decimal(str(
+            Expense.objects.filter(branch=branch).aggregate(t=Coalesce(Sum('amount'), ZERO))['t'] or ZERO
+        ))
         cash_balance = max(ZERO, cash_balance - total_outflows_historical)
 
-        paybill_balance = all_sales.filter(
-            Q(payment_method__icontains='PAYBILL') | Q(payment_method__icontains='TILL')
-        ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+        paybill_balance = Decimal(str(
+            all_sales.filter(
+                Q(payment_method__icontains='PAYBILL') | Q(payment_method__icontains='TILL')
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
+        ))
 
-        send_money_balance = all_sales.filter(
-            Q(payment_method__icontains='SEND_MONEY') | Q(payment_method__icontains='SEND MONEY')
-        ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+        send_money_balance = Decimal(str(
+            all_sales.filter(
+                Q(payment_method__icontains='SEND_MONEY') | Q(payment_method__icontains='SEND MONEY')
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
+        ))
 
-        mpesa_general = all_sales.filter(
-            Q(payment_method__iexact='MPESA') | Q(payment_method__iexact='M-PESA')
-        ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+        mpesa_general = Decimal(str(
+            all_sales.filter(
+                Q(payment_method__iexact='MPESA') | Q(payment_method__iexact='M-PESA')
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
+        ))
         paybill_balance += mpesa_general
 
         total_available_funds = cash_balance + paybill_balance + send_money_balance
 
+        rec_today = Decimal(str(stock_received_today or ZERO))
+        iss_today = Decimal(str(stock_issued_today or ZERO))
+
         return Response({
-            "branch_id": branch.id if branch else None,
-            "branch_name": branch.name if branch else "",
+            "branch_id": branch.id,
+            "branch_name": branch.name,
             "profitability": {
                 "total_sales": float(revenue),
-                "total_sales_formatted": format_currency(revenue),
+                "total_sales_formatted": _fmt_curr(revenue),
                 "gross_profit": float(gross_profit),
-                "gross_profit_formatted": format_currency(gross_profit),
+                "gross_profit_formatted": _fmt_curr(gross_profit),
                 "gross_margin_percentage": round(gross_margin, 1),
-                "operating_expenses": float(total_expenses),
-                "operating_expenses_formatted": format_currency(total_expenses),
+                "operating_expenses": float(expenses),
+                "operating_expenses_formatted": _fmt_curr(expenses),
                 "net_profit": float(net_profit),
-                "net_profit_formatted": format_currency(net_profit)
+                "net_profit_formatted": _fmt_curr(net_profit)
             },
             "inventory": {
                 "total_stock_value": float(total_stock_value),
-                "total_stock_value_formatted": format_currency(total_stock_value),
+                "total_stock_value_formatted": _fmt_curr(total_stock_value),
                 "product_skus": pricings.count(),
                 "low_stock_items": low_stock_count,
                 "out_of_stock_items": out_of_stock_count,
-                "stock_received_today": float(stock_received_today),
-                "stock_received_today_formatted": f"KSh {stock_received_today:,.0f}",
-                "stock_issued_today": float(stock_issued_today),
-                "stock_issued_today_formatted": f"KSh {stock_issued_today:,.0f}",
+                "stock_received_today": float(rec_today),
+                "stock_received_today_formatted": _fmt_curr(rec_today),
+                "stock_issued_today": float(iss_today),
+                "stock_issued_today_formatted": _fmt_curr(iss_today),
                 "pending_transfers": 0,
                 "stock_variances": stock_variances_count
             },
             "cash_flow": {
                 "total_available_funds": float(total_available_funds),
-                "total_available_funds_formatted": format_currency(total_available_funds),
+                "total_available_funds_formatted": _fmt_curr(total_available_funds),
                 "todays_receipts": float(todays_receipts),
-                "todays_receipts_formatted": format_currency(todays_receipts),
+                "todays_receipts_formatted": _fmt_curr(todays_receipts),
                 "todays_payments": float(todays_payments),
-                "todays_payments_formatted": format_currency(todays_payments),
+                "todays_payments_formatted": _fmt_curr(todays_payments),
                 "net_cash_movement": float(net_cash_movement),
-                "net_cash_movement_formatted": f"{'+' if net_cash_movement >= ZERO else ''}{format_currency(net_cash_movement)}"
+                "net_cash_movement_formatted": f"{'+' if net_cash_movement >= ZERO else ''}{_fmt_curr(net_cash_movement)}"
             },
             "account_balances": {
                 "cash_at_hand": float(cash_balance),
-                "cash_at_hand_formatted": f"KSh {cash_balance:,.0f}",
+                "cash_at_hand_formatted": _fmt_curr(cash_balance),
                 "paybill": float(paybill_balance),
-                "paybill_formatted": f"KSh {paybill_balance:,.0f}",
+                "paybill_formatted": _fmt_curr(paybill_balance),
                 "send_money": float(send_money_balance),
-                "send_money_formatted": f"KSh {send_money_balance:,.0f}"
+                "send_money_formatted": _fmt_curr(send_money_balance)
             }
         })
 
