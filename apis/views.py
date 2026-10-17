@@ -5652,15 +5652,15 @@ class FinancialReportViewSet(viewsets.ViewSet):
 
 class ManagementAnalyticsViewSet(viewsets.ViewSet):
     """
-    Lightweight, high-performance API endpoints for executive management dashboards.
-    Delegates calculation tasks directly to the database using Django ORM aggregations.
+    Lightweight, high-performance API endpoints for executive management dashboards
+    and detailed operational reporting tables.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_branch_and_dates(self, request):
         branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
-        start_date_str = request.query_params.get('start_date')
-        end_date_str = request.query_params.get('end_date')
+        start_date_str = request.query_params.get('start_date') or request.query_params.get('startDate')
+        end_date_str = request.query_params.get('end_date') or request.query_params.get('endDate')
 
         branch = None
         if branch_id:
@@ -5672,14 +5672,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         start_date = None
         if start_date_str:
             try:
-                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                start_date = datetime.strptime(str(start_date_str).split('T')[0], "%Y-%m-%d").date()
             except ValueError:
                 pass
 
         end_date = None
         if end_date_str:
             try:
-                end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+                end_date = datetime.strptime(str(end_date_str).split('T')[0], "%Y-%m-%d").date()
             except ValueError:
                 pass
 
@@ -5700,14 +5700,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
             return "PAYBILL"
 
-        if any(k in clean for k in [
-            "SEND_MONEY",
-            "SENDMONEY",
-            "TILL",
-            "BUY_GOODS",
-            "BUYGOODS",
-            "P2P",
-        ]):
+        if any(k in clean for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "BUYGOODS", "P2P"]):
             return "SEND_MONEY"
 
         if "CASH" in clean:
@@ -6068,3 +6061,151 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             "purchase_total": float(total_purchases_cost),
             "purchase_count": purchases_qs.count()
         })
+
+    # =========================================================================
+    # DETAILED OPERATIONAL ENDPOINTS (FOR OPERATIONS TAB SUB-SECTIONS)
+    # =========================================================================
+
+    @action(detail=False, methods=['get'], url_path='operations-inventory')
+    def operations_inventory(self, request):
+        """Returns itemized inventory stock levels, prices, and threshold statuses."""
+        branch, _, _ = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        pricings = BranchItemPricing.objects.filter(branch=branch).select_related('item')
+        results = []
+
+        for p in pricings:
+            rem_stock = float(p.remaining_stock or 0.0)
+            threshold = float(p.min_stock_threshold or 5.0)
+            unit_cost = float(p.unit_cost_price or 0.0)
+            unit_retail = float(p.unit_selling_price or 0.0)
+
+            results.append({
+                "id": p.id,
+                "item_id": p.item.id,
+                "item_name": p.item.name,
+                "item_code": p.item.code or "",
+                "remaining_stock": rem_stock,
+                "min_stock_threshold": threshold,
+                "unit_cost_price": unit_cost,
+                "unit_selling_price": unit_retail,
+                "total_valuation": float(rem_stock * unit_cost),
+                "is_low_stock": rem_stock <= threshold
+            })
+
+        return Response({"count": len(results), "results": results})
+
+    @action(detail=False, methods=['get'], url_path='operations-purchases')
+    def operations_purchases(self, request):
+        """Returns itemized restock and purchase records."""
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        purchases_qs = Purchase.objects.filter(branch=branch).select_related('item', 'supplier')
+
+        if start_date and end_date:
+            purchases_qs = purchases_qs.filter(purchase_date__date__range=(start_date, end_date))
+
+        results = []
+        for p in purchases_qs:
+            qty = float(p.quantity or 0.0)
+            cost = float(p.unit_cost_price or 0.0)
+            results.append({
+                "id": p.id,
+                "purchase_date": str(p.purchase_date),
+                "item_name": p.item.name if p.item else "General Purchase",
+                "supplier_name": p.supplier.name if p.supplier else "N/A",
+                "quantity": qty,
+                "unit_cost_price": cost,
+                "total_cost": float(qty * cost),
+                "reference": getattr(p, 'invoice_number', f"PUR-{p.id}")
+            })
+
+        return Response({"count": len(results), "results": results})
+
+    @action(detail=False, methods=['get'], url_path='operations-credit')
+    def operations_credit(self, request):
+        """Returns customer credit accounts and repayment records."""
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        credit_sales = SaleTransaction.objects.filter(
+            branch=branch,
+            payment_method=SaleTransaction.PaymentMethod.CREDIT
+        ).select_related('customer')
+
+        repayments = CreditRepayment.objects.filter(branch=branch).select_related('customer')
+
+        if start_date and end_date:
+            credit_sales = credit_sales.filter(sale_date__date__range=(start_date, end_date))
+            repayments = repayments.filter(date__range=(start_date, end_date))
+
+        credit_entries = [
+            {
+                "id": f"CS-{cs.id}",
+                "type": "CREDIT_SALE",
+                "date": str(cs.sale_date.date() if hasattr(cs.sale_date, 'date') else cs.sale_date),
+                "customer_name": cs.customer.name if cs.customer else "Walk-in Customer",
+                "amount": float(cs.total_amount or 0.0),
+                "reference": getattr(cs, 'receipt_number', f"REC-{cs.id}")
+            } for cs in credit_sales
+        ]
+
+        repayment_entries = [
+            {
+                "id": f"CR-{cr.id}",
+                "type": "REPAYMENT",
+                "date": str(cr.date),
+                "customer_name": cr.customer.name if cr.customer else "Customer Repayment",
+                "amount": float(cr.amount or 0.0),
+                "payment_method": getattr(cr, 'payment_method', 'CASH'),
+                "reference": f"REP-{cr.id}"
+            } for cr in repayments
+        ]
+
+        return Response({
+            "credit_sales": credit_entries,
+            "repayments": repayment_entries
+        })
+
+    @action(detail=False, methods=['get'], url_path='operations-losses')
+    def operations_losses(self, request):
+        """Returns stock loss, damage, and adjustment movements."""
+        branch, start_date, end_date = self._get_branch_and_dates(request)
+        if not branch:
+            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        loss_types = [
+            StockMovement.MovementType.DAMAGE,
+            StockMovement.MovementType.ADJUSTMENT_OUT,
+            StockMovement.MovementType.SUPPLIER_RETURN,
+        ]
+
+        movements = StockMovement.objects.filter(
+            branch=branch,
+            movement_type__in=loss_types
+        ).select_related('item')
+
+        if start_date and end_date:
+            movements = movements.filter(created_at__date__range=(start_date, end_date))
+
+        results = []
+        for m in movements:
+            qty = float(m.quantity or 0.0)
+            cost = float(m.unit_cost_price or 0.0)
+            results.append({
+                "id": m.id,
+                "date": str(m.created_at.date() if hasattr(m.created_at, 'date') else m.created_at),
+                "item_name": m.item.name if m.item else "Unknown Item",
+                "movement_type": m.movement_type,
+                "quantity": qty,
+                "unit_cost_price": cost,
+                "total_loss_value": float(qty * cost),
+                "reason": getattr(m, 'notes', '') or getattr(m, 'reason', '-')
+            })
+
+        return Response({"count": len(results), "results": results})
