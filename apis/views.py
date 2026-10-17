@@ -5835,11 +5835,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         cogs = financials['cogs']
         gross_profit = revenue - cogs
         net_profit = gross_profit - total_expenses
+        gross_margin = float((gross_profit / revenue * 100) if revenue > ZERO else Decimal("0.0"))
 
         return Response({
             "revenue": float(revenue),
             "cost_of_goods_sold": float(cogs),
             "gross_profit": float(gross_profit),
+            "gross_margin": round(gross_margin, 1),
             "expenses": float(total_expenses),
             "net_profit": float(net_profit),
         })
@@ -5982,6 +5984,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
         total_valuation = Decimal("0.00")
         low_stock_count = 0
+        out_of_stock_count = 0
         total_quantity = Decimal("0.000")
 
         for pricing in pricings.select_related('item'):
@@ -5992,14 +5995,17 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             total_quantity += rem_stock
             total_valuation += (rem_stock * unit_cost)
 
-            if rem_stock <= threshold:
+            if rem_stock <= ZERO:
+                out_of_stock_count += 1
+            elif rem_stock <= threshold:
                 low_stock_count += 1
 
         return Response({
             "total_items": pricings.count(),
             "total_quantity": float(total_quantity),
             "inventory_value_at_cost": float(total_valuation),
-            "low_stock_count": low_stock_count
+            "low_stock_count": low_stock_count,
+            "out_of_stock_count": out_of_stock_count
         })
 
     @action(detail=False, methods=['get'], url_path='credit')
@@ -6068,49 +6074,42 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='operations-inventory')
     def operations_inventory(self, request):
-        """
-        Returns itemized inventory stock levels, period restocks, units sold,
-        and pricing valuation aggregated directly from StockMovement ledger records.
-        """
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         pricings = BranchItemPricing.objects.filter(branch=branch).select_related('item')
-
-        # 1. Base Queryset for Stock Movements
         movements_qs = StockMovement.objects.filter(branch=branch)
 
         if start_date and end_date:
             movements_qs = movements_qs.filter(date__range=(start_date, end_date))
 
-        # 2. Inbound restock types according to StockMovement.MovementType
         inbound_types = [
             StockMovement.MovementType.PURCHASE,
             StockMovement.MovementType.TRANSFER_IN,
             StockMovement.MovementType.ADJUSTMENT_IN,
         ]
 
-        # 3. Aggregate Restocks directly from StockMovement
-        restocks_map = {}
-        for mv in movements_qs.filter(movement_type__in=inbound_types).values('item_id').annotate(
-            total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
-        ):
-            restocks_map[mv['item_id']] = Decimal(str(mv['total_qty']))
+        restocks_map = {
+            mv['item_id']: Decimal(str(mv['total_qty']))
+            for mv in movements_qs.filter(movement_type__in=inbound_types).values('item_id').annotate(
+                total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
+            )
+        }
 
-        # 4. Aggregate Units Sold directly from StockMovement (MovementType.SALE)
-        sales_map = {}
-        for mv in movements_qs.filter(movement_type=StockMovement.MovementType.SALE).values('item_id').annotate(
-            total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
-        ):
-            sales_map[mv['item_id']] = Decimal(str(mv['total_qty']))
+        sales_map = {
+            mv['item_id']: Decimal(str(mv['total_qty']))
+            for mv in movements_qs.filter(movement_type=StockMovement.MovementType.SALE).values('item_id').annotate(
+                total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
+            )
+        }
 
-        # 5. Aggregate Customer Returns directly from StockMovement (MovementType.CUSTOMER_RETURN)
-        returns_map = {}
-        for mv in movements_qs.filter(movement_type=StockMovement.MovementType.CUSTOMER_RETURN).values('item_id').annotate(
-            total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
-        ):
-            returns_map[mv['item_id']] = Decimal(str(mv['total_qty']))
+        returns_map = {
+            mv['item_id']: Decimal(str(mv['total_qty']))
+            for mv in movements_qs.filter(movement_type=StockMovement.MovementType.CUSTOMER_RETURN).values('item_id').annotate(
+                total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
+            )
+        }
 
         results = []
         for p in pricings:
@@ -6125,7 +6124,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             units_sold_qty = sales_map.get(item_id, Decimal("0.000"))
             customer_returns_qty = returns_map.get(item_id, Decimal("0.000"))
 
-            # Dynamic Opening Stock for period
             if start_date and end_date:
                 opening_stock = max(Decimal("0.000"), rem_stock - restocks_qty + units_sold_qty - customer_returns_qty)
             else:
@@ -6153,7 +6151,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='operations-purchases')
     def operations_purchases(self, request):
-        """Returns itemized restock and purchase records."""
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -6171,18 +6168,17 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "id": p.id,
                 "purchase_date": str(p.purchase_date),
                 "item_name": p.item.name if p.item else "General Purchase",
-                "supplier_name": p.supplier.name if p.supplier else "N/A",
+                "supplier_name": p.supplier.name if p.supplier else (p.supplier_name or "N/A"),
                 "quantity": qty,
                 "unit_cost_price": cost,
                 "total_cost": float(qty * cost),
-                "reference": getattr(p, 'invoice_number', f"PUR-{p.id}")
+                "reference": f"PUR-{p.id}"
             })
 
         return Response({"count": len(results), "results": results})
 
     @action(detail=False, methods=['get'], url_path='operations-credit')
     def operations_credit(self, request):
-        """Returns customer credit accounts and credit repayments fetched from models."""
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -6206,7 +6202,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "customer_name": cs.customer.name if cs.customer else (cs.customer_name or "Walk-in Customer"),
                 "amount": float(quantize_money(cs.total_amount or ZERO)),
                 "balance_due": float(quantize_money(cs.balance_due)),
-                "reference": getattr(cs, 'receipt_number', f"REC-{cs.id}"),
+                "reference": cs.receipt_number or f"REC-{cs.id}",
                 "invoice_number": cs.invoice_number or "",
             } for cs in credit_sales
         ]
@@ -6231,15 +6227,12 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'], url_path='operations-losses')
     def operations_losses(self, request):
-        """Returns customer returns, stock losses, damages, and adjustments."""
         branch, start_date, end_date = self._get_branch_and_dates(request)
         if not branch:
             return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 1. Fetch Customer Returns directly from CustomerReturn model
         customer_returns_qs = CustomerReturn.objects.filter(branch=branch).select_related('item')
         
-        # 2. Fetch Damage and Loss movements
         loss_types = [
             StockMovement.MovementType.DAMAGE,
             StockMovement.MovementType.ADJUSTMENT_OUT,
