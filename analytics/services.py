@@ -899,3 +899,49 @@ class AnalyticsService:
             target_date=target_date,
             tax_rate=tax_rate,
         )
+
+
+class AnalyticsService:
+    # ... existing methods ...
+
+    @staticmethod
+    def get_lightweight_management_summary(branch, start_date, end_date):
+        """
+        Fast aggregation helper for executive dashboard overview cards.
+        """
+        SaleTransaction = get_stock_model("SaleTransaction")
+        CreditRepayment = get_stock_model("CreditRepayment")
+        Expense = get_stock_model("Expense")
+
+        sales = SaleTransaction.objects.filter(
+            branch=branch,
+            sale_date__date__range=(start_date, end_date)
+        )
+        repayments = CreditRepayment.objects.filter(
+            branch=branch,
+            date__range=(start_date, end_date)
+        )
+        expenses = Expense.objects.filter(
+            branch=branch,
+            date__range=(start_date, end_date)
+        )
+
+        sales_summary = sales.aggregate(
+            gross=Coalesce(Sum("total_amount"), ZERO, output_field=MONEY_FIELD),
+            count=Count("id")
+        )
+        repayment_sum = repayments.aggregate(
+            total=Coalesce(Sum("amount"), ZERO, output_field=MONEY_FIELD)
+        )["total"]
+        expense_sum = expenses.aggregate(
+            total=Coalesce(Sum("amount"), ZERO, output_field=MONEY_FIELD)
+        )["total"]
+
+        return {
+            "gross_sales": float(sales_summary["gross"]),
+            "transaction_count": sales_summary["count"],
+            "repayments_received": float(repayment_sum),
+            "total_expenses": float(expense_sum),
+            "expense_count": expenses.count(),
+        }
+        
