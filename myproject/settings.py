@@ -193,22 +193,40 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173' if DEBUG e
 BACKEND_URL = os.environ.get('BACKEND_URL', 'http://127.0.0.1:8000' if DEBUG else 'https://api.melvexbusinesssolutions.com')
 
 
-# Email Configuration
+import os
+
+# =========================================================
+# EMAIL CONFIGURATION
+# =========================================================
 MANAGEMENT_EMAILS = [
     email.strip() for email in os.environ.get('MANAGEMENT_EMAILS', 'engugi922@gmail.com').split(',') if email.strip()
 ]
 
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'engugi922@gmail.com')
-EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend' if DEBUG else 'django.core.mail.backends.smtp.EmailBackend')
+# Primary sender addresses
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'Melvex Management <engugi922@gmail.com>')
+SERVER_EMAIL = os.environ.get('SERVER_EMAIL', 'engugi922@gmail.com')
+
+# Email backend routing (Console for DEBUG, SMTP for Production)
+EMAIL_BACKEND = os.environ.get(
+    'EMAIL_BACKEND', 
+    'django.core.mail.backends.smtp.EmailBackend'  # Force SMTP Backend
+)
+
+# SMTP Server Parameters
 EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
 EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
 EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True').lower() in ('true', '1', 't')
+EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False').lower() in ('true', '1', 't')
+
+# SMTP Credentials
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', 'engugi922@gmail.com')
-EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')  # Must be set in environment (.env or server environment)
 EMAIL_TIMEOUT = 10
 
 
-# Production HTTPS Security Enhancements
+# =========================================================
+# PRODUCTION HTTPS SECURITY ENHANCEMENTS
+# =========================================================
 if not DEBUG:
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
     SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT', 'True').lower() in ('true', '1', 't')
