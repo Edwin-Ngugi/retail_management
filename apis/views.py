@@ -2,7 +2,7 @@ import calendar
 import logging
 import random
 import string
-rom django.core.mail import send_mail
+from django.core.mail import send_mail
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from decimal import Decimal
