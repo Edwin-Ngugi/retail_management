@@ -500,6 +500,9 @@ class ResetForgotPasswordView(APIView):
             status=status.HTTP_200_OK
         )
 
+logger = logging.getLogger(__name__)
+User = get_user_model()
+
 class RequestOTPView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -513,7 +516,7 @@ class RequestOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Look up by email first, or fallback to username
+        # Look up user by email or username
         user = None
         if email:
             user = User.objects.filter(email__iexact=email).first()
@@ -527,33 +530,30 @@ class RequestOTPView(APIView):
             )
 
         target_email = user.email or email
-        if not target_email:
-            return Response(
-                {"error": "No email address is registered for this account."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        otp_code = ''.join(random.choices(string.digits, k=6))
 
-        # Generate OTP
+        # Save OTP record safely using the retrieved user's canonical username
         try:
-            otp_entry = PasswordResetOTP.generate_otp(username=user.username)
+            PasswordResetOTP.objects.filter(username=user.username, is_used=False).update(is_used=True)
+            PasswordResetOTP.objects.create(username=user.username, otp_code=otp_code)
         except Exception as e:
-            logger.error(f"OTP Generation Error: {e}")
+            logger.error(f"OTP DB Save Error for user {user.username}: {str(e)}", exc_info=True)
             return Response(
-                {"error": "Failed to generate OTP code."},
+                {"error": f"Database error generating OTP: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-        # Send Email
+        # Dispatch Email via SMTP
         try:
             send_mail(
                 subject="Melvex Management - Password Reset OTP",
-                message=f"Hello {user.username},\n\nYour verification code is: {otp_entry.otp_code}\n\nThis code expires in 10 minutes.",
+                message=f"Hello {user.username},\n\nYour 6-digit verification code is: {otp_code}\n\nThis code expires in 10 minutes.",
                 from_email=None,
                 recipient_list=[target_email],
                 fail_silently=False,
             )
         except Exception as e:
-            logger.error(f"SMTP Error: {e}")
+            logger.error(f"SMTP Dispatch Error to {target_email}: {str(e)}", exc_info=True)
             return Response(
                 {"error": f"Failed to dispatch email: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
