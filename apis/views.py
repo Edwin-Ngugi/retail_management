@@ -516,7 +516,7 @@ class RequestOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Look up user by email or username
+        # Flexible lookup: match by email first, or fallback to username
         user = None
         if email:
             user = User.objects.filter(email__iexact=email).first()
@@ -530,16 +530,14 @@ class RequestOTPView(APIView):
             )
 
         target_email = user.email or email
-        otp_code = ''.join(random.choices(string.digits, k=6))
 
-        # Save OTP record safely using the retrieved user's canonical username
+        # Delegate OTP creation to the model classmethod
         try:
-            PasswordResetOTP.objects.filter(username=user.username, is_used=False).update(is_used=True)
-            PasswordResetOTP.objects.create(username=user.username, otp_code=otp_code)
+            otp_obj = PasswordResetOTP.generate_otp(username=user.username)
         except Exception as e:
-            logger.error(f"OTP DB Save Error for user {user.username}: {str(e)}", exc_info=True)
+            logger.error(f"OTP Generation Error: {e}", exc_info=True)
             return Response(
-                {"error": f"Database error generating OTP: {str(e)}"},
+                {"error": f"Database error generating OTP code: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
@@ -547,13 +545,17 @@ class RequestOTPView(APIView):
         try:
             send_mail(
                 subject="Melvex Management - Password Reset OTP",
-                message=f"Hello {user.username},\n\nYour 6-digit verification code is: {otp_code}\n\nThis code expires in 10 minutes.",
+                message=(
+                    f"Hello {user.username},\n\n"
+                    f"Your 6-digit verification code is: {otp_obj.otp_code}\n\n"
+                    f"This code expires in 10 minutes."
+                ),
                 from_email=None,
                 recipient_list=[target_email],
                 fail_silently=False,
             )
         except Exception as e:
-            logger.error(f"SMTP Dispatch Error to {target_email}: {str(e)}", exc_info=True)
+            logger.error(f"SMTP Dispatch Error to {target_email}: {e}", exc_info=True)
             return Response(
                 {"error": f"Failed to dispatch email: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -564,40 +566,56 @@ class RequestOTPView(APIView):
             status=status.HTTP_200_OK
         )
 
-class VerifyOTPAndResetPasswordView(APIView):
+
+class VerifyOTPAndResetPassword(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
         username = request.data.get("username", "").strip()
         otp_code = request.data.get("otp_code", "").strip()
-        new_password = request.data.get("new_password")
+        new_password = request.data.get("new_password", "")
 
         if not username or not otp_code or not new_password:
-            return Response({"error": "Username, OTP code, and new password are required."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Username, OTP code, and new password are all required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        # Fetch matching active OTP
-        otp_entry = PasswordResetOTP.objects.filter(
-            username=username,
+        # Fetch user flexibly by username or email
+        user = User.objects.filter(username__iexact=username).first()
+        if not user:
+            user = User.objects.filter(email__iexact=username).first()
+
+        if not user:
+            return Response(
+                {"error": "User account not found."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Retrieve active OTP record
+        otp_record = PasswordResetOTP.objects.filter(
+            username=user.username,
             otp_code=otp_code,
             is_verified=False
-        ).order_by('-created_at').first()
+        ).first()
 
-        if not otp_entry or not otp_entry.is_valid():
-            return Response({"error": "Invalid or expired OTP code."}, status=status.HTTP_400_BAD_REQUEST)
+        if not otp_record or not otp_record.is_valid():
+            return Response(
+                {"error": "Invalid or expired OTP code. Please request a new one."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        try:
-            user = User.objects.get(username=username)
-        except User.DoesNotExist:
-            return Response({"error": "User account not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Set new password & mark OTP as used
+        # Reset password and mark OTP as verified
         user.set_password(new_password)
         user.save()
 
-        otp_entry.is_verified = True
-        otp_entry.save()
+        otp_record.is_verified = True
+        otp_record.save()
 
-        return Response({"detail": "Password reset successfully. You can now log in."}, status=status.HTTP_200_OK)
+        return Response(
+            {"detail": "Password reset successfully! You can now log in."},
+            status=status.HTTP_200_OK
+        )
 
 class AdminLoginView(APIView):
     """
