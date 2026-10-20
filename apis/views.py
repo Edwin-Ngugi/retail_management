@@ -62,6 +62,7 @@ from stocks.models import (
     Supplier,
     SupplierReturn,
     SupplierPayment,
+    PasswordResetOTP,
 
     recalculate_wac_sales_cost,
 )
@@ -533,7 +534,7 @@ class RequestOTPView(APIView):
             {"detail": f"An OTP code has been sent to {email}."},
             status=status.HTTP_200_OK
         )
-                        
+
 class VerifyOTPAndResetPasswordView(APIView):
     permission_classes = [permissions.AllowAny]
 
