@@ -17,6 +17,7 @@ from .views import (
     UserLoginView,
     ManagementLoginView,
     AdminLoginView,
+    ChangePasswordView,
     CustomTokenObtainPairView,
     RegisterView,
     UserProfileView,
@@ -54,9 +55,10 @@ urlpatterns = [
     path('auth/management-login/', ManagementLoginView.as_view(), name='management_login'),
     path('auth/admin-login/', AdminLoginView.as_view(), name='admin_login'),
 
-    # Profile and Token Refresh
+    # Profile, Password, and Token Refresh
     path('auth/register/', RegisterView.as_view(), name='register'),
     path('auth/profile/', UserProfileView.as_view(), name='user_profile'),
+    path('auth/change-password/', ChangePasswordView.as_view(), name='change_password'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('management/login/', ManagementLoginView.as_view(), name='management-login'),
 

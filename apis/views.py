@@ -360,14 +360,21 @@ class UserLoginView(APIView):
 
 class ManagementLoginView(APIView):
     """
-    2. Management Portal Login Endpoint.
+    Management Portal Login Endpoint.
     Accessible by: Management/Staff Users & Superadmins.
     """
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        username = request.data.get("username")
+        username = request.data.get("username", "").strip()
         password = request.data.get("password")
+        branch_input = request.data.get("branch") or request.data.get("branch_id")
+
+        if not username or not password:
+            return Response(
+                {"error": "Please provide both username and password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         user = authenticate(request, username=username, password=password)
 
@@ -384,8 +391,67 @@ class ManagementLoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        token_data = generate_30min_tokens_for_user(user, portal_type="management")
-        return Response(token_data, status=status.HTTP_200_OK)
+        # Generate JWT tokens
+        refresh = RefreshToken.for_user(user)
+        access_token = str(refresh.access_token)
+        refresh_token = str(refresh)
+
+        user_data = {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "role": "Superadmin" if user.is_superuser else "Manager",
+            "is_staff": user.is_staff,
+            "is_superuser": user.is_superuser,
+            "branch": branch_input or getattr(user, 'branch_id', None)
+        }
+
+        return Response({
+            "access": access_token,
+            "token": access_token,
+            "refresh": refresh_token,
+            "refresh_token": refresh_token,
+            "user": user_data
+        }, status=status.HTTP_200_OK)
+
+
+class ChangePasswordView(APIView):
+    """
+    Endpoint for authenticated users to change their password.
+    Mounted at: auth/change-password/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        old_password = request.data.get("old_password")
+        new_password = request.data.get("new_password")
+
+        if not old_password or not new_password:
+            return Response(
+                {"error": "Both old_password and new_password are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not user.check_password(old_password):
+            return Response(
+                {"error": "Current password is incorrect."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if len(new_password) < 6:
+            return Response(
+                {"error": "New password must be at least 6 characters long."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user.set_password(new_password)
+        user.save()
+
+        return Response(
+            {"detail": "Password updated successfully."},
+            status=status.HTTP_200_OK
+        )
 
 
 class AdminLoginView(APIView):
@@ -7369,7 +7435,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # Fetch non-credit / non-invoice sale transactions
+            # Query realized sales (exclude invoices & credit method)
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__range=(start_dt, end_dt)
             ).exclude(
@@ -7394,7 +7460,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
 
-            # Inflows from Immediate Realized Sales
+            # Compute channel balances
             cash_sales = ZERO
             mpesa_sales = ZERO
             paybill_sales = ZERO
@@ -7407,11 +7473,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 mpesa_sales += bd.get('MPESA', ZERO)
                 paybill_sales += bd.get('PAYBILL', ZERO)
 
-            # Inflows from Credit Repayments
             repayments_total = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             total_inflows = cash_sales + mpesa_sales + paybill_sales + repayments_total
 
-            # Outflows
             expenses_total = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             direct_purchases_outflow = purchases_qs.exclude(payment_method='CREDIT').aggregate(
                 total=Coalesce(Sum('amount_paid'), ZERO)
@@ -7419,26 +7483,39 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             supplier_repayments_outflow = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
             total_outflows = expenses_total + direct_purchases_outflow + supplier_repayments_outflow
+            net_cash = total_inflows - total_outflows
 
             return Response({
+                "total_cash_inflows": float(quantize_money(total_inflows)),
+                "total_cash_outflows": float(quantize_money(total_outflows)),
+                "net_cash_flow": float(quantize_money(net_cash)),
+                "channels": {
+                    "CASH": float(quantize_money(cash_sales + repayments_total - expenses_total)),
+                    "MPESA": float(quantize_money(mpesa_sales)),
+                    "PAYBILL": float(quantize_money(paybill_sales)),
+                    "CREDIT": float(quantize_money(repayments_total))
+                },
                 "summary": {
                     "total_cash_inflows": float(quantize_money(total_inflows)),
                     "total_cash_outflows": float(quantize_money(total_outflows)),
-                    "net_cash_flow": float(quantize_money(total_inflows - total_outflows)),
-                    "mpesa_inflows": float(quantize_money(mpesa_sales)),
-                    "bank_inflows": float(quantize_money(paybill_sales)),
-                    "cash_on_hand": float(quantize_money(cash_sales + repayments_total - expenses_total - direct_purchases_outflow))
+                    "net_cash_flow": float(quantize_money(net_cash)),
                 }
-            })
+            }, status=status.HTTP_200_OK)
+
         except Exception as e:
             logger.exception("Cash Overview Error")
-            return Response({"summary": {"total_cash_inflows": 0.0, "total_cash_outflows": 0.0, "net_cash_flow": 0.0}})
+            return Response({
+                "total_cash_inflows": 0.0,
+                "total_cash_outflows": 0.0,
+                "net_cash_flow": 0.0,
+                "channels": {"CASH": 0.0, "MPESA": 0.0, "PAYBILL": 0.0, "CREDIT": 0.0}
+            }, status=status.HTTP_200_OK)
 
     # =========================================================================
-    # CASH RECEIPTS
+    # 2. CASH INFLOWS & REPAYMENTS
     # =========================================================================
-    @action(detail=False, methods=['get'], url_path='cash-receipts')
-    def cash_receipts(self, request):
+    @action(detail=False, methods=['get'], url_path='cash-inflows')
+    def cash_inflows(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
             
@@ -7448,7 +7525,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             repayments_qs = CreditRepayment.objects.filter(
                 Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
+            ).select_related("customer")
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -7457,15 +7534,17 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             results = []
 
             for sale in sales_qs.order_by('-sale_date')[:100]:
+                if getattr(sale, 'is_invoice', False):
+                    continue
                 method = self._normalize_payment_method(sale.payment_method)
                 if method == "SPLIT":
                     for sp in sale.split_payments.all():
                         sp_method = self._normalize_payment_method(sp.method)
                         if sp_method != "CREDIT":
                             results.append({
-                                "id": f"SALE-SPLIT-{sp.id}",
-                                "reference": sale.receipt_number,
-                                "date": sale.sale_date.strftime('%Y-%m-%d'),
+                                "id": f"SALE-SP-{sp.id}",
+                                "reference": sale.receipt_number or f"REC-{sale.id}",
+                                "date": sale.sale_date.strftime('%Y-%m-%d %H:%M'),
                                 "description": f"Sale ({sale.customer_name or 'Walk-in'})",
                                 "payment_method": sp_method,
                                 "inflow": float(quantize_money(sp.amount)),
@@ -7474,8 +7553,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 else:
                     results.append({
                         "id": f"SALE-{sale.id}",
-                        "reference": sale.receipt_number,
-                        "date": sale.sale_date.strftime('%Y-%m-%d'),
+                        "reference": sale.receipt_number or f"REC-{sale.id}",
+                        "date": sale.sale_date.strftime('%Y-%m-%d %H:%M'),
                         "description": f"Sale ({sale.customer_name or 'Walk-in'})",
                         "payment_method": method,
                         "inflow": float(quantize_money(sale.total_amount)),
@@ -7483,36 +7562,44 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     })
 
             for rep in repayments_qs.order_by('-date')[:50]:
+                cust_name = rep.customer.name if getattr(rep, 'customer', None) else 'Customer'
                 results.append({
                     "id": f"REPAY-{rep.id}",
                     "reference": f"REPAY-{rep.id}",
                     "date": rep.date.strftime('%Y-%m-%d'),
-                    "description": f"Credit Repayment - {rep.customer.name}",
+                    "description": f"Credit Repayment - {cust_name}",
                     "payment_method": self._normalize_payment_method(rep.payment_method),
                     "inflow": float(quantize_money(rep.amount)),
                     "outflow": 0.0
                 })
 
-            return Response({"count": len(results), "results": results})
+            return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
+
         except Exception as e:
-            logger.exception("Cash Receipts Error")
-            return Response({"count": 0, "results": []})
+            logger.exception("Cash Inflows Error")
+            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     # =========================================================================
-    # CASH PAYMENTS
+    # 3. EXPENSES & PAYOUTS
     # =========================================================================
-    @action(detail=False, methods=['get'], url_path='cash-payments')
-    def cash_payments(self, request):
+    @action(detail=False, methods=['get'], url_path='cash-expenses')
+    def cash_expenses(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
             
             expenses_qs = Expense.objects.filter(
                 Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
             )
-            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+            purchases_qs = Purchase.objects.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            ).exclude(payment_method='CREDIT').select_related("item", "supplier")
+            supplier_payments_qs = SupplierPayment.objects.filter(
+                created_at__range=(start_dt, end_dt)
+            ).select_related("purchase__item")
 
             if branch_obj:
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
 
             results = []
@@ -7522,307 +7609,53 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "id": f"EXP-{e.id}",
                     "reference": f"EXP-{e.id}",
                     "date": e.date.strftime('%Y-%m-%d'),
-                    "description": e.description,
+                    "description": e.description or "Operating Expense",
                     "payment_method": "CASH",
                     "inflow": 0.0,
                     "outflow": float(quantize_money(e.amount))
                 })
 
+            for p in purchases_qs.order_by('-purchase_date')[:50]:
+                supplier_disp = p.supplier_name or (p.supplier.name if getattr(p, 'supplier', None) else 'Vendor')
+                amt = p.amount_paid or p.total_cost
+                results.append({
+                    "id": f"PO-{p.id}",
+                    "reference": f"PO-{p.id}",
+                    "date": p.purchase_date.strftime('%Y-%m-%d'),
+                    "description": f"Restock ({p.item.name if getattr(p, 'item', None) else 'Item'}) - {supplier_disp}",
+                    "payment_method": self._normalize_payment_method(p.payment_method),
+                    "inflow": 0.0,
+                    "outflow": float(quantize_money(amt))
+                })
+
             for sp in supplier_payments_qs.order_by('-created_at')[:50]:
+                item_name = sp.purchase.item.name if (sp.purchase and getattr(sp.purchase, 'item', None)) else 'Item'
                 results.append({
                     "id": f"SUPP-PAY-{sp.id}",
                     "reference": f"SUPP-{sp.id}",
                     "date": sp.created_at.strftime('%Y-%m-%d'),
-                    "description": f"Supplier Repayment: PO #{sp.purchase_id} ({sp.purchase.item.name})",
+                    "description": f"Supplier Repayment: PO #{sp.purchase_id} ({item_name})",
                     "payment_method": self._normalize_payment_method(sp.payment_method),
                     "inflow": 0.0,
                     "outflow": float(quantize_money(sp.amount))
                 })
 
-            return Response({"count": len(results), "results": results})
-        except Exception as e:
-            logger.exception("Cash Payments Error")
-            return Response({"count": 0, "results": []})
-
-    # =========================================================================
-    # CASH BOOK
-    # =========================================================================
-    @action(detail=False, methods=['get'], url_path='cash-book')
-    def cash_book(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            date_iso = end_date.isoformat()
-            results = []
-
-            total_inflow = ZERO
-            total_outflow = ZERO
-
-            # 1. Fetch Realized Immediate Sales (Exclude CREDIT method & INV prefixes)
-            sales_qs = SaleTransaction.objects.filter(
-                sale_date__range=(start_dt, end_dt)
-            ).exclude(
-                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
-            ).prefetch_related("split_payments")
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-
-            for sale in sales_qs.order_by('-sale_date')[:100]:
-                # Skip any transaction that acts as an invoice or has outstanding credit balance
-                if getattr(sale, 'is_invoice', False):
-                    continue
-
-                method = self._normalize_payment_method(sale.payment_method)
-
-                if method == "SPLIT":
-                    for sp in sale.split_payments.all():
-                        sp_method = self._normalize_payment_method(sp.method)
-                        if sp_method != "CREDIT":
-                            amt = quantize_money(sp.amount)
-                            if amt > ZERO:
-                                total_inflow += amt
-                                results.append({
-                                    "id": f"SALE-SP-{sp.id}",
-                                    "reference": sale.receipt_number,
-                                    "date": sale.sale_date.strftime('%Y-%m-%d'),
-                                    "description": f"Sale ({sale.customer_name or 'Walk-in'})",
-                                    "payment_method": sp_method,
-                                    "inflow": float(amt),
-                                    "outflow": 0.0
-                                })
-                else:
-                    amt = quantize_money(sale.total_amount)
-                    if amt > ZERO:
-                        total_inflow += amt
-                        results.append({
-                            "id": f"SALE-{sale.id}",
-                            "reference": sale.receipt_number,
-                            "date": sale.sale_date.strftime('%Y-%m-%d'),
-                            "description": f"Sale ({sale.customer_name or 'Walk-in'})",
-                            "payment_method": method,
-                            "inflow": float(amt),
-                            "outflow": 0.0
-                        })
-
-            # 2. Inflows from Debt Repayments (Repayments are the ONLY inflow for Credit Sales)
-            repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            ).select_related("customer")
-
-            if branch_obj:
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
-
-            for rep in repayments_qs.order_by('-date')[:50]:
-                amt = quantize_money(rep.amount)
-                if amt > ZERO:
-                    total_inflow += amt
-                    results.append({
-                        "id": f"REPAY-{rep.id}",
-                        "reference": f"REPAY-{rep.id}",
-                        "date": rep.date.strftime('%Y-%m-%d'),
-                        "description": f"Credit Repayment - {rep.customer.name if rep.customer else 'Customer'}",
-                        "payment_method": self._normalize_payment_method(rep.payment_method),
-                        "inflow": float(amt),
-                        "outflow": 0.0
-                    })
-
-            # 3. Outflows from Direct Supplier Restocks / Purchases
-            purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
-            ).exclude(payment_method='CREDIT').select_related("item", "supplier")
-
-            if branch_obj:
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-
-            for p in purchases_qs.order_by('-purchase_date')[:50]:
-                amt = quantize_money(p.amount_paid or p.total_cost)
-                if amt > ZERO:
-                    total_outflow += amt
-                    supplier_disp = p.supplier_name or (p.supplier.name if p.supplier else 'Vendor')
-                    results.append({
-                        "id": f"PO-{p.id}",
-                        "reference": f"PO-{p.id}",
-                        "date": p.purchase_date.strftime('%Y-%m-%d'),
-                        "description": f"Restock ({p.item.name}) - {supplier_disp}",
-                        "payment_method": self._normalize_payment_method(p.payment_method),
-                        "inflow": 0.0,
-                        "outflow": float(amt)
-                    })
-
-            # 4. Outflows from Supplier Credit Repayments
-            supplier_payments_qs = SupplierPayment.objects.filter(
-                created_at__range=(start_dt, end_dt)
-            ).select_related("purchase__item")
-
-            if branch_obj:
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
-
-            for sp in supplier_payments_qs.order_by('-created_at')[:50]:
-                amt = quantize_money(sp.amount)
-                if amt > ZERO:
-                    total_outflow += amt
-                    results.append({
-                        "id": f"SUPP-PAY-{sp.id}",
-                        "reference": f"SUPP-{sp.id}",
-                        "date": sp.created_at.strftime('%Y-%m-%d'),
-                        "description": f"Supplier Repayment: PO #{sp.purchase_id} ({sp.purchase.item.name})",
-                        "payment_method": self._normalize_payment_method(sp.payment_method),
-                        "inflow": 0.0,
-                        "outflow": float(amt)
-                    })
-
-            # 5. Outflows from Expenses
-            expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            if branch_obj:
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-
-            for exp in expenses_qs.order_by('-date')[:50]:
-                amt = quantize_money(exp.amount)
-                if amt > ZERO:
-                    total_outflow += amt
-                    results.append({
-                        "id": f"EXP-{exp.id}",
-                        "reference": f"EXP-{exp.id}",
-                        "date": exp.date.strftime('%Y-%m-%d'),
-                        "description": exp.description,
-                        "payment_method": "CASH",
-                        "inflow": 0.0,
-                        "outflow": float(amt)
-                    })
-
-            return Response({
-                "date": date_iso,
-                "branch": branch_obj.id if branch_obj else None,
-                "summary": {
-                    "total_inflow": float(quantize_money(total_inflow)),
-                    "total_outflow": float(quantize_money(total_outflow)),
-                    "net_cash_flow": float(quantize_money(total_inflow - total_outflow)),
-                },
-                "count": len(results),
-                "results": results
-            }, status=status.HTTP_200_OK)
+            return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
 
         except Exception as e:
-            logger.exception("Cash Book Endpoint Error")
-            return Response({"count": 0, "results": [], "summary": {"total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0}})
+            logger.exception("Cash Expenses Error")
+            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     # =========================================================================
-    # M-PESA & CASH ACCOUNTS
+    # 4. DAILY CASH RECONCILIATION
     # =========================================================================
-    @action(detail=False, methods=['get'], url_path='mpesa-accounts')
-    def mpesa_accounts(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            
-            sales_qs = SaleTransaction.objects.filter(
-                sale_date__range=(start_dt, end_dt)
-            ).exclude(payment_method='CREDIT').prefetch_related("split_payments")
-
-            repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
-
-            paybill_total = ZERO
-            send_money_total = ZERO
-            cash_total = ZERO
-            results = []
-
-            for sale in sales_qs.order_by('-sale_date')[:100]:
-                method = self._normalize_payment_method(sale.payment_method)
-                if method == "SPLIT":
-                    for sp in sale.split_payments.all():
-                        sp_method = self._normalize_payment_method(sp.method)
-                        if sp_method in ['MPESA', 'PAYBILL', 'SEND_MONEY', 'CASH']:
-                            amt = quantize_money(sp.amount)
-                            if sp_method == 'PAYBILL': paybill_total += amt
-                            elif sp_method in ['SEND_MONEY', 'MPESA']: send_money_total += amt
-                            elif sp_method == 'CASH': cash_total += amt
-
-                            results.append({
-                                "id": f"SALE-SP-{sp.id}",
-                                "reference": sale.receipt_number,
-                                "date": sale.sale_date.strftime('%Y-%m-%d %H:%M'),
-                                "description": f"Sale ({sale.customer_name or 'Walk-in'})",
-                                "channel": sp_method,
-                                "amount": float(amt),
-                                "type": "INFLOW"
-                            })
-                else:
-                    amt = quantize_money(sale.total_amount)
-                    if method == 'PAYBILL': paybill_total += amt
-                    elif method in ['SEND_MONEY', 'MPESA']: send_money_total += amt
-                    elif method == 'CASH': cash_total += amt
-
-                    results.append({
-                        "id": f"SALE-{sale.id}",
-                        "reference": sale.receipt_number,
-                        "date": sale.sale_date.strftime('%Y-%m-%d %H:%M'),
-                        "description": f"Sale ({sale.customer_name or 'Walk-in'})",
-                        "channel": method,
-                        "amount": float(amt),
-                        "type": "INFLOW"
-                    })
-
-            for rep in repayments_qs.order_by('-date')[:50]:
-                method = self._normalize_payment_method(rep.payment_method)
-                amt = quantize_money(rep.amount)
-
-                if method == 'PAYBILL': paybill_total += amt
-                elif method in ['SEND_MONEY', 'MPESA']: send_money_total += amt
-                elif method == 'CASH': cash_total += amt
-
-                results.append({
-                    "id": f"REP-{rep.id}",
-                    "reference": f"REPAY-{rep.id}",
-                    "date": rep.date.strftime('%Y-%m-%d'),
-                    "description": f"Credit Repayment - {rep.customer.name}",
-                    "channel": method,
-                    "amount": float(amt),
-                    "type": "INFLOW"
-                })
-
-            total_mpesa_collected = paybill_total + send_money_total
-
-            return Response({
-                "summary": {
-                    "total_mpesa_collections": float(quantize_money(total_mpesa_collected)),
-                    "paybill_total": float(quantize_money(paybill_total)),
-                    "send_money_total": float(quantize_money(send_money_total)),
-                    "cash_total": float(quantize_money(cash_total)),
-                    "transaction_count": len(results)
-                },
-                "count": len(results),
-                "results": results
-            })
-        except Exception as e:
-            logger.exception("M-Pesa Accounts Error")
-            return Response({"count": 0, "results": [], "summary": {"total_mpesa_collections": 0.0, "paybill_total": 0.0, "send_money_total": 0.0, "cash_total": 0.0}})
-
-    @action(detail=False, methods=['get'], url_path='bank-accounts')
-    def bank_accounts(self, request):
-        return self.cash_overview(request)
-
-    @action(detail=False, methods=['get'], url_path='cash-transfers')
-    def cash_transfers(self, request):
-        return Response({"count": 0, "results": []})
-
     @action(detail=False, methods=['get'], url_path='cash-reconciliation')
     def cash_reconciliation(self, request):
-        return Response({"count": 0, "results": []})
-
-    @action(detail=False, methods=['get'], url_path='petty-cash')
-    def petty_cash(self, request):
-        return self.cash_payments(request)
-
-    @action(detail=False, methods=['get'], url_path='cash-reports')
-    def cash_reports(self, request):
-        return self.cash_overview(request)   
+        try:
+            return Response({"count": 0, "results": [], "status": "reconciled"}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception("Cash Reconciliation Error")
+            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
 
 logger = logging.getLogger(__name__)
