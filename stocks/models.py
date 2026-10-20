@@ -2850,3 +2850,32 @@ def recalculate_wac_sales_cost(branch, item):
         )
 
     return final_wac
+
+
+class PasswordResetOTP(models.Model):
+    username = models.CharField(max_length=150, db_index=True)
+    otp_code = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    is_verified = models.BooleanField(default=False)
+
+    def is_valid(self):
+        return not self.is_verified and timezone.now() < self.expires_at
+
+    @classmethod
+    def generate_otp(cls, username):
+        # 1. Invalidate old unverified codes for this user
+        cls.objects.filter(username=username, is_verified=False).delete()
+
+        # 2. Generate random 6-digit numeric OTP
+        code = ''.join(random.choices(string.digits, k=6))
+
+        # 3. Set expiration time (10 minutes)
+        expiry = timezone.now() + timedelta(minutes=10)
+
+        otp_obj = cls.objects.create(
+            username=username,
+            otp_code=code,
+            expires_at=expiry
+        )
+        return otp_obj

@@ -27,6 +27,8 @@ from .views import (
     FinancialReportViewSet,
     ManagementAnalyticsViewSet,
     ManagementReportsViewSet,
+    RequestOTPView, 
+    VerifyOTPAndResetPasswordView,
 )
 
 router = DefaultRouter()
@@ -61,6 +63,8 @@ urlpatterns = [
     path('auth/change-password/', ChangePasswordView.as_view(), name='change_password'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('management/login/', ManagementLoginView.as_view(), name='management-login'),
+    path('auth/request-otp/', RequestOTPView.as_view(), name='request_otp'),
+    path('auth/verify-otp-reset/', VerifyOTPAndResetPasswordView.as_view(), name='verify_otp_reset'),
 
     # Custom endpoints
     path('branches/copy-items/', CopyBranchItemsView.as_view(), name='branch-copy-items'),

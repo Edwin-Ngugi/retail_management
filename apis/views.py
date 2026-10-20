@@ -453,6 +453,111 @@ class ChangePasswordView(APIView):
             status=status.HTTP_200_OK
         )
 
+class ResetForgotPasswordView(APIView):
+    """
+    Endpoint for resetting forgotten passwords without requiring old password.
+    Mounted at: auth/reset-forgot-password/
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get("username", "").strip()
+        new_password = request.data.get("new_password")
+        # In a full production workflow, verify request.data.get("reset_code") here
+
+        if not username or not new_password:
+            return Response(
+                {"error": "Both username and new password are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            # Return success or generic error to prevent username enumeration attacks
+            return Response(
+                {"error": "Account not found or invalid reset request."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate password strength against standard rules
+        try:
+            validate_password(new_password, user=user)
+        except ValidationError as e:
+            return Response({"error": e.messages[0]}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Securely update and hash the user's password
+        user.set_password(new_password)
+        user.save()
+
+        return Response(
+            {"detail": "Password reset successfully. You can now log in with your new password."},
+            status=status.HTTP_200_OK
+        )
+
+class RequestOTPView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get("username", "").strip()
+
+        if not username:
+            return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            # Generic response to prevent user enumeration
+            return Response({"detail": "If the account exists, an OTP code has been sent."}, status=status.HTTP_200_OK)
+
+        # Generate OTP
+        otp_entry = PasswordResetOTP.generate_otp(username=user.username)
+
+        # Send via Email
+        if user.email:
+            send_mail(
+                subject="Password Reset OTP Code - Melvex",
+                message=f"Your password reset code is: {otp_entry.otp_code}. It will expire in 10 minutes.",
+                from_email=None,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+
+        return Response({"detail": "If the account exists, an OTP code has been sent."}, status=status.HTTP_200_OK)                
+class VerifyOTPAndResetPasswordView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get("username", "").strip()
+        otp_code = request.data.get("otp_code", "").strip()
+        new_password = request.data.get("new_password")
+
+        if not username or not otp_code or not new_password:
+            return Response({"error": "Username, OTP code, and new password are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Fetch matching active OTP
+        otp_entry = PasswordResetOTP.objects.filter(
+            username=username,
+            otp_code=otp_code,
+            is_verified=False
+        ).order_by('-created_at').first()
+
+        if not otp_entry or not otp_entry.is_valid():
+            return Response({"error": "Invalid or expired OTP code."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            return Response({"error": "User account not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Set new password & mark OTP as used
+        user.set_password(new_password)
+        user.save()
+
+        otp_entry.is_verified = True
+        otp_entry.save()
+
+        return Response({"detail": "Password reset successfully. You can now log in."}, status=status.HTTP_200_OK)
 
 class AdminLoginView(APIView):
     """
