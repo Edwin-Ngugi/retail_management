@@ -505,34 +505,60 @@ class RequestOTPView(APIView):
         username = request.data.get("username", "").strip()
         email = request.data.get("email", "").strip()
 
-        if not username or not email:
+        if not username and not email:
             return Response(
-                {"error": "Both username and email address are required."},
+                {"error": "Please provide a valid username or email address."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Look up by email first, or fallback to username
+        user = None
+        if email:
+            user = User.objects.filter(email__iexact=email).first()
+        if not user and username:
+            user = User.objects.filter(username__iexact=username).first()
+
+        if not user:
+            return Response(
+                {"error": "No account found matching the provided details."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        target_email = user.email or email
+        if not target_email:
+            return Response(
+                {"error": "No email address is registered for this account."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Generate OTP
         try:
-            user = User.objects.get(username=username, email__iexact=email)
-        except User.DoesNotExist:
+            otp_entry = PasswordResetOTP.generate_otp(username=user.username)
+        except Exception as e:
+            logger.error(f"OTP Generation Error: {e}")
             return Response(
-                {"error": "No account matched the provided username and email address."},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "Failed to generate OTP code."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-        # Generate OTP code
-        otp_entry = PasswordResetOTP.generate_otp(username=user.username)
-
-        # Dispatch Email
-        send_mail(
-            subject="Melvex Management Password Reset OTP",
-            message=f"Your password reset verification code is: {otp_entry.otp_code}\nThis code will expire in 10 minutes.",
-            from_email=None,
-            recipient_list=[email],
-            fail_silently=False,
-        )
+        # Send Email
+        try:
+            send_mail(
+                subject="Melvex Management - Password Reset OTP",
+                message=f"Hello {user.username},\n\nYour verification code is: {otp_entry.otp_code}\n\nThis code expires in 10 minutes.",
+                from_email=None,
+                recipient_list=[target_email],
+                fail_silently=False,
+            )
+        except Exception as e:
+            logger.error(f"SMTP Error: {e}")
+            return Response(
+                {"error": f"Failed to dispatch email: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
         return Response(
-            {"detail": f"An OTP code has been sent to {email}."},
+            {"detail": f"An OTP code has been sent to {target_email}."},
             status=status.HTTP_200_OK
         )
 
