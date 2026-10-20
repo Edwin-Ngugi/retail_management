@@ -62,6 +62,7 @@ from stocks.models import (
     Supplier,
     SupplierReturn,
     SupplierPayment,
+
     recalculate_wac_sales_cost,
 )
 
@@ -500,30 +501,39 @@ class RequestOTPView(APIView):
 
     def post(self, request):
         username = request.data.get("username", "").strip()
+        email = request.data.get("email", "").strip()
 
-        if not username:
-            return Response({"error": "Username is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            user = User.objects.get(username=username)
-        except User.DoesNotExist:
-            # Generic response to prevent user enumeration
-            return Response({"detail": "If the account exists, an OTP code has been sent."}, status=status.HTTP_200_OK)
-
-        # Generate OTP
-        otp_entry = PasswordResetOTP.generate_otp(username=user.username)
-
-        # Send via Email
-        if user.email:
-            send_mail(
-                subject="Password Reset OTP Code - Melvex",
-                message=f"Your password reset code is: {otp_entry.otp_code}. It will expire in 10 minutes.",
-                from_email=None,
-                recipient_list=[user.email],
-                fail_silently=False,
+        if not username or not email:
+            return Response(
+                {"error": "Both username and email address are required."},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
-        return Response({"detail": "If the account exists, an OTP code has been sent."}, status=status.HTTP_200_OK)                
+        try:
+            user = User.objects.get(username=username, email__iexact=email)
+        except User.DoesNotExist:
+            return Response(
+                {"error": "No account matched the provided username and email address."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Generate OTP code
+        otp_entry = PasswordResetOTP.generate_otp(username=user.username)
+
+        # Dispatch Email
+        send_mail(
+            subject="Melvex Management Password Reset OTP",
+            message=f"Your password reset verification code is: {otp_entry.otp_code}\nThis code will expire in 10 minutes.",
+            from_email=None,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+
+        return Response(
+            {"detail": f"An OTP code has been sent to {email}."},
+            status=status.HTTP_200_OK
+        )
+                        
 class VerifyOTPAndResetPasswordView(APIView):
     permission_classes = [permissions.AllowAny]
 
