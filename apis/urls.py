@@ -58,6 +58,7 @@ urlpatterns = [
     path('auth/register/', RegisterView.as_view(), name='register'),
     path('auth/profile/', UserProfileView.as_view(), name='user_profile'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('management/login/', ManagementViewSet.as_view({'post': 'login'}), name='management-login'),
 
     # Custom endpoints
     path('branches/copy-items/', CopyBranchItemsView.as_view(), name='branch-copy-items'),
