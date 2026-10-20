@@ -25,6 +25,7 @@ from .views import (
     BalanceSheetViewSet,
     FinancialReportViewSet,
     ManagementAnalyticsViewSet,
+    ManagementReportsViewSet,
 )
 
 router = DefaultRouter()
@@ -44,6 +45,7 @@ router.register(r'financial-reports', FinancialReportViewSet, basename='financia
 router.register(r'pending-approvals', PendingApprovalViewSet, basename='pending-approval')
 router.register(r"cashbook", CashbookViewSet, basename="cashbook")
 router.register(r"balance-sheet", BalanceSheetViewSet, basename="balance-sheet")
+router.register(r'management-reports', ManagementReportsViewSet, basename='management-reports')
 
 urlpatterns = [
     # Separate Portal Login Endpoints

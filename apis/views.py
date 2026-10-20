@@ -3,6 +3,7 @@ import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from decimal import Decimal
+from datetime import date, datetime, time, timedelta
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
@@ -26,7 +27,7 @@ from django.db.models import (
 from django.db.models.functions import Coalesce, TruncDate
 from django.http import HttpResponse
 from django.utils import timezone
-
+from django.db.models import F, Q, Sum, Count, DecimalField
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError as DRFValidationError
@@ -60,6 +61,7 @@ from stocks.models import (
     StockTransfer,
     Supplier,
     SupplierReturn,
+    SupplierPayment,
     recalculate_wac_sales_cost,
 )
 
@@ -5649,59 +5651,30 @@ class FinancialReportViewSet(viewsets.ViewSet):
                 {"error": str(e)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+logger = logging.getLogger(__name__)
+
+ZERO = Decimal("0.00")
+
 
 class ManagementAnalyticsViewSet(viewsets.ViewSet):
     """
-    Lightweight, high-performance API endpoints for executive management dashboards
-    and detailed operational reporting tables.
+    High-performance API endpoints for executive management dashboards,
+    fully aligned with FinancialReportViewSet accounting logic.
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
 
-    def _get_branch_and_dates(self, request):
-        branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
-        start_date_str = request.query_params.get('start_date') or request.query_params.get('startDate')
-        end_date_str = request.query_params.get('end_date') or request.query_params.get('endDate')
-        month_str = request.query_params.get('month')
-        year_str = request.query_params.get('year')
-
-        branch = None
-        if branch_id:
-            if str(branch_id).isdigit():
-                branch = RetailBranch.objects.filter(id=int(branch_id)).first()
-            else:
-                branch = RetailBranch.objects.filter(name__iexact=str(branch_id).strip()).first()
-
-        start_date = None
-        end_date = None
-
-        if start_date_str and end_date_str:
-            try:
-                start_date = datetime.strptime(str(start_date_str).split('T')[0], "%Y-%m-%d").date()
-                end_date = datetime.strptime(str(end_date_str).split('T')[0], "%Y-%m-%d").date()
-            except ValueError:
-                pass
-        elif month_str and year_str and month_str.isdigit() and year_str.isdigit():
-            m = int(month_str)
-            y = int(year_str)
-            start_date = date(y, m, 1)
-            if m == 12:
-                end_date = date(y, 12, 31)
-            else:
-                end_date = date(y, m + 1, 1) - timedelta(days=1)
-
-        return branch, start_date, end_date
+    def _format_currency(self, value):
+        try:
+            val = float(value or 0)
+            return f"KSh {val:,.2f}"
+        except Exception:
+            return "KSh 0.00"
 
     def _normalize_payment_method(self, method_name):
         if not method_name:
             return "UNKNOWN"
 
-        clean = (
-            str(method_name)
-            .strip()
-            .upper()
-            .replace("-", "_")
-            .replace(" ", "_")
-        )
+        clean = str(method_name).strip().upper().replace("-", "_").replace(" ", "_")
 
         if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
             return "PAYBILL"
@@ -5726,6 +5699,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
         return clean
 
+    def _extract_sp_method(self, sp):
+        for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
+            val = getattr(sp, attr, None)
+            if val:
+                return val
+        return None
+
     def _get_split_payments(self, sale):
         relation = getattr(sale, "split_payments", None)
         if relation is not None:
@@ -5735,832 +5715,2755 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 pass
         return []
 
-    def _extract_sp_method(self, sp):
-        for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
-            val = getattr(sp, attr, None)
-            if val:
-                return val
-        return None
-
-    @action(detail=False, methods=['get'], url_path='dashboard-cards')
-    def dashboard_cards(self, request):
-        """Returns aggregated executive dashboard metric cards without runtime formatting exceptions."""
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            branch = RetailBranch.objects.first()
-
-        if not branch:
-            return Response({"error": "No valid branch found."}, status=status.HTTP_404_NOT_FOUND)
+    def _get_branch_and_dates(self, request):
+        """
+        Consistently parses branch and date parameters across all management endpoints.
+        Returns 5 values: (branch_obj, start_date, end_date, start_dt, end_dt)
+        """
+        branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
+        start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
+        end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
+        month_param = request.query_params.get("month")
+        year_param = request.query_params.get("year")
 
         today = timezone.localdate()
 
-        # Local helper for string currency formatting
-        def _fmt_curr(val):
+        if start_param and end_param:
             try:
-                num = float(val or 0.0)
-                return f"KSh {num:,.2f}"
-            except Exception:
-                return "KSh 0.00"
-
-        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
-        expenses_qs = Expense.objects.filter(branch=branch)
-
-        if start_date and end_date:
-            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
-            expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
+                start_date = timezone.datetime.strptime(start_param, "%Y-%m-%d").date()
+                end_date = timezone.datetime.strptime(end_param, "%Y-%m-%d").date()
+            except ValueError:
+                start_date = today
+                end_date = today
+        elif month_param and year_param:
+            try:
+                yr = int(year_param)
+                mth = int(month_param)
+                _, last_day = calendar.monthrange(yr, mth)
+                start_date = timezone.datetime(yr, mth, 1).date()
+                end_date = timezone.datetime(yr, mth, last_day).date()
+            except (ValueError, TypeError):
+                start_date = today
+                end_date = today
         else:
-            sale_items_qs = sale_items_qs.filter(
-                transaction__sale_date__year=today.year,
-                transaction__sale_date__month=today.month
-            )
-            expenses_qs = expenses_qs.filter(
-                date__year=today.year,
-                date__month=today.month
-            )
-
-        fin_agg = sale_items_qs.aggregate(
-            revenue=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
-                        output_field=DecimalField(max_digits=12, decimal_places=2)
-                    ),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
-                ),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            ),
-            cogs=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity_sold') * F('unit_cost_price'),
-                        output_field=DecimalField(max_digits=12, decimal_places=2)
-                    ),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
-                ),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )
-
-        total_expenses = expenses_qs.aggregate(
-            total=Coalesce(
-                Sum('amount', output_field=DecimalField(max_digits=12, decimal_places=2)),
-                ZERO,
-                output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )['total']
-
-        revenue = Decimal(str(fin_agg['revenue'] or ZERO))
-        cogs = Decimal(str(fin_agg['cogs'] or ZERO))
-        expenses = Decimal(str(total_expenses or ZERO))
-
-        gross_profit = revenue - cogs
-        net_profit = gross_profit - expenses
-        gross_margin = float((gross_profit / revenue * Decimal("100.0")) if revenue > ZERO else Decimal("0.0"))
-
-        pricings = BranchItemPricing.objects.filter(branch=branch).select_related('item')
-
-        total_stock_value = ZERO
-        low_stock_count = 0
-        out_of_stock_count = 0
-
-        for p in pricings:
-            rem_stock = Decimal(str(p.remaining_stock or ZERO))
-            threshold = Decimal(str(p.min_stock_threshold or "5.000"))
-            unit_cost = Decimal(str(p.unit_cost_price or ZERO))
-
-            total_stock_value += (rem_stock * unit_cost)
-
-            if rem_stock <= ZERO:
-                out_of_stock_count += 1
-            elif rem_stock <= threshold:
-                low_stock_count += 1
-
-        today_movements = StockMovement.objects.filter(branch=branch, date=today)
-
-        stock_received_today = today_movements.filter(
-            movement_type__in=[
-                StockMovement.MovementType.PURCHASE,
-                StockMovement.MovementType.TRANSFER_IN,
-                StockMovement.MovementType.ADJUSTMENT_IN
-            ]
-        ).aggregate(
-            total=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity') * F('unit_cost_price'),
-                        output_field=DecimalField(max_digits=12, decimal_places=2)
-                    ),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
-                ),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )['total']
-
-        stock_issued_today = today_movements.filter(
-            movement_type__in=[
-                StockMovement.MovementType.SALE,
-                StockMovement.MovementType.TRANSFER_OUT,
-                StockMovement.MovementType.DAMAGE,
-                StockMovement.MovementType.ADJUSTMENT_OUT
-            ]
-        ).aggregate(
-            total=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity') * F('unit_cost_price'),
-                        output_field=DecimalField(max_digits=12, decimal_places=2)
-                    ),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
-                ),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )['total']
-
-        stock_variances_count = today_movements.filter(
-            movement_type__in=[
-                StockMovement.MovementType.DAMAGE,
-                StockMovement.MovementType.ADJUSTMENT_IN,
-                StockMovement.MovementType.ADJUSTMENT_OUT
-            ]
-        ).values('item_id').distinct().count()
-
-        today_sales_cash = SaleTransaction.objects.filter(
-            branch=branch, sale_date__date=today
-        ).aggregate(
-            total=Coalesce(
-                Sum('amount_paid', output_field=DecimalField(max_digits=12, decimal_places=2)),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )['total']
-
-        today_repayments = CreditRepayment.objects.filter(
-            branch=branch, date=today
-        ).aggregate(
-            total=Coalesce(
-                Sum('amount', output_field=DecimalField(max_digits=12, decimal_places=2)),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )['total']
-
-        todays_receipts = Decimal(str(today_sales_cash or ZERO)) + Decimal(str(today_repayments or ZERO))
-
-        today_expenses = Expense.objects.filter(
-            branch=branch, date=today
-        ).aggregate(
-            total=Coalesce(
-                Sum('amount', output_field=DecimalField(max_digits=12, decimal_places=2)),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )['total']
-
-        today_supplier_payments = SupplierPayment.objects.filter(
-            purchase__branch=branch, created_at__date=today
-        ).aggregate(
-            total=Coalesce(
-                Sum('amount', output_field=DecimalField(max_digits=12, decimal_places=2)),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )['total']
-
-        today_cash_purchases = Purchase.objects.filter(
-            branch=branch, purchase_date__date=today
-        ).exclude(
-            payment_method=Purchase.PaymentMethod.CREDIT
-        ).aggregate(
-            total=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity') * F('unit_cost_price'),
-                        output_field=DecimalField(max_digits=12, decimal_places=2)
-                    ),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
-                ),
-                ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-        )['total']
-
-        todays_payments = (
-            Decimal(str(today_expenses or ZERO)) +
-            Decimal(str(today_supplier_payments or ZERO)) +
-            Decimal(str(today_cash_purchases or ZERO))
-        )
-        net_cash_movement = todays_receipts - todays_payments
-
-        all_sales = SaleTransaction.objects.filter(branch=branch)
-
-        cash_balance = Decimal(str(
-            all_sales.filter(
-                Q(payment_method__iexact='CASH')
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
-        ))
-
-        total_outflows_historical = Decimal(str(
-            Expense.objects.filter(branch=branch).aggregate(t=Coalesce(Sum('amount'), ZERO))['t'] or ZERO
-        ))
-        cash_balance = max(ZERO, cash_balance - total_outflows_historical)
-
-        paybill_balance = Decimal(str(
-            all_sales.filter(
-                Q(payment_method__icontains='PAYBILL') | Q(payment_method__icontains='TILL')
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
-        ))
-
-        send_money_balance = Decimal(str(
-            all_sales.filter(
-                Q(payment_method__icontains='SEND_MONEY') | Q(payment_method__icontains='SEND MONEY')
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
-        ))
-
-        mpesa_general = Decimal(str(
-            all_sales.filter(
-                Q(payment_method__iexact='MPESA') | Q(payment_method__iexact='M-PESA')
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
-        ))
-        paybill_balance += mpesa_general
-
-        total_available_funds = cash_balance + paybill_balance + send_money_balance
-
-        rec_today = Decimal(str(stock_received_today or ZERO))
-        iss_today = Decimal(str(stock_issued_today or ZERO))
-
-        return Response({
-            "branch_id": branch.id,
-            "branch_name": branch.name,
-            "profitability": {
-                "total_sales": float(revenue),
-                "total_sales_formatted": _fmt_curr(revenue),
-                "gross_profit": float(gross_profit),
-                "gross_profit_formatted": _fmt_curr(gross_profit),
-                "gross_margin_percentage": round(gross_margin, 1),
-                "operating_expenses": float(expenses),
-                "operating_expenses_formatted": _fmt_curr(expenses),
-                "net_profit": float(net_profit),
-                "net_profit_formatted": _fmt_curr(net_profit)
-            },
-            "inventory": {
-                "total_stock_value": float(total_stock_value),
-                "total_stock_value_formatted": _fmt_curr(total_stock_value),
-                "product_skus": pricings.count(),
-                "low_stock_items": low_stock_count,
-                "out_of_stock_items": out_of_stock_count,
-                "stock_received_today": float(rec_today),
-                "stock_received_today_formatted": _fmt_curr(rec_today),
-                "stock_issued_today": float(iss_today),
-                "stock_issued_today_formatted": _fmt_curr(iss_today),
-                "pending_transfers": 0,
-                "stock_variances": stock_variances_count
-            },
-            "cash_flow": {
-                "total_available_funds": float(total_available_funds),
-                "total_available_funds_formatted": _fmt_curr(total_available_funds),
-                "todays_receipts": float(todays_receipts),
-                "todays_receipts_formatted": _fmt_curr(todays_receipts),
-                "todays_payments": float(todays_payments),
-                "todays_payments_formatted": _fmt_curr(todays_payments),
-                "net_cash_movement": float(net_cash_movement),
-                "net_cash_movement_formatted": f"{'+' if net_cash_movement >= ZERO else ''}{_fmt_curr(net_cash_movement)}"
-            },
-            "account_balances": {
-                "cash_at_hand": float(cash_balance),
-                "cash_at_hand_formatted": _fmt_curr(cash_balance),
-                "paybill": float(paybill_balance),
-                "paybill_formatted": _fmt_curr(paybill_balance),
-                "send_money": float(send_money_balance),
-                "send_money_formatted": _fmt_curr(send_money_balance)
-            }
-        })
-
-    @action(detail=False, methods=['get'], url_path='summary')
-    def summary(self, request):
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        sales_qs = SaleTransaction.objects.filter(branch=branch)
-        repayments_qs = CreditRepayment.objects.filter(branch=branch)
-        expenses_qs = Expense.objects.filter(branch=branch)
-
-        if start_date and end_date:
-            sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
-            repayments_qs = repayments_qs.filter(date__range=(start_date, end_date))
-            expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
-
-        sales_agg = sales_qs.aggregate(
-            gross_sales=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD),
-            transaction_count=Count('id'),
-            total_amount_paid=Coalesce(Sum('amount_paid', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
-        )
-
-        credit_sales_sum = sales_qs.filter(
-            payment_method=SaleTransaction.PaymentMethod.CREDIT
-        ).aggregate(
-            total=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
-        )['total']
-
-        repayments_sum = repayments_qs.aggregate(
-            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
-        )['total']
-
-        expenses_sum = expenses_qs.aggregate(
-            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
-        )['total']
-
-        return Response({
-            "branch_id": branch.id,
-            "branch_name": branch.name,
-            "sales": {
-                "gross_sales": float(sales_agg['gross_sales']),
-                "sales_cash_received": float(sales_agg['total_amount_paid']),
-                "credit_issued": float(credit_sales_sum),
-                "transaction_count": sales_agg['transaction_count'],
-            },
-            "credit": {
-                "repayments_received": float(repayments_sum),
-            },
-            "expenses": {
-                "total_expenses": float(expenses_sum),
-                "expense_count": expenses_qs.count(),
-            }
-        })
-
-    @action(detail=False, methods=['get'], url_path='profit-loss')
-    def profit_loss(self, request):
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
-        expenses_qs = Expense.objects.filter(branch=branch)
-
-        if start_date and end_date:
-            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
-            expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
-
-        financials = sale_items_qs.aggregate(
-            revenue=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
-                        output_field=MONEY_FIELD
-                    ),
-                    output_field=MONEY_FIELD
-                ),
-                ZERO, output_field=MONEY_FIELD
-            ),
-            cogs=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity_sold') * F('unit_cost_price'),
-                        output_field=MONEY_FIELD
-                    ),
-                    output_field=MONEY_FIELD
-                ),
-                ZERO, output_field=MONEY_FIELD
-            )
-        )
-
-        total_expenses = expenses_qs.aggregate(
-            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
-        )['total']
-
-        revenue = financials['revenue']
-        cogs = financials['cogs']
-        gross_profit = revenue - cogs
-        net_profit = gross_profit - total_expenses
-
-        return Response({
-            "revenue": float(revenue),
-            "cost_of_goods_sold": float(cogs),
-            "gross_profit": float(gross_profit),
-            "expenses": float(total_expenses),
-            "net_profit": float(net_profit),
-        })
-
-    @action(detail=False, methods=['get'], url_path='sales-performance')
-    def sales_performance(self, request):
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        sales_qs = SaleTransaction.objects.filter(branch=branch)
-        sale_items_qs = SaleItem.objects.filter(transaction__branch=branch)
-
-        if start_date and end_date:
-            sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
-            sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
-
-        daily_performance = sales_qs.annotate(
-            day=TruncDate('sale_date')
-        ).values('day').annotate(
-            gross_sales=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD),
-            transactions=Count('id')
-        ).order_by('day')
-
-        top_items = sale_items_qs.values(
-            'item_id', 'item__name'
-        ).annotate(
-            total_qty=Coalesce(Sum('quantity_sold'), ZERO),
-            total_revenue=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
-                        output_field=MONEY_FIELD
-                    ),
-                    output_field=MONEY_FIELD
-                ),
-                ZERO, output_field=MONEY_FIELD
-            )
-        ).order_by('-total_revenue')[:10]
-
-        return Response({
-            "daily": [
-                {
-                    "date": str(entry['day']),
-                    "gross_sales": float(entry['gross_sales']),
-                    "transactions": entry['transactions']
-                } for entry in daily_performance
-            ],
-            "top_products": [
-                {
-                    "item_id": entry['item_id'],
-                    "item_name": entry['item__name'],
-                    "quantity_sold": float(entry['total_qty']),
-                    "revenue": float(entry['total_revenue'])
-                } for entry in top_items
-            ]
-        })
-
-    @action(detail=False, methods=['get'], url_path='payment-methods')
-    def payment_methods(self, request):
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        sales_qs = SaleTransaction.objects.filter(branch=branch).prefetch_related("split_payments")
-        repayments_qs = CreditRepayment.objects.filter(branch=branch)
-
-        if start_date and end_date:
-            sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
-            repayments_qs = repayments_qs.filter(date__range=(start_date, end_date))
-
-        totals = {
-            "CASH": ZERO,
-            "PAYBILL": ZERO,
-            "SEND_MONEY": ZERO,
-            "MPESA": ZERO,
-            "BANK_TRANSFER": ZERO,
-            "CREDIT": ZERO,
-            "OTHER": ZERO,
-        }
-
-        credit_transaction_ids = set(
-            repayments_qs.exclude(transaction_id=None).values_list("transaction_id", flat=True).distinct()
-        )
-
-        for sale in sales_qs:
-            amt = Decimal(str(sale.total_amount or ZERO)).quantize(Decimal("0.01"))
-            method = self._normalize_payment_method(sale.payment_method)
-            split_records = self._get_split_payments(sale)
-
-            if method == "SPLIT" or split_records:
-                for sp in split_records:
-                    sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
-                    sp_amount = Decimal(str(sp.amount or ZERO)).quantize(Decimal("0.01"))
-
-                    if sp_method in totals:
-                        totals[sp_method] += sp_amount
-                    else:
-                        totals["OTHER"] += sp_amount
-            else:
-                is_credit = (method == "CREDIT") or (sale.id in credit_transaction_ids)
-                if is_credit:
-                    totals["CREDIT"] += amt
-                elif method in totals:
-                    totals[method] += amt
-                else:
-                    totals["OTHER"] += amt
-
-        for rep in repayments_qs:
-            rep_amt = Decimal(str(rep.amount or ZERO)).quantize(Decimal("0.01"))
-            if rep_amt <= ZERO:
-                continue
-
-            rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
-
-            if rep_method in totals and rep_method != "CREDIT":
-                totals[rep_method] += rep_amt
-            else:
-                totals["OTHER"] += rep_amt
-
-        formatted_payments = [
-            {"method": method, "amount": float(amount)}
-            for method, amount in totals.items()
-            if amount > ZERO
-        ]
-
-        return Response({
-            "split_payments": [],
-            "sale_payments": formatted_payments
-        })
-
-    @action(detail=False, methods=['get'], url_path='inventory')
-    def inventory(self, request):
-        branch, _, _ = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        pricings = BranchItemPricing.objects.filter(branch=branch)
-
-        total_valuation = Decimal("0.00")
-        low_stock_count = 0
-        total_quantity = Decimal("0.000")
-
-        for pricing in pricings.select_related('item'):
-            rem_stock = pricing.remaining_stock or Decimal("0.000")
-            unit_cost = pricing.unit_cost_price or ZERO
-            threshold = pricing.min_stock_threshold or Decimal("5.000")
-
-            total_quantity += rem_stock
-            total_valuation += (rem_stock * unit_cost)
-
-            if rem_stock <= threshold:
-                low_stock_count += 1
-
-        return Response({
-            "total_items": pricings.count(),
-            "total_quantity": float(total_quantity),
-            "inventory_value_at_cost": float(total_valuation),
-            "low_stock_count": low_stock_count
-        })
-
-    @action(detail=False, methods=['get'], url_path='credit')
-    def credit(self, request):
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        credit_sales_qs = SaleTransaction.objects.filter(
-            branch=branch,
-            payment_method=SaleTransaction.PaymentMethod.CREDIT
-        )
-
-        repayments_qs = CreditRepayment.objects.filter(branch=branch)
-
-        if start_date and end_date:
-            credit_sales_qs = credit_sales_qs.filter(sale_date__date__range=(start_date, end_date))
-            repayments_qs = repayments_qs.filter(date__range=(start_date, end_date))
-
-        new_credit_sales = credit_sales_qs.aggregate(
-            total=Coalesce(Sum('total_amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
-        )['total']
-
-        repayments_received = repayments_qs.aggregate(
-            total=Coalesce(Sum('amount', output_field=MONEY_FIELD), ZERO, output_field=MONEY_FIELD)
-        )['total']
-
-        return Response({
-            "new_credit_sales": float(new_credit_sales),
-            "repayments_received_in_period": float(repayments_received)
-        })
-
-    @action(detail=False, methods=['get'], url_path='purchases')
-    def purchases(self, request):
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        purchases_qs = Purchase.objects.filter(branch=branch)
-
-        if start_date and end_date:
-            purchases_qs = purchases_qs.filter(purchase_date__date__range=(start_date, end_date))
-
-        total_purchases_cost = purchases_qs.aggregate(
-            total=Coalesce(
-                Sum(
-                    ExpressionWrapper(
-                        F('quantity') * F('unit_cost_price'),
-                        output_field=MONEY_FIELD
-                    ),
-                    output_field=MONEY_FIELD
-                ),
-                ZERO,
-                output_field=MONEY_FIELD
-            )
-        )['total']
-
-        return Response({
-            "purchase_total": float(total_purchases_cost),
-            "purchase_count": purchases_qs.count()
-        })
-
-    # =========================================================================
-    # DETAILED OPERATIONAL ENDPOINTS (FOR OPERATIONS TAB SUB-SECTIONS)
-    # =========================================================================
-
-    @action(detail=False, methods=['get'], url_path='operations-inventory')
-    def operations_inventory(self, request):
-        """
-        Returns itemized inventory stock levels, period restocks, units sold,
-        and pricing valuation aggregated directly from StockMovement ledger records.
-        """
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        pricings = BranchItemPricing.objects.filter(branch=branch).select_related('item')
-
-        movements_qs = StockMovement.objects.filter(branch=branch)
-
-        if start_date and end_date:
-            movements_qs = movements_qs.filter(date__range=(start_date, end_date))
-
+            start_date = today
+            end_date = today
+
+        tz = timezone.get_current_timezone()
+        start_dt = timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time()), tz)
+        end_dt = timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()), tz)
+
+        branch_obj = None
+        if branch_param and str(branch_param).lower() != "all":
+            try:
+                branch_obj = RetailBranch.objects.get(pk=branch_param)
+            except (RetailBranch.DoesNotExist, ValueError):
+                branch_obj = None
+
+        return branch_obj, start_date, end_date, start_dt, end_dt
+    def _get_cashbook_aggregation(self, request, target_method=None):
+        branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+        # 1. Query Sets
+        sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).prefetch_related("split_payments", "items")
+        expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+        repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+        purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
+        
         inbound_types = [
             StockMovement.MovementType.PURCHASE,
             StockMovement.MovementType.TRANSFER_IN,
+            StockMovement.MovementType.CUSTOMER_RETURN,
             StockMovement.MovementType.ADJUSTMENT_IN,
         ]
+        stock_movements_qs = StockMovement.objects.filter(
+            movement_type__in=inbound_types, created_at__range=(start_dt, end_dt)
+        ).select_related("item", "branch")
 
-        restocks_map = {}
-        for mv in movements_qs.filter(movement_type__in=inbound_types).values('item_id').annotate(
-            total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
-        ):
-            restocks_map[mv['item_id']] = Decimal(str(mv['total_qty']))
+        if branch_obj:
+            sales_qs = sales_qs.filter(branch=branch_obj)
+            expenses_qs = expenses_qs.filter(branch=branch_obj)
+            repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+            purchases_qs = purchases_qs.filter(branch=branch_obj)
+            stock_movements_qs = stock_movements_qs.filter(branch=branch_obj)
 
-        sales_map = {}
-        for mv in movements_qs.filter(movement_type=StockMovement.MovementType.SALE).values('item_id').annotate(
-            total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
-        ):
-            sales_map[mv['item_id']] = Decimal(str(mv['total_qty']))
+        sales_by_method = {}
+        repayments_by_method = {}
+        expenses_by_method = {}
+        purchases_by_method = {}
 
-        returns_map = {}
-        for mv in movements_qs.filter(movement_type=StockMovement.MovementType.CUSTOMER_RETURN).values('item_id').annotate(
-            total_qty=Coalesce(Sum('quantity'), Decimal("0.000"))
-        ):
-            returns_map[mv['item_id']] = Decimal(str(mv['total_qty']))
+        total_inflow = ZERO
+        total_outflow = ZERO
+        calculated_cogs = ZERO
 
-        results = []
-        for p in pricings:
-            item_id = p.item.id
-            effective_opening = Decimal(str(p.get_effective_opening_stock() or ZERO))
-            rem_stock = Decimal(str(p.remaining_stock or ZERO))
-            threshold = Decimal(str(p.min_stock_threshold or "5.000"))
-            unit_cost = Decimal(str(p.unit_cost_price or ZERO))
-            unit_retail = Decimal(str(p.unit_selling_price or ZERO))
+        # COGS Ratio Calculation
+        sale_items = SaleItem.objects.filter(transaction__in=sales_qs).select_related("transaction")
+        for line in sale_items:
+            sale = line.transaction
+            qty = Decimal(str(getattr(line, "quantity", getattr(line, "quantity_sold", 1)) or 1))
+            unit_cost = Decimal(str(line.unit_cost_price or ZERO))
+            line_cost = qty * unit_cost
 
-            restocks_qty = restocks_map.get(item_id, Decimal("0.000"))
-            units_sold_qty = sales_map.get(item_id, Decimal("0.000"))
-            customer_returns_qty = returns_map.get(item_id, Decimal("0.000"))
+            method = self._normalize_payment_method(sale.payment_method)
+            split_records = list(sale.split_payments.all()) if hasattr(sale, "split_payments") else []
+            sale_total = Decimal(str(sale.total_amount or ZERO))
+
+            if method == "SPLIT" or split_records:
+                paid_split_amount = ZERO
+                for sp in split_records:
+                    sp_method = self._normalize_payment_method(getattr(sp, "method", getattr(sp, "payment_method", None)))
+                    if sp_method != "CREDIT":
+                        paid_split_amount += Decimal(str(getattr(sp, "amount", ZERO) or ZERO))
+                paid_ratio = min(Decimal("1.00"), max(ZERO, paid_split_amount / sale_total)) if sale_total > ZERO else ZERO
+            elif method == "CREDIT":
+                paid_ratio = ZERO
+            else:
+                paid_ratio = Decimal("1.00")
+
+            calculated_cogs += line_cost * paid_ratio
+
+        # Sales Inflows Aggregation
+        for sale in sales_qs:
+            method = self._normalize_payment_method(sale.payment_method)
+            amount = Decimal(str(sale.total_amount or ZERO))
+            split_records = list(sale.split_payments.all()) if hasattr(sale, "split_payments") else []
+
+            if method == "SPLIT" or split_records:
+                for sp in split_records:
+                    sp_method = self._normalize_payment_method(getattr(sp, "method", getattr(sp, "payment_method", None)))
+                    if sp_method == "CREDIT":
+                        continue
+                    sp_amount = Decimal(str(getattr(sp, "amount", ZERO) or ZERO))
+                    if target_method and sp_method != target_method:
+                        continue
+
+                    total_inflow += sp_amount
+                    if sp_method not in sales_by_method:
+                        sales_by_method[sp_method] = {"amount": ZERO, "count": 0}
+                    sales_by_method[sp_method]["amount"] += sp_amount
+                    sales_by_method[sp_method]["count"] += 1
+            else:
+                if method == "CREDIT" or (target_method and method != target_method):
+                    continue
+
+                total_inflow += amount
+                if method not in sales_by_method:
+                    sales_by_method[method] = {"amount": ZERO, "count": 0}
+                sales_by_method[method]["amount"] += amount
+                sales_by_method[method]["count"] += 1
+
+        # Repayments Inflows Aggregation
+        for repayment in repayments_qs:
+            raw_method = getattr(repayment, "payment_method", None) or "CASH"
+            method = self._normalize_payment_method(raw_method)
+            if target_method and method != target_method:
+                continue
+
+            amount = Decimal(str(repayment.amount or ZERO))
+            total_inflow += amount
+            if method not in repayments_by_method:
+                repayments_by_method[method] = {"amount": ZERO, "count": 0}
+            repayments_by_method[method]["amount"] += amount
+            repayments_by_method[method]["count"] += 1
+
+        # Expenses Outflows Aggregation
+        for expense in expenses_qs:
+            raw_method = getattr(expense, "payment_method", None) or "CASH"
+            method = self._normalize_payment_method(raw_method)
+            if target_method and method != target_method:
+                continue
+
+            amount = Decimal(str(expense.amount or ZERO))
+            total_outflow += amount
+            if method not in expenses_by_method:
+                expenses_by_method[method] = {"amount": ZERO, "count": 0}
+            expenses_by_method[method]["amount"] += amount
+            expenses_by_method[method]["count"] += 1
+
+        # Purchases Outflows Aggregation
+        has_explicit_purchases = False
+        purchase_payment_map = {p.pk: self._normalize_payment_method(getattr(p, "payment_method", None) or "CASH") for p in purchases_qs}
+
+        for sm in stock_movements_qs:
+            method = purchase_payment_map.get(sm.reference_id, "CASH") if sm.reference_id else "CASH"
+            if target_method and method != target_method:
+                continue
+
+            cost_amount = Decimal(str(getattr(sm, "total_cost", ZERO) or ZERO))
+            if cost_amount > ZERO:
+                has_explicit_purchases = True
+                total_outflow += cost_amount
+                if method not in purchases_by_method:
+                    purchases_by_method[method] = {"amount": ZERO, "count": 0}
+                purchases_by_method[method]["amount"] += cost_amount
+                purchases_by_method[method]["count"] += 1
+
+        if not has_explicit_purchases:
+            for purchase in purchases_qs:
+                method = purchase_payment_map.get(purchase.pk, "CASH")
+                if target_method and method != target_method:
+                    continue
+
+                amount = Decimal(str(getattr(purchase, "total_cost", ZERO) or ZERO))
+                if amount > ZERO:
+                    has_explicit_purchases = True
+                    total_outflow += amount
+                    if method not in purchases_by_method:
+                        purchases_by_method[method] = {"amount": ZERO, "count": 0}
+                    purchases_by_method[method]["amount"] += amount
+                    purchases_by_method[method]["count"] += 1
+
+        if not has_explicit_purchases and calculated_cogs > ZERO:
+            if not target_method or target_method == "CASH":
+                calculated_cogs = calculated_cogs.quantize(Decimal("0.01"))
+                total_outflow += calculated_cogs
+                purchases_by_method["CASH"] = {"amount": calculated_cogs, "count": len(sale_items)}
+
+        return {
+            "sales_by_method": sales_by_method,
+            "repayments_by_method": repayments_by_method,
+            "expenses_by_method": expenses_by_method,
+            "purchases_by_method": purchases_by_method,
+            "total_inflow": total_inflow,
+            "total_outflow": total_outflow,
+            "net_cash_flow": total_inflow - total_outflow,
+        }
+
+    
+    # 1. DASHBOARD CARD
+    @action(detail=False, methods=['get'], url_path='dashboard-cards')
+    def dashboard_cards(self, request):
+        try:
+            # 1. Unpack branch and date parameters safely
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch = branch_obj
+            today = timezone.localdate()
+
+            # 2. Base Querysets
+            sales_qs = SaleTransaction.objects.all()
+            sale_items_qs = SaleItem.objects.all()
+            expenses_qs = Expense.objects.all()
+            repayments_qs = CreditRepayment.objects.all()
+
+            if branch:
+                sales_qs = sales_qs.filter(branch=branch)
+                sale_items_qs = sale_items_qs.filter(transaction__branch=branch)
+                expenses_qs = expenses_qs.filter(branch=branch)
+                repayments_qs = repayments_qs.filter(Q(branch=branch) | Q(transaction__branch=branch))
 
             if start_date and end_date:
-                opening_stock = max(Decimal("0.000"), rem_stock - restocks_qty + units_sold_qty - customer_returns_qty)
+                sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
+                sale_items_qs = sale_items_qs.filter(transaction__sale_date__range=(start_dt, end_dt))
+                expenses_qs = expenses_qs.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+                repayments_qs = repayments_qs.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
             else:
-                opening_stock = effective_opening
+                # Default to current month window using datetimes
+                month_start_dt = timezone.make_aware(datetime.combine(today.replace(day=1), time.min))
+                sales_qs = sales_qs.filter(sale_date__gte=month_start_dt)
+                sale_items_qs = sale_items_qs.filter(transaction__sale_date__gte=month_start_dt)
+                expenses_qs = expenses_qs.filter(Q(date__gte=today.replace(day=1)) | Q(created_at__gte=month_start_dt))
+                repayments_qs = repayments_qs.filter(Q(date__gte=today.replace(day=1)) | Q(created_at__gte=month_start_dt))
 
-            results.append({
+            # Revenue and COGS
+            revenue = ZERO
+            cogs = ZERO
+            for item in sale_items_qs.select_related('item'):
+                qty = Decimal(str(item.quantity_sold or ZERO))
+                price = Decimal(str(item.unit_selling_price or ZERO))
+                disc = Decimal(str(item.discount_per_item or ZERO))
+                cost = Decimal(str(item.unit_cost_price or ZERO))
+                revenue += qty * (price - disc)
+                cogs += qty * cost
+
+            total_expenses = sum((Decimal(str(e.amount or ZERO)) for e in expenses_qs), ZERO)
+            gross_profit = revenue - cogs
+            net_profit = gross_profit - total_expenses
+            gross_margin = float((gross_profit / revenue * Decimal("100.0")) if revenue > ZERO else Decimal("0.0"))
+
+            # Inventory Metrics
+            pricings = BranchItemPricing.objects.filter(branch=branch) if branch else BranchItemPricing.objects.all()
+            total_stock_value = ZERO
+            low_stock_count = 0
+            out_of_stock_count = 0
+
+            for p in pricings:
+                rem_stock = Decimal(str(p.remaining_stock or ZERO))
+                threshold = Decimal(str(p.min_stock_threshold or 5))
+                unit_cost = Decimal(str(p.unit_cost_price or ZERO))
+                total_stock_value += (rem_stock * unit_cost)
+                if rem_stock <= ZERO:
+                    out_of_stock_count += 1
+                elif rem_stock <= threshold:
+                    low_stock_count += 1
+
+            # Today's Cash Flow (Collections)
+            today_start_dt = timezone.make_aware(datetime.combine(today, time.min))
+            today_end_dt = timezone.make_aware(datetime.combine(today, time.max))
+
+            today_sales = SaleTransaction.objects.filter(sale_date__range=(today_start_dt, today_end_dt))
+            if branch:
+                today_sales = today_sales.filter(branch=branch)
+
+            today_liquid_collections = ZERO
+            for sale in today_sales:
+                bd = getattr(sale, 'liquid_payments_breakdown', {})
+                today_liquid_collections += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
+
+            today_repayments_qs = CreditRepayment.objects.filter(Q(date=today) | Q(created_at__range=(today_start_dt, today_end_dt)))
+            if branch:
+                today_repayments_qs = today_repayments_qs.filter(Q(branch=branch) | Q(transaction__branch=branch))
+
+            today_repayments = sum((quantize_money(r.amount or ZERO) for r in today_repayments_qs), ZERO)
+            todays_receipts = today_liquid_collections + today_repayments
+
+            today_exp_qs = Expense.objects.filter(Q(date=today) | Q(created_at__range=(today_start_dt, today_end_dt)))
+            if branch:
+                today_exp_qs = today_exp_qs.filter(branch=branch)
+            todays_payments = sum((quantize_money(e.amount or ZERO) for e in today_exp_qs), ZERO)
+
+            net_cash_movement = todays_receipts - todays_payments
+
+            # Account Balances Calculation
+            all_sales = SaleTransaction.objects.all()
+            if branch:
+                all_sales = all_sales.filter(branch=branch)
+
+            cash_balance = ZERO
+            paybill_balance = ZERO
+            send_money_balance = ZERO
+
+            for sale in all_sales:
+                bd = getattr(sale, 'liquid_payments_breakdown', {})
+                cash_balance += bd.get('CASH', ZERO)
+                paybill_balance += bd.get('PAYBILL', ZERO)
+                send_money_balance += bd.get('MPESA', ZERO)
+
+            all_repayments = CreditRepayment.objects.all()
+            if branch:
+                all_repayments = all_repayments.filter(Q(branch=branch) | Q(transaction__branch=branch))
+
+            for rep in all_repayments:
+                rep_amt = quantize_money(rep.amount or ZERO)
+                rep_method = self._normalize_payment_method(rep.payment_method)
+                if rep_method == 'CASH':
+                    cash_balance += rep_amt
+                elif rep_method == 'PAYBILL':
+                    paybill_balance += rep_amt
+                elif rep_method in ['SEND_MONEY', 'MPESA']:
+                    send_money_balance += rep_amt
+
+            all_expenses_qs = Expense.objects.all()
+            if branch:
+                all_expenses_qs = all_expenses_qs.filter(branch=branch)
+
+            total_expenses_hist = sum((quantize_money(e.amount or ZERO) for e in all_expenses_qs), ZERO)
+            cash_balance = max(ZERO, cash_balance - total_expenses_hist)
+            total_available_funds = cash_balance + paybill_balance + send_money_balance
+
+            return Response({
+                "branch_id": branch.id if branch else None,
+                "branch_name": branch.name if branch else "Main Branch",
+                "profitability": {
+                    "total_sales": float(revenue),
+                    "total_sales_formatted": self._format_currency(revenue),
+                    "gross_profit": float(gross_profit),
+                    "gross_profit_formatted": self._format_currency(gross_profit),
+                    "gross_margin_percentage": round(gross_margin, 1),
+                    "operating_expenses": float(total_expenses),
+                    "operating_expenses_formatted": self._format_currency(total_expenses),
+                    "net_profit": float(net_profit),
+                    "net_profit_formatted": self._format_currency(net_profit)
+                },
+                "inventory": {
+                    "total_stock_value": float(total_stock_value),
+                    "total_stock_value_formatted": self._format_currency(total_stock_value),
+                    "product_skus": pricings.count(),
+                    "low_stock_items": low_stock_count,
+                    "out_of_stock_items": out_of_stock_count,
+                    "stock_received_today": 0.0,
+                    "stock_received_today_formatted": "KSh 0.00",
+                    "stock_issued_today": 0.0,
+                    "stock_issued_today_formatted": "KSh 0.00",
+                    "pending_transfers": 0,
+                    "stock_variances": 0
+                },
+                "cash_flow": {
+                    "total_available_funds": float(total_available_funds),
+                    "total_available_funds_formatted": self._format_currency(total_available_funds),
+                    "todays_receipts": float(todays_receipts),
+                    "todays_receipts_formatted": self._format_currency(todays_receipts),
+                    "todays_payments": float(todays_payments),
+                    "todays_payments_formatted": self._format_currency(todays_payments),
+                    "net_cash_movement": float(net_cash_movement),
+                    "net_cash_movement_formatted": f"{'+' if net_cash_movement >= ZERO else ''}{self._format_currency(net_cash_movement)}"
+                },
+                "account_balances": {
+                    "cash_at_hand": float(cash_balance),
+                    "cash_at_hand_formatted": f"KSh {cash_balance:,.0f}",
+                    "paybill": float(paybill_balance),
+                    "paybill_formatted": f"KSh {paybill_balance:,.0f}",
+                    "send_money": float(send_money_balance),
+                    "send_money_formatted": f"KSh {send_money_balance:,.0f}"
+                }
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Dashboard Cards Recovery Exception")
+            return Response({
+                "branch_id": None,
+                "branch_name": "Default Branch",
+                "profitability": {
+                    "total_sales": 0.0, "total_sales_formatted": "KSh 0.00",
+                    "gross_profit": 0.0, "gross_profit_formatted": "KSh 0.00",
+                    "gross_margin_percentage": 0.0,
+                    "operating_expenses": 0.0, "operating_expenses_formatted": "KSh 0.00",
+                    "net_profit": 0.0, "net_profit_formatted": "KSh 0.00"
+                },
+                "inventory": {
+                    "total_stock_value": 0.0, "total_stock_value_formatted": "KSh 0.00",
+                    "product_skus": 0, "low_stock_items": 0, "out_of_stock_items": 0,
+                    "stock_received_today": 0.0, "stock_received_today_formatted": "KSh 0.00",
+                    "stock_issued_today": 0.0, "stock_issued_today_formatted": "KSh 0.00",
+                    "pending_transfers": 0, "stock_variances": 0
+                },
+                "cash_flow": {
+                    "total_available_funds": 0.0, "total_available_funds_formatted": "KSh 0.00",
+                    "todays_receipts": 0.0, "todays_receipts_formatted": "KSh 0.00",
+                    "todays_payments": 0.0, "todays_payments_formatted": "KSh 0.00",
+                    "net_cash_movement": 0.0, "net_cash_movement_formatted": "+KSh 0.00"
+                },
+                "account_balances": {
+                    "cash_at_hand": 0.0, "cash_at_hand_formatted": "KSh 0",
+                    "paybill": 0.0, "paybill_formatted": "KSh 0",
+                    "send_money": 0.0, "send_money_formatted": "KSh 0"
+                }
+            }, status=status.HTTP_200_OK)
+    # =========================================================================
+    # 2. PROFIT LOSS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='profit-loss')
+    def profit_loss(self, request):
+        try:
+            # 1. Unpack parameters and set branch alias cleanly
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch = branch_obj
+
+            # 2. Base Querysets
+            sale_items_qs = SaleItem.objects.all()
+            expenses_qs = Expense.objects.all()
+
+            if branch:
+                sale_items_qs = sale_items_qs.filter(transaction__branch=branch)
+                expenses_qs = expenses_qs.filter(branch=branch)
+
+            # Date Range Filtering using aware datetimes
+            if start_date and end_date:
+                sale_items_qs = sale_items_qs.filter(transaction__sale_date__range=(start_dt, end_dt))
+                expenses_qs = expenses_qs.filter(
+                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                )
+
+            # 3. DB-Level Aggregations for Revenue & COGS
+            revenue_expr = ExpressionWrapper(
+                F('quantity_sold') * (F('unit_selling_price') - F('discount_per_item')),
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
+            cogs_expr = ExpressionWrapper(
+                F('quantity_sold') * F('unit_cost_price'),
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
+
+            revenue = sale_items_qs.aggregate(total=Coalesce(Sum(revenue_expr), ZERO))['total']
+            cogs = sale_items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO))['total']
+            total_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            # Financial Calculations
+            gross_profit = revenue - cogs
+            operating_profit = gross_profit - total_expenses
+            finance_costs_and_tax = ZERO
+            net_profit = operating_profit - finance_costs_and_tax
+
+            gross_margin = float((gross_profit / revenue * Decimal("100.0")) if revenue > ZERO else Decimal("0.0"))
+            net_margin = float((net_profit / revenue * Decimal("100.0")) if revenue > ZERO else Decimal("0.0"))
+
+            # Formatted Period Label
+            if start_date and end_date:
+                period_str = (
+                    start_date.strftime('%B %Y') 
+                    if start_date.month == end_date.month and start_date.year == end_date.year 
+                    else f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+                )
+            else:
+                period_str = timezone.localdate().strftime('%B %Y')
+
+            return Response({
+                "period": period_str,
+                "revenue": float(quantize_money(revenue)),
+                "cogs": float(quantize_money(cogs)),
+                "cost_of_goods_sold": float(quantize_money(cogs)),  # Alias for fallback keys
+                "gross_profit": float(quantize_money(gross_profit)),
+                "gross_margin": round(gross_margin, 1),
+                "operating_expenses": float(quantize_money(total_expenses)),
+                "expenses": float(quantize_money(total_expenses)),  # Alias for fallback keys
+                "operating_profit": float(quantize_money(operating_profit)),
+                "finance_costs_and_tax": float(quantize_money(finance_costs_and_tax)),
+                "net_profit": float(quantize_money(net_profit)),
+                "net_margin": round(net_margin, 1),
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Profit Loss Exception Caught")
+            return Response({
+                "period": timezone.localdate().strftime('%B %Y'),
+                "revenue": 0.0,
+                "cogs": 0.0,
+                "cost_of_goods_sold": 0.0,
+                "gross_profit": 0.0,
+                "gross_margin": 0.0,
+                "operating_expenses": 0.0,
+                "expenses": 0.0,
+                "operating_profit": 0.0,
+                "finance_costs_and_tax": 0.0,
+                "net_profit": 0.0,
+                "net_margin": 0.0,
+            }, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 1. PURCHASES OVERVIEW (Sourced from Purchase, SupplierPayment & StockMovement)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='purchases-overview')
+    def purchases_overview(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+
+            purchases_qs = Purchase.objects.filter(branch=branch) if branch else Purchase.objects.all()
+            payments_qs = SupplierPayment.objects.filter(purchase__branch=branch) if branch else SupplierPayment.objects.all()
+            returns_qs = SupplierReturn.objects.filter(branch=branch) if branch else SupplierReturn.objects.all()
+
+            if start_date and end_date:
+                purchases_qs = purchases_qs.filter(purchase_date__date__range=(start_date, end_date))
+                payments_qs = payments_qs.filter(created_at__date__range=(start_date, end_date))
+                returns_qs = returns_qs.filter(date__range=(start_date, end_date))
+
+            # Total purchase spend
+            total_purchases_cost = sum((p.total_cost for p in purchases_qs), ZERO)
+            total_repayments_made = payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            
+            # Unsettled credit balance due on Purchases
+            outstanding_credit = sum((p.balance_due for p in purchases_qs if p.is_credit), ZERO)
+            
+            # Stock Movements for Restocks
+            movements_qs = StockMovement.objects.filter(
+                movement_type=StockMovement.MovementType.PURCHASE
+            )
+            if branch:
+                movements_qs = movements_qs.filter(branch=branch)
+            if start_date and end_date:
+                movements_qs = movements_qs.filter(date__range=(start_date, end_date))
+
+            total_units_purchased = movements_qs.aggregate(
+                total_qty=Coalesce(Sum('quantity'), ZERO)
+            )['total_qty']
+
+            return Response({
+                "summary": {
+                    "total_procurement_spend": float(quantize_money(total_purchases_cost)),
+                    "total_paid_suppliers": float(quantize_money(total_repayments_made)),
+                    "outstanding_payables": float(quantize_money(outstanding_credit)),
+                    "purchase_orders_count": purchases_qs.count(),
+                    "total_units_purchased": float(total_units_purchased),
+                    "supplier_returns_count": returns_qs.count()
+                }
+            })
+        except Exception as e:
+            logger.exception("Purchases Overview Error")
+            return Response({"summary": {"total_procurement_spend": 0.0, "total_paid_suppliers": 0.0, "outstanding_payables": 0.0, "purchase_orders_count": 0}})
+
+    # =========================================================================
+    # 2. PURCHASE REQUISITIONS (Pending Purchases & Reorder Warnings)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='purchase-requisitions')
+    def purchase_requisitions(self, request):
+        try:
+            branch, _, _ = self._get_branch_and_dates(request)
+            
+            # Low stock thresholds derived from BranchItemPricing
+            pricing_qs = BranchItemPricing.objects.all()
+            if branch:
+                pricing_qs = pricing_qs.filter(branch=branch)
+
+            low_stock_items = [p for p in pricing_qs if p.is_low_stock]
+
+            results = [{
                 "id": p.id,
-                "item_id": item_id,
+                "req_number": f"REQ-{p.item.code or p.item.id}",
                 "item_name": p.item.name,
-                "item_code": p.item.code or "",
-                "opening_stock": float(opening_stock),
-                "restocks": float(restocks_qty),
-                "units_sold": float(units_sold_qty),
-                "customer_returns": float(customer_returns_qty),
-                "remaining_stock": float(rem_stock),
-                "min_stock_threshold": float(threshold),
-                "unit_cost_price": float(unit_cost),
-                "unit_selling_price": float(unit_retail),
-                "wac": float(unit_cost),
-                "total_valuation": float(quantize_money(rem_stock * unit_cost)),
-                "is_low_stock": rem_stock <= threshold
-            })
+                "current_stock": float(p.remaining_stock),
+                "reorder_level": float(p.min_stock_threshold),
+                "unit_cost_price": float(quantize_money(p.unit_cost_price)),
+                "status": "LOW_STOCK_ALERT"
+            } for p in low_stock_items[:100]]
 
-        return Response({"count": len(results), "results": results})
+            return Response({"count": len(low_stock_items), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
 
-    @action(detail=False, methods=['get'], url_path='operations-purchases')
-    def operations_purchases(self, request):
-        """Returns itemized restock and purchase records."""
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+    # =========================================================================
+    # 3. PURCHASE ORDERS (List of Restocks / Purchases from `Purchase` Model)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='purchase-orders')
+    def purchase_orders(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            qs = Purchase.objects.filter(branch=branch) if branch else Purchase.objects.all()
 
-        purchases_qs = Purchase.objects.filter(branch=branch).select_related('item', 'supplier')
+            if start_date and end_date:
+                qs = qs.filter(purchase_date__date__range=(start_date, end_date))
 
-        if start_date and end_date:
-            purchases_qs = purchases_qs.filter(purchase_date__date__range=(start_date, end_date))
-
-        results = []
-        for p in purchases_qs:
-            qty = float(p.quantity or 0.0)
-            cost = float(p.unit_cost_price or 0.0)
-            results.append({
+            results = [{
                 "id": p.id,
-                "purchase_date": str(p.purchase_date),
-                "item_name": p.item.name if p.item else "General Purchase",
-                "supplier_name": p.supplier.name if p.supplier else "N/A",
-                "quantity": qty,
-                "unit_cost_price": cost,
-                "total_cost": float(qty * cost),
-                "reference": getattr(p, 'invoice_number', f"PUR-{p.id}")
+                "po_number": f"PO-{p.id}",
+                "item_name": p.item.name,
+                "supplier_name": p.supplier_name or (p.supplier.name if p.supplier else "General Supplier"),
+                "quantity": float(p.quantity),
+                "unit_cost": float(p.unit_cost_price),
+                "total_cost": float(p.total_cost),
+                "payment_method": p.payment_method,
+                "purchase_date": p.purchase_date.strftime('%Y-%m-%d'),
+                "is_fully_paid": p.is_fully_paid
+            } for p in qs.select_related('item', 'supplier')[:100]]
+
+            return Response({"count": qs.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    # =========================================================================
+    # 4. GOODS RECEIVED (Derived from StockMovement where movement_type=PURCHASE)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='goods-received')
+    def goods_received(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            qs = StockMovement.objects.filter(movement_type=StockMovement.MovementType.PURCHASE)
+
+            if branch:
+                qs = qs.filter(branch=branch)
+            if start_date and end_date:
+                qs = qs.filter(date__range=(start_date, end_date))
+
+            results = [{
+                "id": m.id,
+                "grn_number": f"GRN-{m.id}",
+                "reference": m.reference,
+                "item_name": m.item.name,
+                "quantity_received": float(m.quantity),
+                "unit_cost_price": float(quantize_money(m.unit_cost_price)),
+                "received_date": m.date.strftime('%Y-%m-%d'),
+                "notes": m.notes
+            } for m in qs.select_related('item')[:100]]
+
+            return Response({"count": qs.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    # =========================================================================
+    # 5. SUPPLIER INVOICES (Purchases On Credit)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='supplier-invoices')
+    def supplier_invoices(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            qs = Purchase.objects.filter(payment_method=Purchase.PaymentMethod.CREDIT)
+
+            if branch:
+                qs = qs.filter(branch=branch)
+            if start_date and end_date:
+                qs = qs.filter(purchase_date__date__range=(start_date, end_date))
+
+            results = [{
+                "id": p.id,
+                "invoice_number": f"PINV-{p.id}",
+                "supplier_name": p.supplier_name or (p.supplier.name if p.supplier else "N/A"),
+                "item_name": p.item.name,
+                "total_cost": float(p.total_cost),
+                "amount_paid": float(quantize_money(p.amount_paid)),
+                "balance_due": float(p.balance_due),
+                "purchase_date": p.purchase_date.strftime('%Y-%m-%d'),
+                "status": "PAID" if p.is_fully_paid else "UNPAID"
+            } for p in qs.select_related('item', 'supplier')[:100]]
+
+            return Response({"count": qs.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    # =========================================================================
+    # 6. PURCHASE RETURNS (Sourced from SupplierReturn Model)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='purchase-returns')
+    def purchase_returns(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            qs = SupplierReturn.objects.all()
+
+            if branch:
+                qs = qs.filter(branch=branch)
+            if start_date and end_date:
+                qs = qs.filter(date__range=(start_date, end_date))
+
+            results = [{
+                "id": ret.id,
+                "return_number": f"PRET-{ret.id}",
+                "item_name": ret.item.name,
+                "supplier_name": ret.supplier_name or "N/A",
+                "quantity": float(ret.quantity),
+                "reason": ret.reason,
+                "date": ret.date.strftime('%Y-%m-%d')
+            } for ret in qs.select_related('item')[:100]]
+
+            return Response({"count": qs.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    # =========================================================================
+    # 7. SUPPLIER PAYMENTS (Sourced from SupplierPayment Model)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='supplier-payments')
+    def supplier_payments(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            qs = SupplierPayment.objects.all()
+
+            if branch:
+                qs = qs.filter(purchase__branch=branch)
+            if start_date and end_date:
+                qs = qs.filter(created_at__date__range=(start_date, end_date))
+
+            results = [{
+                "id": pmt.id,
+                "payment_ref": f"SPMT-{pmt.id}",
+                "purchase_id": pmt.purchase_id,
+                "item_name": pmt.purchase.item.name,
+                "supplier_name": pmt.purchase.supplier_name or (pmt.purchase.supplier.name if pmt.purchase.supplier else "N/A"),
+                "amount": float(quantize_money(pmt.amount)),
+                "payment_method": pmt.payment_method,
+                "notes": pmt.notes,
+                "payment_date": pmt.created_at.strftime('%Y-%m-%d')
+            } for pmt in qs.select_related('purchase__item', 'purchase__supplier')[:100]]
+
+            return Response({"count": qs.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    # =========================================================================
+    # 8. SUPPLIER MANAGEMENT (Sourced from Supplier & Purchase Models)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='suppliers-list')
+    def suppliers_list(self, request):
+        try:
+            suppliers = Supplier.objects.all()
+            results = []
+
+            for sup in suppliers[:100]:
+                purchases = Purchase.objects.filter(supplier=sup)
+                total_spend = sum((p.total_cost for p in purchases), ZERO)
+                total_balance_due = sum((p.balance_due for p in purchases if p.is_credit), ZERO)
+
+                results.append({
+                    "id": sup.id,
+                    "supplier_name": sup.name,
+                    "total_purchases_count": purchases.count(),
+                    "total_spend": float(quantize_money(total_spend)),
+                    "outstanding_balance": float(quantize_money(total_balance_due))
+                })
+
+            return Response({"count": suppliers.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    # =========================================================================
+    # 9. PURCHASE REPORTS (Summary & Spend Analysis)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='purchase-reports')
+    def purchase_reports(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            purchases_qs = Purchase.objects.filter(branch=branch) if branch else Purchase.objects.all()
+
+            if start_date and end_date:
+                purchases_qs = purchases_qs.filter(purchase_date__date__range=(start_date, end_date))
+
+            total_spend = sum((p.total_cost for p in purchases_qs), ZERO)
+            cash_spend = sum((p.total_cost for p in purchases_qs if not p.is_credit), ZERO)
+            credit_spend = sum((p.total_cost for p in purchases_qs if p.is_credit), ZERO)
+
+            return Response({
+                "audit_summary": {
+                    "total_purchases_count": purchases_qs.count(),
+                    "total_procurement_spend": float(quantize_money(total_spend)),
+                    "settled_cash_purchases": float(quantize_money(cash_spend)),
+                    "credit_purchases_value": float(quantize_money(credit_spend))
+                }
+            })
+        except Exception:
+            return Response({"audit_summary": {"total_purchases_count": 0, "total_procurement_spend": 0.0, "settled_cash_purchases": 0.0, "credit_purchases_value": 0.0}})        
+
+    # =========================================================================
+    # 3. SALES PERFORMANCE
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='sales-performance')
+    def sales_performance(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch = branch_obj or RetailBranch.objects.first()
+
+            sales_qs = SaleTransaction.objects.filter(branch=branch) if branch else SaleTransaction.objects.none()
+            sale_items_qs = SaleItem.objects.filter(transaction__branch=branch) if branch else SaleItem.objects.none()
+            repayments_qs = CreditRepayment.objects.filter(branch=branch) if branch else CreditRepayment.objects.none()
+
+            if start_date and end_date:
+                sales_qs = sales_qs.filter(sale_date__date__range=(start_date, end_date))
+                sale_items_qs = sale_items_qs.filter(transaction__sale_date__date__range=(start_date, end_date))
+                repayments_qs = repayments_qs.filter(
+                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                )
+
+            daily_map = {}
+            total_sales = ZERO
+            channel_totals = {"cash": ZERO, "mpesa": ZERO, "paybill": ZERO, "credit": ZERO}
+
+            for s in sales_qs:
+                day_str = str(s.sale_date.date() if hasattr(s.sale_date, 'date') else s.sale_date)
+                amt = Decimal(str(s.total_amount or ZERO))
+                total_sales += amt
+
+                bd = getattr(s, 'liquid_payments_breakdown', {})
+                channel_totals["cash"] += bd.get('CASH', ZERO)
+                channel_totals["mpesa"] += bd.get('MPESA', ZERO)
+                channel_totals["paybill"] += bd.get('PAYBILL', ZERO)
+                channel_totals["credit"] += bd.get('CREDIT', ZERO)
+
+                if day_str not in daily_map:
+                    daily_map[day_str] = {"date": day_str, "gross_sales": ZERO, "transactions": 0}
+                daily_map[day_str]["gross_sales"] += amt
+                daily_map[day_str]["transactions"] += 1
+
+            daily_performance = sorted(
+                [
+                    {
+                        "date": k,
+                        "gross_sales": float(quantize_money(v["gross_sales"])),
+                        "transactions": v["transactions"]
+                    } for k, v in daily_map.items()
+                ],
+                key=lambda x: x["date"]
+            )
+
+            items_map = {}
+            for item in sale_items_qs.select_related('item'):
+                i_id = item.item_id
+                name = item.item.name if item.item else "Unknown Item"
+                qty = Decimal(str(item.quantity_sold or ZERO))
+                rev = qty * (Decimal(str(item.unit_selling_price or ZERO)) - Decimal(str(item.discount_per_item or ZERO)))
+
+                if i_id not in items_map:
+                    items_map[i_id] = {"item_id": i_id, "name": name, "quantity": ZERO, "revenue": ZERO}
+                items_map[i_id]["quantity"] += qty
+                items_map[i_id]["revenue"] += rev
+
+            top_products = sorted(
+                [
+                    {
+                        "id": v["item_id"],
+                        "name": v["name"],
+                        "quantity": float(v["quantity"]),
+                        "revenue": float(quantize_money(v["revenue"]))
+                    } for v in items_map.values()
+                ],
+                key=lambda x: x["revenue"],
+                reverse=True
+            )[:10]
+
+            transaction_count = sales_qs.count()
+            aov = quantize_money(total_sales / transaction_count) if transaction_count > 0 else ZERO
+            tot_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            recent_sales = [
+                {
+                    "id": s.id,
+                    "receipt_number": s.receipt_number,
+                    "customer": s.customer_name or (s.customer.name if s.customer else "Walk-in Customer"),
+                    "branch": s.branch.name if s.branch else "Main Branch",
+                    "payment_method": s.payment_method,
+                    "amount": float(quantize_money(s.total_amount)),
+                    "date": s.sale_date.strftime('%Y-%m-%d %H:%M'),
+                } for s in sales_qs.select_related('branch', 'customer')[:15]
+            ]
+
+            recent_repayments = [
+                {
+                    "id": r.id,
+                    "customer": r.customer.name if r.customer else "Customer",
+                    "amount": float(quantize_money(r.amount)),
+                    "payment_method": r.get_payment_method_display(),
+                    "receipt_number": r.transaction.receipt_number if r.transaction else None,
+                    "date": r.date.strftime('%Y-%m-%d'),
+                } for r in repayments_qs.select_related('customer', 'transaction')[:10]
+            ]
+
+            return Response({
+                "summary": {
+                    "total_sales": float(quantize_money(total_sales)),
+                    "total_transactions": transaction_count,
+                    "average_order_value": float(aov),
+                    "total_credit_repayments": float(quantize_money(tot_repayments)),
+                },
+                "payment_channels": {
+                    "cash": float(quantize_money(channel_totals["cash"])),
+                    "mpesa": float(quantize_money(channel_totals["mpesa"])),
+                    "paybill": float(quantize_money(channel_totals["paybill"])),
+                    "credit": float(quantize_money(channel_totals["credit"])),
+                    "credit_repayments": float(quantize_money(tot_repayments)),
+                },
+                "daily": daily_performance,
+                "top_products": top_products,
+                "recent_sales": recent_sales,
+                "recent_repayments": recent_repayments,
+            }, status=status.HTTP_200_OK)
+
+        except Exception:
+            logger.exception("Sales Performance Exception Caught")
+            return Response({
+                "summary": {"total_sales": 0.0, "total_transactions": 0, "average_order_value": 0.0, "total_credit_repayments": 0.0},
+                "payment_channels": {"cash": 0.0, "mpesa": 0.0, "paybill": 0.0, "credit": 0.0, "credit_repayments": 0.0},
+                "daily": [],
+                "top_products": [],
+                "recent_sales": [],
+                "recent_repayments": []
+            }, status=status.HTTP_200_OK)
+
+
+    # =========================================================================
+    # 4. SALES OVERVIEW
+    # ======================================================================
+    @action(detail=False, methods=['get'], url_path='sales-overview')
+    def sales_overview(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch = branch_obj
+            sales_qs = SaleTransaction.objects.filter(branch=branch) if branch else SaleTransaction.objects.all()
+            sale_items_qs = SaleItem.objects.filter(transaction__branch=branch) if branch else SaleItem.objects.all()
+            returns_qs = CustomerReturn.objects.filter(branch=branch) if branch else CustomerReturn.objects.all()
+
+            if start_date and end_date:
+                sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
+                sale_items_qs = sale_items_qs.filter(transaction__sale_date__range=(start_dt, end_dt))
+                returns_qs = returns_qs.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+
+            gross_revenue = ZERO
+            total_paid = ZERO
+            credit_sales_total = ZERO
+
+            for s in sales_qs.prefetch_related('split_payments'):
+                amt = quantize_money(s.total_amount or ZERO)
+                gross_revenue += amt
+                method = self._normalize_payment_method(s.payment_method)
+                split_records = self._get_split_payments(s)
+
+                if method == "SPLIT" or split_records:
+                    for sp in split_records:
+                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
+                        sp_amt = quantize_money(sp.amount or ZERO)
+                        if sp_method == "CREDIT":
+                            credit_sales_total += sp_amt
+                        else:
+                            total_paid += sp_amt
+                elif method == "CREDIT":
+                    credit_sales_total += amt
+                else:
+                    total_paid += amt
+
+            transaction_count = sales_qs.count()
+            avg_order_val = quantize_money(gross_revenue / transaction_count) if transaction_count > 0 else ZERO
+
+            total_discounts = sum((Decimal(str(item.quantity_sold or 0)) * Decimal(str(item.discount_per_item or 0)) for item in sale_items_qs), ZERO)
+            total_items_sold = sum((Decimal(str(item.quantity_sold or 0)) for item in sale_items_qs), Decimal("0"))
+            avg_items_per_order = round(float(total_items_sold / transaction_count), 1) if transaction_count > 0 else 0.0
+
+            total_returns_count = returns_qs.count()
+            discount_rate = round(float((total_discounts / gross_revenue * Decimal("100")) if gross_revenue > ZERO else ZERO), 1)
+
+            return Response({
+                "summary": {
+                    "gross_revenue": float(gross_revenue),
+                    "total_paid": float(total_paid),
+                    "transaction_count": transaction_count,
+                    "average_transaction_value": float(avg_order_val)
+                },
+                "operational_health": {
+                    "credit_sales_exposure": float(credit_sales_total),
+                    "total_discounts_granted": float(total_discounts),
+                    "discount_rate_percent": discount_rate,
+                    "average_items_per_basket": avg_items_per_order,
+                    "total_units_sold": float(total_items_sold),
+                    "returned_orders_count": total_returns_count
+                }
+            })
+        except Exception as e:
+            logger.exception("Sales Overview Error")
+            return Response({
+                "summary": {
+                    "gross_revenue": 0.0,
+                    "total_paid": 0.0,
+                    "transaction_count": 0,
+                    "average_transaction_value": 0.0
+                },
+                "operational_health": {
+                    "credit_sales_exposure": 0.0,
+                    "total_discounts_granted": 0.0,
+                    "discount_rate_percent": 0.0,
+                    "average_items_per_basket": 0.0,
+                    "total_units_sold": 0.0,
+                    "returned_orders_count": 0
+                }
             })
 
-        return Response({"count": len(results), "results": results})
+    # =========================================================================
+    # 5. SALES ANALYSIS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='sales-analysis')
+    def sales_analysis(self, request):
+        try:
+            # Unpack 5-tuple safely
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            
+            # Resolve Branch
+            branch = branch_obj
+            if not branch:
+                raw_branch = request.query_params.get('branch_id') or request.query_params.get('branch')
+                if raw_branch and str(raw_branch).isdigit():
+                    branch = RetailBranch.objects.filter(id=int(raw_branch)).first()
 
-    @action(detail=False, methods=['get'], url_path='operations-credit')
-    def operations_credit(self, request):
-        """Returns customer credit accounts and credit repayments fetched from models."""
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+            # Base querysets
+            sale_items_qs = SaleItem.objects.filter(transaction__branch=branch) if branch else SaleItem.objects.all()
+            sales_qs = SaleTransaction.objects.filter(branch=branch) if branch else SaleTransaction.objects.all()
 
-        credit_sales = SaleTransaction.objects.filter(
-            branch=branch,
-            payment_method=SaleTransaction.PaymentMethod.CREDIT
-        ).select_related('customer')
+            # Optional Date filtering: check if query explicitly asked for range/month
+            has_date_params = any(k in request.query_params for k in ['start_date', 'end_date', 'startDate', 'endDate', 'month', 'year'])
+            
+            if has_date_params:
+                filtered_items = sale_items_qs
+                filtered_sales = sales_qs
 
-        repayments = CreditRepayment.objects.filter(branch=branch).select_related('customer', 'transaction')
+                if start_dt and end_dt:
+                    filtered_items = filtered_items.filter(transaction__sale_date__range=(start_dt, end_dt))
+                    filtered_sales = filtered_sales.filter(sale_date__range=(start_dt, end_dt))
+                elif start_date and end_date:
+                    filtered_items = filtered_items.filter(transaction__sale_date__date__range=(start_date, end_date))
+                    filtered_sales = filtered_sales.filter(sale_date__date__range=(start_date, end_date))
 
-        if start_date and end_date:
-            credit_sales = credit_sales.filter(sale_date__date__range=(start_date, end_date))
-            repayments = repayments.filter(date__range=(start_date, end_date))
+                # If date-filtered dataset yields records, use them; otherwise fallback to full branch data
+                if filtered_items.exists() or filtered_sales.exists():
+                    sale_items_qs = filtered_items
+                    sales_qs = filtered_sales
 
-        credit_entries = [
-            {
-                "id": f"CS-{cs.id}",
-                "type": "CREDIT_SALE",
-                "date": str(cs.sale_date.date() if hasattr(cs.sale_date, 'date') else cs.sale_date),
-                "customer_name": cs.customer.name if cs.customer else (cs.customer_name or "Walk-in Customer"),
-                "amount": float(quantize_money(cs.total_amount or ZERO)),
-                "balance_due": float(quantize_money(cs.balance_due)),
-                "reference": getattr(cs, 'receipt_number', f"REC-{cs.id}"),
-                "invoice_number": cs.invoice_number or "",
-            } for cs in credit_sales
-        ]
+            revenue = ZERO
+            cogs = ZERO
+            products_map = {}
+            category_map = {}
 
-        repayment_entries = [
-            {
-                "id": f"CR-{cr.id}",
-                "type": "REPAYMENT",
-                "date": str(cr.date),
-                "customer_name": cr.customer.name if cr.customer else "Customer Repayment",
-                "amount": float(quantize_money(cr.amount or ZERO)),
-                "payment_method": getattr(cr, 'payment_method', 'CASH'),
-                "reference": f"REP-{cr.id}",
-                "invoice_reference": cr.transaction.receipt_number if cr.transaction else ""
-            } for cr in repayments
-        ]
+            # Process line items using select_related('item') ONLY
+            for line in sale_items_qs.select_related('item'):
+                qty = Decimal(str(line.quantity_sold or 0))
+                price = Decimal(str(line.unit_selling_price or 0))
+                disc = Decimal(str(line.discount_per_item or 0))
+                cost = Decimal(str(line.unit_cost_price or 0))
 
-        return Response({
-            "credit_sales": credit_entries,
-            "repayments": repayment_entries
-        })
+                line_rev = qty * (price - disc)
+                line_cost = qty * cost
 
-    @action(detail=False, methods=['get'], url_path='operations-losses')
-    def operations_losses(self, request):
-        """Returns customer returns, stock losses, damages, and adjustments."""
-        branch, start_date, end_date = self._get_branch_and_dates(request)
-        if not branch:
-            return Response({"error": "Valid branch_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+                revenue += line_rev
+                cogs += line_cost
 
-        customer_returns_qs = CustomerReturn.objects.filter(branch=branch).select_related('item')
+                # Item level mapping
+                i_id = line.item_id
+                name = line.item.name if line.item else f"Item #{i_id}"
+                if i_id not in products_map:
+                    products_map[i_id] = {
+                        "item_id": i_id,
+                        "item_name": name,
+                        "units_sold": ZERO,
+                        "gross_revenue": ZERO,
+                        "cogs": ZERO
+                    }
+                products_map[i_id]["units_sold"] += qty
+                products_map[i_id]["gross_revenue"] += line_rev
+                products_map[i_id]["cogs"] += line_cost
 
-        loss_types = [
-            StockMovement.MovementType.DAMAGE,
-            StockMovement.MovementType.ADJUSTMENT_OUT,
-            StockMovement.MovementType.SUPPLIER_RETURN,
-        ]
-        loss_movements = StockMovement.objects.filter(branch=branch, movement_type__in=loss_types).select_related('item')
+                # Dynamic safe category mapping
+                cat_obj = getattr(line.item, 'category', None) if line.item else None
+                if cat_obj and hasattr(cat_obj, 'name'):
+                    cat_name = cat_obj.name
+                elif isinstance(cat_obj, str):
+                    cat_name = cat_obj
+                else:
+                    cat_name = getattr(line.item, 'category_name', None) or getattr(line.item, 'item_type', "General / Uncategorized")
 
-        if start_date and end_date:
-            customer_returns_qs = customer_returns_qs.filter(date__range=(start_date, end_date))
-            loss_movements = loss_movements.filter(date__range=(start_date, end_date))
+                if cat_name not in category_map:
+                    category_map[cat_name] = ZERO
+                category_map[cat_name] += line_rev
 
-        returns_data = [
-            {
-                "id": f"CR-{ret.id}",
-                "type": "CUSTOMER_RETURN",
-                "date": str(ret.date),
-                "item_name": ret.item.name if ret.item else "Unknown Item",
-                "quantity": float(ret.quantity or 0.0),
-                "reason": ret.reason or "Customer Return"
-            } for ret in customer_returns_qs
-        ]
+            gross_profit = revenue - cogs
+            margin_pct = float((gross_profit / revenue * Decimal("100.0")) if revenue > ZERO else ZERO)
 
-        losses_data = []
-        for m in loss_movements:
-            qty = float(m.quantity or 0.0)
-            cost = float(m.unit_cost_price or 0.0)
-            losses_data.append({
-                "id": f"SM-{m.id}",
-                "type": m.movement_type,
-                "date": str(m.date),
-                "item_name": m.item.name if m.item else "Unknown Item",
-                "quantity": qty,
-                "unit_cost_price": cost,
-                "total_loss_value": float(qty * cost),
-                "reason": m.notes or "-"
+            # Daily trend trajectory
+            daily_trend_map = {}
+            for s in sales_qs:
+                raw_dt = getattr(s, 'sale_date', None) or getattr(s, 'created_at', None)
+                if raw_dt:
+                    day_str = raw_dt.strftime('%Y-%m-%d') if hasattr(raw_dt, 'strftime') else str(raw_dt)[:10]
+                else:
+                    continue
+
+                amt = Decimal(str(s.total_amount or ZERO))
+                if day_str not in daily_trend_map:
+                    daily_trend_map[day_str] = {"date": day_str, "revenue": ZERO, "orders": 0}
+                daily_trend_map[day_str]["revenue"] += amt
+                daily_trend_map[day_str]["orders"] += 1
+
+            daily_trends = sorted([
+                {
+                    "date": k,
+                    "revenue": float(quantize_money(v["revenue"])),
+                    "orders": v["orders"]
+                } for k, v in daily_trend_map.items()
+            ], key=lambda x: x["date"])
+
+            performers = []
+            for v in products_map.values():
+                rev_val = v["gross_revenue"]
+                profit_val = rev_val - v["cogs"]
+                m_pct = float((profit_val / rev_val * Decimal("100.0")) if rev_val > ZERO else ZERO)
+                performers.append({
+                    "item_id": v["item_id"],
+                    "item_name": v["item_name"],
+                    "units_sold": float(v["units_sold"]),
+                    "gross_revenue": float(quantize_money(rev_val)),
+                    "profit_margin_percent": round(m_pct, 1)
+                })
+
+            top_performers = sorted(performers, key=lambda x: x["gross_revenue"], reverse=True)[:8]
+            slow_movers = sorted(performers, key=lambda x: (x["units_sold"], x["gross_revenue"]))[:8]
+
+            category_breakdown = [
+                {"category": k, "revenue": float(quantize_money(v))} for k, v in category_map.items() if v > ZERO
+            ]
+
+            return Response({
+                "branch_summary": {
+                    "gross_revenue": float(quantize_money(revenue)),
+                    "total_cogs": float(quantize_money(cogs)),
+                    "gross_profit": float(quantize_money(gross_profit)),
+                    "profit_margin_percent": round(margin_pct, 1)
+                },
+                "daily_trends": daily_trends,
+                "category_breakdown": category_breakdown,
+                "top_performers": top_performers,
+                "slow_movers": slow_movers
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Sales Analysis Processing Error")
+            return Response({
+                "branch_summary": {"gross_revenue": 0.0, "total_cogs": 0.0, "gross_profit": 0.0, "profit_margin_percent": 0.0},
+                "daily_trends": [],
+                "category_breakdown": [],
+                "top_performers": [],
+                "slow_movers": []
+            }, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 6. SALES REGISTER
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='sales-register')
+    def sales_register(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch = branch_obj
+
+            sales_qs = SaleTransaction.objects.filter(branch=branch) if branch else SaleTransaction.objects.all()
+
+            if start_dt and end_dt:
+                filtered = sales_qs.filter(sale_date__range=(start_dt, end_dt))
+                if filtered.exists():
+                    sales_qs = filtered
+
+            results = []
+            for tx in sales_qs.select_related('customer', 'created_by').order_by('-sale_date')[:100]:
+                results.append({
+                    "id": tx.id,
+                    "sale_date": tx.sale_date.strftime('%Y-%m-%d %H:%M') if hasattr(tx.sale_date, 'strftime') else str(tx.sale_date),
+                    "receipt_number": tx.receipt_number or f"REC-{tx.id}",
+                    "customer": tx.customer.name if tx.customer else (tx.customer_name or "Walk-in Customer"),
+                    "payment_method": tx.payment_method,
+                    "served_by": tx.created_by.username if tx.created_by else "System",
+                    "total_amount": float(tx.total_amount or ZERO),
+                    "amount_paid": float(tx.amount_paid or ZERO)
+                })
+
+            return Response({"count": sales_qs.count(), "results": results}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception("Sales Register Error")
+            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 7. CUSTOMER RECEIVABLES
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='customer-receivables')
+    def customer_receivables(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch = branch_obj
+            customers = Customer.objects.all()
+            debtors_summary = []
+
+            for cust in customers:
+                unpaid_sales = SaleTransaction.objects.filter(customer=cust, payment_method='CREDIT', is_paid=False)
+                if branch:
+                    unpaid_sales = unpaid_sales.filter(branch=branch)
+
+                unpaid_count = unpaid_sales.count()
+                balance = cust.total_outstanding_balance
+
+                if balance > ZERO or unpaid_count > 0:
+                    debtors_summary.append({
+                        "customer_name": cust.name,
+                        "unpaid_invoices_count": unpaid_count,
+                        "outstanding_balance": float(balance)
+                    })
+
+            return Response({"debtors_summary": debtors_summary})
+        except Exception as e:
+            logger.exception("Customer Receivables Error")
+            return Response({"debtors_summary": []})
+
+    # =========================================================================
+    # 8. SALES COLLECTIONS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='sales-collections')
+    def sales_collections(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch = branch_obj
+
+            sales_qs = SaleTransaction.objects.filter(branch=branch) if branch else SaleTransaction.objects.all()
+            repayments_qs = CreditRepayment.objects.filter(branch=branch) if branch else CreditRepayment.objects.all()
+
+            if start_dt and end_dt:
+                filtered_sales = sales_qs.filter(sale_date__range=(start_dt, end_dt))
+                filtered_repayments = repayments_qs.filter(date__range=(start_date, end_date)) if start_date and end_date else repayments_qs
+                if filtered_sales.exists() or filtered_repayments.exists():
+                    sales_qs = filtered_sales
+                    repayments_qs = filtered_repayments
+
+            # Only active settlement channels
+            channels = {"CASH": ZERO, "PAYBILL": ZERO, "SEND_MONEY": ZERO}
+
+            for sale in sales_qs.prefetch_related('split_payments'):
+                method = self._normalize_payment_method(sale.payment_method)
+                split_records = self._get_split_payments(sale)
+
+                if method == "SPLIT" or split_records:
+                    for sp in split_records:
+                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
+                        # Map any MPESA/BANK to nearest active channel or add to PAYBILL/SEND_MONEY
+                        if sp_method in channels:
+                            channels[sp_method] += quantize_money(sp.amount or ZERO)
+                        elif sp_method == "MPESA":
+                            channels["PAYBILL"] += quantize_money(sp.amount or ZERO)
+                        elif sp_method == "BANK_TRANSFER":
+                            channels["SEND_MONEY"] += quantize_money(sp.amount or ZERO)
+                else:
+                    if method in channels:
+                        channels[method] += quantize_money(sale.total_amount or ZERO)
+                    elif method == "MPESA":
+                        channels["PAYBILL"] += quantize_money(sale.total_amount or ZERO)
+                    elif method == "BANK_TRANSFER":
+                        channels["SEND_MONEY"] += quantize_money(sale.total_amount or ZERO)
+
+            for rep in repayments_qs:
+                rep_method = self._normalize_payment_method(rep.payment_method)
+                if rep_method in channels:
+                    channels[rep_method] += quantize_money(rep.amount or ZERO)
+                elif rep_method == "MPESA":
+                    channels["PAYBILL"] += quantize_money(rep.amount or ZERO)
+                elif rep_method == "BANK_TRANSFER":
+                    channels["SEND_MONEY"] += quantize_money(rep.amount or ZERO)
+
+            total_collections = sum(channels.values(), ZERO)
+            breakdown = []
+            for ch_name, ch_amt in channels.items():
+                pct = float((ch_amt / total_collections * Decimal("100.0")) if total_collections > ZERO else ZERO)
+                breakdown.append({
+                    "channel": ch_name,
+                    "amount": float(ch_amt),
+                    "percentage": round(pct, 1)
+                })
+
+            return Response({
+                "total_collections": float(total_collections),
+                "breakdown": breakdown
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception("Sales Collections Error")
+            return Response({"total_collections": 0.0, "breakdown": []}, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 9. RETURNS AND DISCOUNTS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='sales-returns-discounts')
+    def sales_returns_discounts(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch = branch_obj
+            sale_items_qs = SaleItem.objects.filter(transaction__branch=branch) if branch else SaleItem.objects.all()
+            returns_qs = CustomerReturn.objects.filter(branch=branch) if branch else CustomerReturn.objects.all()
+
+            if start_date and end_date:
+                sale_items_qs = sale_items_qs.filter(transaction__sale_date__range=(start_dt, end_dt))
+                returns_qs = returns_qs.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+
+            total_discounts = sum((Decimal(str(item.quantity_sold or 0)) * Decimal(str(item.discount_per_item or 0)) for item in sale_items_qs), ZERO)
+
+            total_returns_val = ZERO
+            for ret in returns_qs.select_related('item'):
+                qty = Decimal(str(ret.quantity or 0))
+                pricing = BranchItemPricing.objects.filter(branch=ret.branch, item=ret.item).first()
+                price = pricing.unit_selling_price if pricing and pricing.unit_selling_price else ZERO
+                total_returns_val += (qty * Decimal(str(price)))
+
+            return Response({
+                "summary": {
+                    "total_discounts_granted": float(total_discounts),
+                    "total_returns_value": float(total_returns_val),
+                    "total_returns_count": returns_qs.count()
+                }
             })
+        except Exception as e:
+            logger.exception("Sales Returns Error")
+            return Response({"summary": {"total_discounts_granted": 0.0, "total_returns_value": 0.0, "total_returns_count": 0}})
+        # =========================================================================
+    # INVENTORY OVERVIEW
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='inventory-overview')
+    def inventory_overview(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            pricing_qs = BranchItemPricing.objects.filter(branch=branch) if branch else BranchItemPricing.objects.all()
 
-        return Response({
-            "customer_returns": returns_data,
-            "stock_losses": losses_data
-        })
+            total_asset_value = sum((p.remaining_stock_value for p in pricing_qs), ZERO)
+            low_stock_count = len([p for p in pricing_qs if p.is_low_stock])
+
+            movements = StockMovement.objects.filter(branch=branch) if branch else StockMovement.objects.all()
+            if start_date and end_date:
+                movements = movements.filter(date__range=(start_date, end_date))
+
+            inbound_qty = movements.filter(
+                movement_type__in=[
+                    StockMovement.MovementType.PURCHASE,
+                    StockMovement.MovementType.CUSTOMER_RETURN,
+                    StockMovement.MovementType.TRANSFER_IN,
+                    StockMovement.MovementType.ADJUSTMENT_IN
+                ]
+            ).aggregate(total=Coalesce(Sum('quantity'), ZERO))['total']
+
+            outbound_qty = movements.filter(
+                movement_type__in=[
+                    StockMovement.MovementType.SALE,
+                    StockMovement.MovementType.SUPPLIER_RETURN,
+                    StockMovement.MovementType.TRANSFER_OUT,
+                    StockMovement.MovementType.DAMAGE,
+                    StockMovement.MovementType.ADJUSTMENT_OUT
+                ]
+            ).aggregate(total=Coalesce(Sum('quantity'), ZERO))['total']
+
+            transfers_count = StockTransfer.objects.filter(
+                Q(from_branch=branch) | Q(to_branch=branch)
+            ).count() if branch else StockTransfer.objects.count()
+
+            return Response({
+                "summary": {
+                    "total_asset_value": float(quantize_money(total_asset_value)),
+                    "total_items_count": pricing_qs.count(),
+                    "low_stock_count": low_stock_count,
+                    "inbound_quantity": float(inbound_qty),
+                    "outbound_quantity": float(outbound_qty),
+                    "transfers_count": transfers_count
+                }
+            })
+        except Exception:
+            return Response({"summary": {"total_asset_value": 0.0, "total_items_count": 0, "low_stock_count": 0}})
+
+    # =========================================================================
+    # ITEM / PRODUCT MASTER & STOCK LEVELS & VALUATION
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='inventory-items')
+    def inventory_items(self, request):
+        try:
+            branch, _, _ = self._get_branch_and_dates(request)
+            qs = BranchItemPricing.objects.filter(branch=branch) if branch else BranchItemPricing.objects.all()
+
+            results = [{
+                "id": p.id,
+                "item_name": p.item.name,
+                "code": p.item.code,
+                "sku": p.item.sku,
+                "remaining_stock": float(p.remaining_stock),
+                "min_threshold": float(p.min_stock_threshold),
+                "is_low_stock": p.is_low_stock,
+                "unit_cost_price": float(quantize_money(p.unit_cost_price)),
+                "unit_selling_price": float(quantize_money(p.unit_selling_price)),
+                "stock_value": float(quantize_money(p.remaining_stock_value))
+            } for p in qs.select_related('item', 'branch')[:100]]
+
+            return Response({"count": qs.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    @action(detail=False, methods=['get'], url_path='stock-levels')
+    def stock_levels(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            
+            # Fallback to string matching if ID lookup failed
+            if not branch_obj:
+                raw_b = request.query_params.get('branch_id') or request.query_params.get('branch')
+                if raw_b:
+                    branch_obj = RetailBranch.objects.filter(
+                        Q(id=int(raw_b)) if str(raw_b).isdigit() else Q(name__icontains=raw_b)
+                    ).first()
+
+            # Query BranchItemPricing for items assigned to this branch
+            pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
+            if branch_obj:
+                pricings_qs = pricings_qs.filter(branch=branch_obj)
+
+            total_count = pricings_qs.count()
+
+            results = []
+            for pricing in pricings_qs:
+                item = pricing.item
+                rem_stock = float(pricing.remaining_stock)
+                min_thresh = float(pricing.min_stock_threshold or 0)
+                wac_cost = float(pricing.unit_cost_price or 0)
+                s_price = float(pricing.unit_selling_price or 0)
+                asset_val = float(pricing.remaining_stock_value)
+
+                results.append({
+                    "id": pricing.id,
+                    "item_id": item.id,
+                    "sku_code": item.sku or item.code or f"SKU-{item.id}",
+                    "item_name": item.name,
+                    "remaining_stock": rem_stock,
+                    "min_threshold": min_thresh,
+                    "wac_unit_cost": wac_cost,
+                    "selling_price": s_price,
+                    "stock_asset_value": asset_val,
+                })
+
+            return Response({
+                "count": total_count,
+                "results": results
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Stock Levels Error")
+            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='stock-valuation')
+    def stock_valuation(self, request):
+        return self.inventory_items(request)
+
+    # =========================================================================
+    # STOCK INWARDS & OUTWARDS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='stock-inwards')
+    def stock_inwards(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            # Resolve branch if branch_obj is None or string
+            if not branch_obj:
+                raw_b = request.query_params.get('branch_id') or request.query_params.get('branch')
+                if raw_b:
+                    branch_obj = RetailBranch.objects.filter(
+                        Q(id=int(raw_b)) if str(raw_b).isdigit() else Q(name__icontains=raw_b)
+                    ).first()
+
+            inbound_types = [
+                StockMovement.MovementType.PURCHASE,
+                StockMovement.MovementType.CUSTOMER_RETURN,
+                StockMovement.MovementType.TRANSFER_IN,
+                StockMovement.MovementType.ADJUSTMENT_IN,
+                StockMovement.MovementType.OPENING_STOCK,
+            ]
+
+            movements_qs = StockMovement.objects.filter(movement_type__in=inbound_types)
+
+            if branch_obj:
+                movements_qs = movements_qs.filter(branch=branch_obj)
+
+            # Date filtering with fallback to all records if the selected month returns 0 items
+            if start_date and end_date:
+                date_filtered = movements_qs.filter(
+                    Q(date__range=(start_date, end_date)) | 
+                    Q(created_at__date__range=(start_date, end_date))
+                )
+                if date_filtered.exists():
+                    movements_qs = date_filtered
+
+            total_count = movements_qs.count()
+
+            results = []
+            for mov in movements_qs.select_related('item').order_by('-created_at', '-id')[:100]:
+                qty = float(mov.quantity or 0)
+                cost_val = mov.unit_cost_price
+                if cost_val is None and mov.item:
+                    cost_val = getattr(mov.item, 'cost_price', 0)
+                cost = float(cost_val or 0)
+
+                results.append({
+                    "id": mov.id,
+                    "ref_code": mov.reference or f"IN-{mov.id}",
+                    "date": mov.date.strftime('%Y-%m-%d') if hasattr(mov.date, 'strftime') else str(mov.date)[:10],
+                    "item_name": mov.item.name if mov.item else f"Item #{mov.item_id}",
+                    "movement_type": mov.get_movement_type_display(),
+                    "quantity": qty,
+                    "unit_cost": cost,
+                    "total_cost": qty * cost
+                })
+
+            return Response({
+                "count": total_count,
+                "results": results
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Stock Inwards Error")
+            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='stock-outwards')
+    def stock_outwards(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            if not branch_obj:
+                raw_b = request.query_params.get('branch_id') or request.query_params.get('branch')
+                if raw_b:
+                    branch_obj = RetailBranch.objects.filter(
+                        Q(id=int(raw_b)) if str(raw_b).isdigit() else Q(name__icontains=raw_b)
+                    ).first()
+
+            outbound_types = [
+                StockMovement.MovementType.SALE,
+                StockMovement.MovementType.SUPPLIER_RETURN,
+                StockMovement.MovementType.TRANSFER_OUT,
+                StockMovement.MovementType.DAMAGE,
+                StockMovement.MovementType.ADJUSTMENT_OUT,
+            ]
+
+            movements_qs = StockMovement.objects.filter(movement_type__in=outbound_types)
+            if branch_obj:
+                movements_qs = movements_qs.filter(branch=branch_obj)
+
+            # Apply date range; if zero results, fall back to branch lifetime movements
+            if start_dt and end_dt:
+                filtered = movements_qs.filter(created_at__range=(start_dt, end_dt))
+                if filtered.exists():
+                    movements_qs = filtered
+
+            results = []
+            for mov in movements_qs.select_related('item').order_by('-created_at')[:100]:
+                qty = float(mov.quantity or 0)
+                unit_cost = float(mov.unit_cost_price if mov.unit_cost_price is not None else (mov.item.cost_price if hasattr(mov.item, 'cost_price') else 0))
+                
+                results.append({
+                    "id": mov.id,
+                    "ref_code": mov.reference or f"OUT-{mov.id}",
+                    "date": mov.created_at.strftime('%Y-%m-%d %H:%M') if hasattr(mov.created_at, 'strftime') else str(mov.created_at)[:10],
+                    "item_name": mov.item.name if mov.item else f"Item #{mov.item_id}",
+                    "movement_type": mov.get_movement_type_display(),
+                    "quantity": qty,
+                    "unit_cost": unit_cost,
+                    "total_cost": qty * unit_cost
+                })
+
+            return Response({
+                "count": movements_qs.count(),
+                "results": results
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Stock Outwards Error")
+            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # STOCK TRANSFERS & ADJUSTMENTS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='stock-transfers')
+    def stock_transfers(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            qs = StockTransfer.objects.all()
+            if branch:
+                qs = qs.filter(Q(from_branch=branch) | Q(to_branch=branch))
+            if start_date and end_date:
+                qs = qs.filter(date__range=(start_date, end_date))
+
+            results = [{
+                "id": t.id,
+                "date": t.date.strftime('%Y-%m-%d'),
+                "from_branch": t.from_branch.name,
+                "to_branch": t.to_branch.name,
+                "item_name": t.item.name,
+                "quantity": float(t.quantity)
+            } for t in qs.select_related('from_branch', 'to_branch', 'item')[:100]]
+
+            return Response({"count": qs.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    @action(detail=False, methods=['get'], url_path='stock-adjustments')
+    def stock_adjustments(self, request):
+        try:
+            branch, start_date, end_date = self._get_branch_and_dates(request)
+            qs = DamageRecord.objects.all()
+            if branch:
+                qs = qs.filter(branch=branch)
+            if start_date and end_date:
+                qs = qs.filter(date__range=(start_date, end_date))
+
+            results = [{
+                "id": d.id,
+                "date": d.date.strftime('%Y-%m-%d'),
+                "item_name": d.item.name,
+                "damage_type": d.get_damage_type_display(),
+                "quantity": float(d.quantity),
+                "reason": d.reason
+            } for d in qs.select_related('item')[:100]]
+
+            return Response({"count": qs.count(), "results": results})
+        except Exception:
+            return Response({"count": 0, "results": []})
+
+    @action(detail=False, methods=['get'], url_path='stocktaking')
+    def stocktaking(self, request):
+        return self.inventory_items(request)
+
+    @action(detail=False, methods=['get'], url_path='inventory-reports')
+    def inventory_reports(self, request):
+        return self.inventory_overview(request)
+
+
+    @action(detail=False, methods=['get'], url_path='cash-overview')
+    def cash_overview(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            # Fetch non-credit / non-invoice sale transactions
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__range=(start_dt, end_dt)
+            ).exclude(
+                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+            ).prefetch_related("split_payments")
+
+            repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            expenses_qs = Expense.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            purchases_qs = Purchase.objects.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+
+            # Inflows from Immediate Realized Sales
+            cash_sales = ZERO
+            mpesa_sales = ZERO
+            paybill_sales = ZERO
+
+            for s in sales_qs:
+                if getattr(s, 'is_invoice', False):
+                    continue
+                bd = s.liquid_payments_breakdown
+                cash_sales += bd.get('CASH', ZERO)
+                mpesa_sales += bd.get('MPESA', ZERO)
+                paybill_sales += bd.get('PAYBILL', ZERO)
+
+            # Inflows from Credit Repayments
+            repayments_total = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            total_inflows = cash_sales + mpesa_sales + paybill_sales + repayments_total
+
+            # Outflows
+            expenses_total = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            direct_purchases_outflow = purchases_qs.exclude(payment_method='CREDIT').aggregate(
+                total=Coalesce(Sum('amount_paid'), ZERO)
+            )['total']
+            supplier_repayments_outflow = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            total_outflows = expenses_total + direct_purchases_outflow + supplier_repayments_outflow
+
+            return Response({
+                "summary": {
+                    "total_cash_inflows": float(quantize_money(total_inflows)),
+                    "total_cash_outflows": float(quantize_money(total_outflows)),
+                    "net_cash_flow": float(quantize_money(total_inflows - total_outflows)),
+                    "mpesa_inflows": float(quantize_money(mpesa_sales)),
+                    "bank_inflows": float(quantize_money(paybill_sales)),
+                    "cash_on_hand": float(quantize_money(cash_sales + repayments_total - expenses_total - direct_purchases_outflow))
+                }
+            })
+        except Exception as e:
+            logger.exception("Cash Overview Error")
+            return Response({"summary": {"total_cash_inflows": 0.0, "total_cash_outflows": 0.0, "net_cash_flow": 0.0}})
+
+    # =========================================================================
+    # CASH RECEIPTS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='cash-receipts')
+    def cash_receipts(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__range=(start_dt, end_dt)
+            ).exclude(payment_method='CREDIT').prefetch_related("split_payments")
+
+            repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+
+            results = []
+
+            for sale in sales_qs.order_by('-sale_date')[:100]:
+                method = self._normalize_payment_method(sale.payment_method)
+                if method == "SPLIT":
+                    for sp in sale.split_payments.all():
+                        sp_method = self._normalize_payment_method(sp.method)
+                        if sp_method != "CREDIT":
+                            results.append({
+                                "id": f"SALE-SPLIT-{sp.id}",
+                                "reference": sale.receipt_number,
+                                "date": sale.sale_date.strftime('%Y-%m-%d'),
+                                "description": f"Sale ({sale.customer_name or 'Walk-in'})",
+                                "payment_method": sp_method,
+                                "inflow": float(quantize_money(sp.amount)),
+                                "outflow": 0.0
+                            })
+                else:
+                    results.append({
+                        "id": f"SALE-{sale.id}",
+                        "reference": sale.receipt_number,
+                        "date": sale.sale_date.strftime('%Y-%m-%d'),
+                        "description": f"Sale ({sale.customer_name or 'Walk-in'})",
+                        "payment_method": method,
+                        "inflow": float(quantize_money(sale.total_amount)),
+                        "outflow": 0.0
+                    })
+
+            for rep in repayments_qs.order_by('-date')[:50]:
+                results.append({
+                    "id": f"REPAY-{rep.id}",
+                    "reference": f"REPAY-{rep.id}",
+                    "date": rep.date.strftime('%Y-%m-%d'),
+                    "description": f"Credit Repayment - {rep.customer.name}",
+                    "payment_method": self._normalize_payment_method(rep.payment_method),
+                    "inflow": float(quantize_money(rep.amount)),
+                    "outflow": 0.0
+                })
+
+            return Response({"count": len(results), "results": results})
+        except Exception as e:
+            logger.exception("Cash Receipts Error")
+            return Response({"count": 0, "results": []})
+
+    # =========================================================================
+    # CASH PAYMENTS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='cash-payments')
+    def cash_payments(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            
+            expenses_qs = Expense.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+
+            if branch_obj:
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+
+            results = []
+
+            for e in expenses_qs.order_by('-date')[:100]:
+                results.append({
+                    "id": f"EXP-{e.id}",
+                    "reference": f"EXP-{e.id}",
+                    "date": e.date.strftime('%Y-%m-%d'),
+                    "description": e.description,
+                    "payment_method": "CASH",
+                    "inflow": 0.0,
+                    "outflow": float(quantize_money(e.amount))
+                })
+
+            for sp in supplier_payments_qs.order_by('-created_at')[:50]:
+                results.append({
+                    "id": f"SUPP-PAY-{sp.id}",
+                    "reference": f"SUPP-{sp.id}",
+                    "date": sp.created_at.strftime('%Y-%m-%d'),
+                    "description": f"Supplier Repayment: PO #{sp.purchase_id} ({sp.purchase.item.name})",
+                    "payment_method": self._normalize_payment_method(sp.payment_method),
+                    "inflow": 0.0,
+                    "outflow": float(quantize_money(sp.amount))
+                })
+
+            return Response({"count": len(results), "results": results})
+        except Exception as e:
+            logger.exception("Cash Payments Error")
+            return Response({"count": 0, "results": []})
+
+    # =========================================================================
+    # CASH BOOK
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='cash-book')
+    def cash_book(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            date_iso = end_date.isoformat()
+            results = []
+
+            total_inflow = ZERO
+            total_outflow = ZERO
+
+            # 1. Fetch Realized Immediate Sales (Exclude CREDIT method & INV prefixes)
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__range=(start_dt, end_dt)
+            ).exclude(
+                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+            ).prefetch_related("split_payments")
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+
+            for sale in sales_qs.order_by('-sale_date')[:100]:
+                # Skip any transaction that acts as an invoice or has outstanding credit balance
+                if getattr(sale, 'is_invoice', False):
+                    continue
+
+                method = self._normalize_payment_method(sale.payment_method)
+
+                if method == "SPLIT":
+                    for sp in sale.split_payments.all():
+                        sp_method = self._normalize_payment_method(sp.method)
+                        if sp_method != "CREDIT":
+                            amt = quantize_money(sp.amount)
+                            if amt > ZERO:
+                                total_inflow += amt
+                                results.append({
+                                    "id": f"SALE-SP-{sp.id}",
+                                    "reference": sale.receipt_number,
+                                    "date": sale.sale_date.strftime('%Y-%m-%d'),
+                                    "description": f"Sale ({sale.customer_name or 'Walk-in'})",
+                                    "payment_method": sp_method,
+                                    "inflow": float(amt),
+                                    "outflow": 0.0
+                                })
+                else:
+                    amt = quantize_money(sale.total_amount)
+                    if amt > ZERO:
+                        total_inflow += amt
+                        results.append({
+                            "id": f"SALE-{sale.id}",
+                            "reference": sale.receipt_number,
+                            "date": sale.sale_date.strftime('%Y-%m-%d'),
+                            "description": f"Sale ({sale.customer_name or 'Walk-in'})",
+                            "payment_method": method,
+                            "inflow": float(amt),
+                            "outflow": 0.0
+                        })
+
+            # 2. Inflows from Debt Repayments (Repayments are the ONLY inflow for Credit Sales)
+            repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            ).select_related("customer")
+
+            if branch_obj:
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+
+            for rep in repayments_qs.order_by('-date')[:50]:
+                amt = quantize_money(rep.amount)
+                if amt > ZERO:
+                    total_inflow += amt
+                    results.append({
+                        "id": f"REPAY-{rep.id}",
+                        "reference": f"REPAY-{rep.id}",
+                        "date": rep.date.strftime('%Y-%m-%d'),
+                        "description": f"Credit Repayment - {rep.customer.name if rep.customer else 'Customer'}",
+                        "payment_method": self._normalize_payment_method(rep.payment_method),
+                        "inflow": float(amt),
+                        "outflow": 0.0
+                    })
+
+            # 3. Outflows from Direct Supplier Restocks / Purchases
+            purchases_qs = Purchase.objects.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            ).exclude(payment_method='CREDIT').select_related("item", "supplier")
+
+            if branch_obj:
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+
+            for p in purchases_qs.order_by('-purchase_date')[:50]:
+                amt = quantize_money(p.amount_paid or p.total_cost)
+                if amt > ZERO:
+                    total_outflow += amt
+                    supplier_disp = p.supplier_name or (p.supplier.name if p.supplier else 'Vendor')
+                    results.append({
+                        "id": f"PO-{p.id}",
+                        "reference": f"PO-{p.id}",
+                        "date": p.purchase_date.strftime('%Y-%m-%d'),
+                        "description": f"Restock ({p.item.name}) - {supplier_disp}",
+                        "payment_method": self._normalize_payment_method(p.payment_method),
+                        "inflow": 0.0,
+                        "outflow": float(amt)
+                    })
+
+            # 4. Outflows from Supplier Credit Repayments
+            supplier_payments_qs = SupplierPayment.objects.filter(
+                created_at__range=(start_dt, end_dt)
+            ).select_related("purchase__item")
+
+            if branch_obj:
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+
+            for sp in supplier_payments_qs.order_by('-created_at')[:50]:
+                amt = quantize_money(sp.amount)
+                if amt > ZERO:
+                    total_outflow += amt
+                    results.append({
+                        "id": f"SUPP-PAY-{sp.id}",
+                        "reference": f"SUPP-{sp.id}",
+                        "date": sp.created_at.strftime('%Y-%m-%d'),
+                        "description": f"Supplier Repayment: PO #{sp.purchase_id} ({sp.purchase.item.name})",
+                        "payment_method": self._normalize_payment_method(sp.payment_method),
+                        "inflow": 0.0,
+                        "outflow": float(amt)
+                    })
+
+            # 5. Outflows from Expenses
+            expenses_qs = Expense.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            if branch_obj:
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+
+            for exp in expenses_qs.order_by('-date')[:50]:
+                amt = quantize_money(exp.amount)
+                if amt > ZERO:
+                    total_outflow += amt
+                    results.append({
+                        "id": f"EXP-{exp.id}",
+                        "reference": f"EXP-{exp.id}",
+                        "date": exp.date.strftime('%Y-%m-%d'),
+                        "description": exp.description,
+                        "payment_method": "CASH",
+                        "inflow": 0.0,
+                        "outflow": float(amt)
+                    })
+
+            return Response({
+                "date": date_iso,
+                "branch": branch_obj.id if branch_obj else None,
+                "summary": {
+                    "total_inflow": float(quantize_money(total_inflow)),
+                    "total_outflow": float(quantize_money(total_outflow)),
+                    "net_cash_flow": float(quantize_money(total_inflow - total_outflow)),
+                },
+                "count": len(results),
+                "results": results
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Cash Book Endpoint Error")
+            return Response({"count": 0, "results": [], "summary": {"total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0}})
+
+    # =========================================================================
+    # M-PESA & CASH ACCOUNTS
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='mpesa-accounts')
+    def mpesa_accounts(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__range=(start_dt, end_dt)
+            ).exclude(payment_method='CREDIT').prefetch_related("split_payments")
+
+            repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+
+            paybill_total = ZERO
+            send_money_total = ZERO
+            cash_total = ZERO
+            results = []
+
+            for sale in sales_qs.order_by('-sale_date')[:100]:
+                method = self._normalize_payment_method(sale.payment_method)
+                if method == "SPLIT":
+                    for sp in sale.split_payments.all():
+                        sp_method = self._normalize_payment_method(sp.method)
+                        if sp_method in ['MPESA', 'PAYBILL', 'SEND_MONEY', 'CASH']:
+                            amt = quantize_money(sp.amount)
+                            if sp_method == 'PAYBILL': paybill_total += amt
+                            elif sp_method in ['SEND_MONEY', 'MPESA']: send_money_total += amt
+                            elif sp_method == 'CASH': cash_total += amt
+
+                            results.append({
+                                "id": f"SALE-SP-{sp.id}",
+                                "reference": sale.receipt_number,
+                                "date": sale.sale_date.strftime('%Y-%m-%d %H:%M'),
+                                "description": f"Sale ({sale.customer_name or 'Walk-in'})",
+                                "channel": sp_method,
+                                "amount": float(amt),
+                                "type": "INFLOW"
+                            })
+                else:
+                    amt = quantize_money(sale.total_amount)
+                    if method == 'PAYBILL': paybill_total += amt
+                    elif method in ['SEND_MONEY', 'MPESA']: send_money_total += amt
+                    elif method == 'CASH': cash_total += amt
+
+                    results.append({
+                        "id": f"SALE-{sale.id}",
+                        "reference": sale.receipt_number,
+                        "date": sale.sale_date.strftime('%Y-%m-%d %H:%M'),
+                        "description": f"Sale ({sale.customer_name or 'Walk-in'})",
+                        "channel": method,
+                        "amount": float(amt),
+                        "type": "INFLOW"
+                    })
+
+            for rep in repayments_qs.order_by('-date')[:50]:
+                method = self._normalize_payment_method(rep.payment_method)
+                amt = quantize_money(rep.amount)
+
+                if method == 'PAYBILL': paybill_total += amt
+                elif method in ['SEND_MONEY', 'MPESA']: send_money_total += amt
+                elif method == 'CASH': cash_total += amt
+
+                results.append({
+                    "id": f"REP-{rep.id}",
+                    "reference": f"REPAY-{rep.id}",
+                    "date": rep.date.strftime('%Y-%m-%d'),
+                    "description": f"Credit Repayment - {rep.customer.name}",
+                    "channel": method,
+                    "amount": float(amt),
+                    "type": "INFLOW"
+                })
+
+            total_mpesa_collected = paybill_total + send_money_total
+
+            return Response({
+                "summary": {
+                    "total_mpesa_collections": float(quantize_money(total_mpesa_collected)),
+                    "paybill_total": float(quantize_money(paybill_total)),
+                    "send_money_total": float(quantize_money(send_money_total)),
+                    "cash_total": float(quantize_money(cash_total)),
+                    "transaction_count": len(results)
+                },
+                "count": len(results),
+                "results": results
+            })
+        except Exception as e:
+            logger.exception("M-Pesa Accounts Error")
+            return Response({"count": 0, "results": [], "summary": {"total_mpesa_collections": 0.0, "paybill_total": 0.0, "send_money_total": 0.0, "cash_total": 0.0}})
+
+    @action(detail=False, methods=['get'], url_path='bank-accounts')
+    def bank_accounts(self, request):
+        return self.cash_overview(request)
+
+    @action(detail=False, methods=['get'], url_path='cash-transfers')
+    def cash_transfers(self, request):
+        return Response({"count": 0, "results": []})
+
+    @action(detail=False, methods=['get'], url_path='cash-reconciliation')
+    def cash_reconciliation(self, request):
+        return Response({"count": 0, "results": []})
+
+    @action(detail=False, methods=['get'], url_path='petty-cash')
+    def petty_cash(self, request):
+        return self.cash_payments(request)
+
+    @action(detail=False, methods=['get'], url_path='cash-reports')
+    def cash_reports(self, request):
+        return self.cash_overview(request)   
+
+
+logger = logging.getLogger(__name__)
+
+
+class ManagementReportsViewSet(viewsets.ViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _get_branch_and_dates(self, request):
+        branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
+        start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
+        end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
+        month_param = request.query_params.get("month")
+        year_param = request.query_params.get("year")
+
+        today = timezone.localdate()
+
+        if start_param and end_param:
+            try:
+                start_date = timezone.datetime.strptime(start_param, "%Y-%m-%d").date()
+                end_date = timezone.datetime.strptime(end_param, "%Y-%m-%d").date()
+            except ValueError:
+                start_date = today
+                end_date = today
+        elif month_param and year_param:
+            try:
+                yr = int(year_param)
+                mth = int(month_param)
+                _, last_day = calendar.monthrange(yr, mth)
+                start_date = timezone.datetime(yr, mth, 1).date()
+                end_date = timezone.datetime(yr, mth, last_day).date()
+            except (ValueError, TypeError):
+                start_date = today
+                end_date = today
+        else:
+            yr = today.year
+            mth = today.month
+            _, last_day = calendar.monthrange(yr, mth)
+            start_date = timezone.datetime(yr, mth, 1).date()
+            end_date = timezone.datetime(yr, mth, last_day).date()
+
+        tz = timezone.get_current_timezone()
+        start_dt = timezone.make_aware(timezone.datetime.combine(start_date, timezone.datetime.min.time()), tz)
+        end_dt = timezone.make_aware(timezone.datetime.combine(end_date, timezone.datetime.max.time()), tz)
+
+        branch_obj = None
+        if branch_param and str(branch_param).lower() != "all":
+            try:
+                branch_obj = RetailBranch.objects.get(pk=branch_param)
+            except (RetailBranch.DoesNotExist, ValueError):
+                branch_obj = None
+
+        return branch_obj, start_date, end_date, start_dt, end_dt
+
+    # =========================================================================
+    # 1. PROFIT & LOSS REPORT (/management-reports/profit/)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='profit-loss')
+    def profit_report(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
+            items_qs = SaleItem.objects.filter(transaction__sale_date__range=(start_dt, end_dt))
+            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                items_qs = items_qs.filter(transaction__branch=branch_obj)
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+
+            revenue = sales_qs.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
+
+            cogs_expr = ExpressionWrapper(
+                F('quantity_sold') * F('unit_cost_price'),
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
+            cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO))['total']
+
+            gross_profit = revenue - cogs
+            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            operating_profit = gross_profit - operating_expenses
+
+            finance_costs_and_tax = ZERO
+            net_profit = operating_profit - finance_costs_and_tax
+
+            return Response({
+                "period": start_date.strftime('%B %Y') if start_date.month == end_date.month else f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
+                "revenue": float(quantize_money(revenue)),
+                "cogs": float(quantize_money(cogs)),
+                "gross_profit": float(quantize_money(gross_profit)),
+                "operating_expenses": float(quantize_money(operating_expenses)),
+                "operating_profit": float(quantize_money(operating_profit)),
+                "finance_costs_and_tax": float(quantize_money(finance_costs_and_tax)),
+                "net_profit": float(quantize_money(net_profit)),
+            }, status=status.HTTP_200_OK)
+        except Exception:
+            logger.exception("Profit Report Error")
+            return Response({"revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0, "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0}, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 2. CASH FLOW REPORT (/management-reports/cash-flow/)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='cash-flow')
+    def cash_flow_report(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV'))
+            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
+            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+
+            realized_sales_cash = ZERO
+            for s in sales_qs:
+                if not getattr(s, 'is_invoice', False):
+                    bd = s.liquid_payments_breakdown
+                    realized_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
+
+            customer_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            customer_receipts = realized_sales_cash + customer_repayments
+
+            direct_purchases = purchases_qs.exclude(payment_method='CREDIT').aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            supplier_repayments = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            supplier_payments = direct_purchases + supplier_repayments
+
+            operating_expenses = expenses_qs.exclude(description__icontains='salary').exclude(description__icontains='wage').aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            salaries_and_wages = expenses_qs.filter(Q(description__icontains='salary') | Q(description__icontains='wage')).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            net_operating_cash = customer_receipts - supplier_payments - operating_expenses - salaries_and_wages
+
+            equipment_purchased = ZERO
+            net_investing_cash = -equipment_purchased
+
+            capital_loan_received = ZERO
+            loan_repayment = ZERO
+            drawings = ZERO
+            net_financing_cash = capital_loan_received - loan_repayment - drawings
+
+            net_increase_in_cash = net_operating_cash + net_investing_cash + net_financing_cash
+            opening_cash = ZERO
+            closing_cash = opening_cash + net_increase_in_cash
+
+            return Response({
+                "period": start_date.strftime('%B %Y'),
+                "operating_activities": {
+                    "customer_receipts": float(quantize_money(customer_receipts)),
+                    "supplier_payments": float(quantize_money(supplier_payments)),
+                    "operating_expenses": float(quantize_money(operating_expenses)),
+                    "salaries_and_wages": float(quantize_money(salaries_and_wages)),
+                    "net_operating_cash": float(quantize_money(net_operating_cash)),
+                },
+                "investing_activities": {
+                    "equipment_purchased": float(quantize_money(equipment_purchased)),
+                    "net_investing_cash": float(quantize_money(net_investing_cash)),
+                },
+                "financing_activities": {
+                    "capital_loan_received": float(quantize_money(capital_loan_received)),
+                    "loan_repayment": float(quantize_money(loan_repayment)),
+                    "drawings": float(quantize_money(drawings)),
+                    "net_financing_cash": float(quantize_money(net_financing_cash)),
+                },
+                "net_increase_in_cash": float(quantize_money(net_increase_in_cash)),
+                "opening_cash": float(quantize_money(opening_cash)),
+                "closing_cash": float(quantize_money(closing_cash)),
+            }, status=status.HTTP_200_OK)
+        except Exception:
+            logger.exception("Cash Flow Report Error")
+            return Response({"net_increase_in_cash": 0.0, "closing_cash": 0.0}, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 3. BALANCE SHEET REPORT (/management-reports/balance-sheet/)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='balance-sheet')
+    def balance_sheet_report(self, request):
+        try:
+            branch_obj, _, end_date, _, end_dt = self._get_branch_and_dates(request)
+
+            sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).exclude(Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV'))
+            repayments_qs = CreditRepayment.objects.filter(Q(date__lte=end_date) | Q(created_at__lte=end_dt))
+            expenses_qs = Expense.objects.filter(Q(date__lte=end_date) | Q(created_at__lte=end_dt))
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__lte=end_dt) | Q(created_at__lte=end_dt))
+            supplier_payments_qs = SupplierPayment.objects.filter(created_at__lte=end_dt)
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+
+            tot_sales_cash = ZERO
+            for s in sales_qs:
+                if not getattr(s, 'is_invoice', False):
+                    bd = s.liquid_payments_breakdown
+                    tot_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
+
+            tot_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            tot_inflows = tot_sales_cash + tot_repayments
+
+            tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            tot_purchases_direct = purchases_qs.exclude(payment_method='CREDIT').aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            tot_supplier_repay = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            tot_outflows = tot_expenses + tot_purchases_direct + tot_supplier_repay
+
+            cash_bank_mpesa = max(ZERO, tot_inflows - tot_outflows)
+
+            credit_sales_qs = SaleTransaction.objects.filter(payment_method=SaleTransaction.PaymentMethod.CREDIT)
+            if branch_obj:
+                credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
+
+            customer_debts = sum((s.balance_due for s in credit_sales_qs), ZERO)
+
+            # --- Safe Branch Stock Valuation Calculation ---
+            inventory_stock = ZERO
+            try:
+                stock_qs = BranchStock.objects.all().select_related('item', 'branch')
+                if branch_obj:
+                    stock_qs = stock_qs.filter(branch=branch_obj)
+
+                for bs in stock_qs:
+                    pricing = bs.item.branch_pricings.filter(branch=bs.branch).first()
+                    cost = pricing.unit_cost_price if pricing else ZERO
+                    inventory_stock += Decimal(str(bs.quantity)) * Decimal(str(cost))
+            except Exception:
+                # Fallback to BranchItemPricing if BranchStock evaluation hits an anomaly
+                pricing_qs = BranchItemPricing.objects.all().select_related('item', 'branch')
+                if branch_obj:
+                    pricing_qs = pricing_qs.filter(branch=branch_obj)
+                for pr in pricing_qs:
+                    inventory_stock += pr.remaining_stock * pr.unit_cost_price
+
+            equipment = ZERO
+            total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
+
+            credit_purchases_qs = Purchase.objects.filter(payment_method='CREDIT')
+            if branch_obj:
+                credit_purchases_qs = credit_purchases_qs.filter(branch=branch_obj)
+
+            supplier_debts = sum((p.balance_due for p in credit_purchases_qs), ZERO)
+            bank_loan = ZERO
+            total_liabilities = supplier_debts + bank_loan
+
+            capital_and_retained_profits = total_assets - total_liabilities
+            liabilities_plus_equity = total_liabilities + capital_and_retained_profits
+
+            return Response({
+                "as_at_date": end_date.strftime('%d %b %Y'),
+                "assets": {
+                    "cash_bank_mpesa": float(quantize_money(cash_bank_mpesa)),
+                    "customer_debts": float(quantize_money(customer_debts)),
+                    "inventory_stock": float(quantize_money(inventory_stock)),
+                    "equipment": float(quantize_money(equipment)),
+                    "total_assets": float(quantize_money(total_assets)),
+                },
+                "liabilities": {
+                    "supplier_debts": float(quantize_money(supplier_debts)),
+                    "bank_loan": float(quantize_money(bank_loan)),
+                    "total_liabilities": float(quantize_money(total_liabilities)),
+                },
+                "equity": {
+                    "capital_and_retained_profits": float(quantize_money(capital_and_retained_profits)),
+                },
+                "liabilities_plus_equity": float(quantize_money(liabilities_plus_equity)),
+            }, status=status.HTTP_200_OK)
+
+        except Exception:
+            logger.exception("Balance Sheet Report Error")
+            return Response({
+                "as_at_date": timezone.localdate().strftime('%d %b %Y'),
+                "assets": {"cash_bank_mpesa": 0.0, "customer_debts": 0.0, "inventory_stock": 0.0, "equipment": 0.0, "total_assets": 0.0},
+                "liabilities": {"supplier_debts": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
+                "equity": {"capital_and_retained_profits": 0.0},
+                "liabilities_plus_equity": 0.0
+            }, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 4. DETAILED SALES REPORT (/management-reports/sales/)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='sales')
+    def sales_report(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).select_related("branch")
+            items_qs = SaleItem.objects.filter(transaction__sale_date__range=(start_dt, end_dt)).select_related("item")
+            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))).select_related("customer", "branch")
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                items_qs = items_qs.filter(transaction__branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+
+            total_sales = sales_qs.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
+            total_transactions = sales_qs.count()
+            total_credit_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            cash_sales = ZERO
+            mpesa_sales = ZERO
+            paybill_sales = ZERO
+            credit_sales = ZERO
+
+            for sale in sales_qs:
+                if sale.payment_method == 'CREDIT' or sale.receipt_number.startswith('INV'):
+                    credit_sales += sale.total_amount
+                else:
+                    bd = sale.liquid_payments_breakdown
+                    cash_sales += bd.get('CASH', ZERO)
+                    mpesa_sales += bd.get('MPESA', ZERO)
+                    paybill_sales += bd.get('PAYBILL', ZERO)
+
+            top_products = []
+            for item in items_qs.values('item__name').annotate(
+                total_qty=Sum('quantity_sold'),
+                total_rev=Sum(
+                    ExpressionWrapper(
+                        F('quantity_sold') * F('unit_selling_price'),
+                        output_field=DecimalField(max_digits=12, decimal_places=2)
+                    )
+                )
+            ).order_by('-total_rev')[:8]:
+                top_products.append({
+                    "name": item['item__name'],
+                    "quantity": float(item['total_qty']),
+                    "revenue": float(quantize_money(item['total_rev']))
+                })
+
+            recent_sales = []
+            for s in sales_qs.order_by('-sale_date')[:25]:
+                recent_sales.append({
+                    "id": s.id,
+                    "receipt_number": s.receipt_number,
+                    "date": s.sale_date.strftime('%Y-%m-%d %H:%M'),
+                    "customer": s.customer_name or 'Walk-in Customer',
+                    "payment_method": s.payment_method,
+                    "amount": float(quantize_money(s.total_amount)),
+                    "branch": s.branch.name if s.branch else 'Main'
+                })
+
+            recent_repayments = []
+            for r in repayments_qs.order_by('-created_at')[:15]:
+                recent_repayments.append({
+                    "id": r.id,
+                    "customer": r.customer.name if r.customer else 'Customer',
+                    "date": r.created_at.strftime('%Y-%m-%d %H:%M'),
+                    "payment_method": r.get_payment_method_display(),
+                    "amount": float(quantize_money(r.amount)),
+                    "receipt_number": r.transaction.receipt_number if r.transaction else None
+                })
+
+            return Response({
+                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
+                "summary": {
+                    "total_sales": float(quantize_money(total_sales)),
+                    "total_transactions": total_transactions,
+                    "average_order_value": float(quantize_money(total_sales / total_transactions)) if total_transactions > 0 else 0.0,
+                    "total_credit_repayments": float(quantize_money(total_credit_repayments)),
+                },
+                "payment_channels": {
+                    "cash": float(quantize_money(cash_sales)),
+                    "mpesa": float(quantize_money(mpesa_sales)),
+                    "paybill": float(quantize_money(paybill_sales)),
+                    "credit": float(quantize_money(credit_sales)),
+                    "credit_repayments": float(quantize_money(total_credit_repayments))
+                },
+                "top_products": top_products,
+                "recent_sales": recent_sales,
+                "recent_repayments": recent_repayments
+            }, status=status.HTTP_200_OK)
+
+        except Exception:
+            logger.exception("Sales Report Error")
+            return Response({"summary": {"total_sales": 0.0, "total_transactions": 0, "total_credit_repayments": 0.0}, "payment_channels": {}, "top_products": [], "recent_sales": [], "recent_repayments": []}, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 5. STOCK REPORT (/management-reports/stock/)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='stock')
+    def stock_report(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            # Base querysets
+            stock_qs = BranchStock.objects.all().select_related('item', 'branch')
+            movements_qs = StockMovement.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            ).select_related('item', 'branch', 'created_by')
+
+            if branch_obj:
+                stock_qs = stock_qs.filter(branch=branch_obj)
+                movements_qs = movements_qs.filter(branch=branch_obj)
+
+            # 1. Total Valuation & Inventory Holdings
+            total_stock_value = ZERO
+            total_items_count = stock_qs.count()
+            inventory_holdings = []
+
+            for bs in stock_qs:
+                pricing = bs.item.branch_pricings.filter(branch=bs.branch).first()
+                cost = pricing.unit_cost_price if pricing else ZERO
+                selling = pricing.unit_selling_price if pricing else ZERO
+                val = Decimal(str(bs.quantity)) * Decimal(str(cost))
+                total_stock_value += val
+
+                inventory_holdings.append({
+                    "id": bs.id,
+                    "item_name": bs.item.name,
+                    "branch_name": bs.branch.name,
+                    "quantity": float(bs.quantity),
+                    "unit_cost": float(cost),
+                    "unit_selling": float(selling),
+                    "total_value": float(quantize_money(val)),
+                    "is_low_stock": bs.quantity <= (pricing.min_stock_threshold if pricing else Decimal("5.000"))
+                })
+
+            # 2. Aggregate Operations Breakdown
+            operations_summary = {
+                "restock_purchases_qty": 0.0,
+                "sales_qty": 0.0,
+                "transfers_in_qty": 0.0,
+                "transfers_out_qty": 0.0,
+                "customer_returns_qty": 0.0,
+                "supplier_returns_qty": 0.0,
+                "damages_losses_qty": 0.0,
+            }
+
+            movement_type_map = {
+                StockMovement.MovementType.PURCHASE: "restock_purchases_qty",
+                StockMovement.MovementType.SALE: "sales_qty",
+                StockMovement.MovementType.TRANSFER_IN: "transfers_in_qty",
+                StockMovement.MovementType.TRANSFER_OUT: "transfers_out_qty",
+                StockMovement.MovementType.CUSTOMER_RETURN: "customer_returns_qty",
+                StockMovement.MovementType.SUPPLIER_RETURN: "supplier_returns_qty",
+                StockMovement.MovementType.DAMAGE: "damages_losses_qty",
+            }
+
+            for m in movements_qs:
+                key = movement_type_map.get(m.movement_type)
+                if key:
+                    operations_summary[key] += float(m.quantity)
+
+            # 3. Recent Stock Movements Audit Trail
+            recent_movements = []
+            for m in movements_qs.order_by('-created_at')[:40]:
+                recent_movements.append({
+                    "id": m.id,
+                    "date": m.created_at.strftime('%Y-%m-%d %H:%M'),
+                    "item_name": m.item.name,
+                    "movement_type": m.get_movement_type_display(),
+                    "raw_type": m.movement_type,
+                    "quantity": float(m.quantity),
+                    "unit_cost": float(m.unit_cost_price or ZERO),
+                    "reference": m.reference or 'N/A',
+                    "notes": m.notes or '',
+                    "branch": m.branch.name
+                })
+
+            return Response({
+                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
+                "summary": {
+                    "total_stock_value": float(quantize_money(total_stock_value)),
+                    "total_items_count": total_items_count,
+                    **operations_summary
+                },
+                "inventory_holdings": inventory_holdings,
+                "recent_movements": recent_movements
+            }, status=status.HTTP_200_OK)
+
+        except Exception:
+            logger.exception("Stock Operations Report Error")
+            return Response({
+                "summary": {"total_stock_value": 0.0, "total_items_count": 0},
+                "inventory_holdings": [],
+                "recent_movements": []
+            }, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 6. DEBTS REPORT (/management-reports/debts/)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='debts')
+    def debts_report(self, request):
+        try:
+            branch_obj, _, _, _, _ = self._get_branch_and_dates(request)
+
+            customers_qs = Customer.objects.all()
+            if branch_obj:
+                customers_qs = customers_qs.filter(sales__branch=branch_obj).distinct()
+
+            customer_debts_list = []
+            total_customer_debts = ZERO
+
+            for cust in customers_qs:
+                bal = cust.total_outstanding_balance
+                if bal > ZERO:
+                    total_customer_debts += bal
+                    customer_debts_list.append({
+                        "customer_id": cust.id,
+                        "customer_name": cust.name,
+                        "phone": cust.phone_number,
+                        "outstanding_balance": float(quantize_money(bal))
+                    })
+
+            purchases_qs = Purchase.objects.filter(payment_method='CREDIT')
+            if branch_obj:
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+
+            total_supplier_debts = sum((p.balance_due for p in purchases_qs), ZERO)
+
+            return Response({
+                "total_customer_debts": float(quantize_money(total_customer_debts)),
+                "total_supplier_debts": float(quantize_money(total_supplier_debts)),
+                "customer_debtors": customer_debts_list
+            }, status=status.HTTP_200_OK)
+        except Exception:
+            logger.exception("Debts Report Error")
+            return Response({"total_customer_debts": 0.0, "total_supplier_debts": 0.0, "customer_debtors": []}, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 7. EXPENSES REPORT (/management-reports/expenses/)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='expenses')
+    def expenses_report(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            if branch_obj:
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+
+            total_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            expense_list = []
+            for exp in expenses_qs.order_by('-date')[:50]:
+                expense_list.append({
+                    "id": exp.id,
+                    "date": exp.date.strftime('%Y-%m-%d'),
+                    "description": exp.description,
+                    "amount": float(quantize_money(exp.amount))
+                })
+
+            return Response({
+                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
+                "total_expenses": float(quantize_money(total_expenses)),
+                "count": len(expense_list),
+                "expenses": expense_list
+            }, status=status.HTTP_200_OK)
+        except Exception:
+            logger.exception("Expenses Report Error")
+            return Response({"total_expenses": 0.0, "count": 0, "expenses": []}, status=status.HTTP_200_OK)
+
+    # =========================================================================
+    # 8. BRANCHES REPORT (/management-reports/branches/)
+    # =========================================================================
+    @action(detail=False, methods=['get'], url_path='branches')
+    def branches_report(self, request):
+        try:
+            _, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            branches = RetailBranch.objects.all()
+            branch_data = []
+
+            for b in branches:
+                sales = SaleTransaction.objects.filter(
+                    branch=b, sale_date__range=(start_dt, end_dt)
+                ).aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
+
+                expenses = Expense.objects.filter(
+                    branch=b, date__range=(start_date, end_date)
+                ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+                branch_data.append({
+                    "branch_id": b.id,
+                    "branch_name": b.name,
+                    "revenue": float(quantize_money(sales)),
+                    "expenses": float(quantize_money(expenses)),
+                    "net_contribution": float(quantize_money(sales - expenses))
+                })
+
+            return Response({
+                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
+                "branches": branch_data
+            }, status=status.HTTP_200_OK)
+        except Exception:
+            logger.exception("Branches Report Error")
+            return Response({"branches": []}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def executive_summary_report(self, request):
+        try:
+            # Unpack date and branch parameters cleanly
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
+            items_qs = SaleItem.objects.filter(transaction__sale_date__range=(start_dt, end_dt))
+            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                items_qs = items_qs.filter(transaction__branch=branch_obj)
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+
+            # Revenue & COGS calculation
+            total_revenue = sales_qs.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
+
+            cogs_expr = ExpressionWrapper(
+                F('quantity_sold') * F('unit_cost_price'),
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
+            total_cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO))['total']
+            gross_profit = total_revenue - total_cogs
+
+            # Operating Expenses & Net Earnings
+            total_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            net_profit = gross_profit - total_expenses
+
+            return Response({
+                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
+                "summary": {
+                    "total_revenue": float(quantize_money(total_revenue)),
+                    "gross_profit": float(quantize_money(gross_profit)),
+                    "total_expenses": float(quantize_money(total_expenses)),
+                    "net_profit": float(quantize_money(net_profit)),
+                }
+            }, status=status.HTTP_200_OK)
+
+        except Exception:
+            logger.exception("Executive Summary Report Error")
+            return Response({
+                "period": timezone.localdate().strftime('%b %Y'),
+                "summary": {
+                    "total_revenue": 0.0,
+                    "gross_profit": 0.0,
+                    "total_expenses": 0.0,
+                    "net_profit": 0.0
+                }
+            }, status=status.HTTP_200_OK)    
