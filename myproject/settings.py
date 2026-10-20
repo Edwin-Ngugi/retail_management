@@ -220,7 +220,7 @@ EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False').lower() in ('true', '1'
 
 # SMTP Credentials
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', 'engugi922@gmail.com')
-EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')  # Must be set in environment (.env or server environment)
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', 'vluhjisjkztljjyo')  # Must be set in environment (.env or server environment)
 EMAIL_TIMEOUT = 10
 
 
