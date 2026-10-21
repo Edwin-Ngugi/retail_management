@@ -39,3 +39,4 @@ celery
 redis
 gunicorn
 reportlab
+svglib

@@ -7580,6 +7580,54 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 }
             }, status=status.HTTP_200_OK)    
 
+    import os
+import io
+from django.conf import settings
+from django.http import HttpResponse
+from django.db.models import Q
+from django.utils import timezone
+from rest_framework.decorators import action
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+# Try importing svglib for SVG logo rendering in ReportLab
+try:
+    from svglib.svglib import svg2rlg
+except ImportError:
+    svg2rlg = None
+
+
+def _get_pdf_logo_element():
+    """Helper to locate and convert logo.svg to a ReportLab Flowable element."""
+    if not svg2rlg:
+        return None
+
+    # Search common project paths for logo.svg
+    possible_paths = [
+        os.path.join(settings.BASE_DIR, 'static', 'logo.svg'),
+        os.path.join(settings.BASE_DIR, 'public', 'logo.svg'),
+        os.path.join(settings.BASE_DIR, 'logo.svg'),
+    ]
+
+    for path in possible_paths:
+        if os.path.exists(path):
+            try:
+                drawing = svg2rlg(path)
+                if drawing:
+                    # Scale down the SVG logo to fit header nicely
+                    drawing.scale(0.2, 0.2)
+                    drawing.hAlign = 'CENTER'
+                    return drawing
+            except Exception:
+                pass
+    return None
+
+
+class ManagementAnalyticsViewSet(viewsets.ViewSet):
+    # ... existing methods ...
+
     @action(detail=False, methods=['get'], url_path='export-profit-loss-pdf')
     def export_profit_loss_pdf(self, request):
         branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
@@ -7627,11 +7675,19 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         branch_name = branch_obj.name if branch_obj else "All Branches"
         period_str = f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
 
-        elements = [
-            Paragraph("MELVEX MANAGEMENT PORTAL", title_style),
+        elements = []
+        
+        # Add Logo SVG if available
+        logo_element = _get_pdf_logo_element()
+        if logo_element:
+            elements.append(logo_element)
+            elements.append(Spacer(1, 6))
+
+        elements.extend([
+            Paragraph("MELVEX BUSINESS SOLUTIONS", title_style),
             Paragraph(f"PROFIT & LOSS STATEMENT — {branch_name.upper()}<br/>Period: {period_str}", subtitle_style),
             Spacer(1, 10)
-        ]
+        ])
 
         data = [
             [Paragraph("<b>Revenue</b>", styles['Normal']), f"KSh {total_sales:,.2f}"],
@@ -7699,11 +7755,19 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         branch_name = branch_obj.name if branch_obj else "All Branches"
         period_str = f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
 
-        elements = [
-            Paragraph("MELVEX MANAGEMENT PORTAL", title_style),
+        elements = []
+
+        # Add Logo SVG if available
+        logo_element = _get_pdf_logo_element()
+        if logo_element:
+            elements.append(logo_element)
+            elements.append(Spacer(1, 6))
+
+        elements.extend([
+            Paragraph("MELVEX BUSINESS SOLUTIONS", title_style),
             Paragraph(f"CASH FLOW STATEMENT — {branch_name.upper()}<br/>Period: {period_str}", sub_style),
             Spacer(1, 10)
-        ]
+        ])
 
         data = [
             [Paragraph("<b>Operating Cash Inflows</b>", styles['Normal']), ""],
@@ -7768,11 +7832,19 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
         branch_name = branch_obj.name if branch_obj else "All Branches"
 
-        elements = [
-            Paragraph("MELVEX MANAGEMENT PORTAL", title_style),
+        elements = []
+
+        # Add Logo SVG if available
+        logo_element = _get_pdf_logo_element()
+        if logo_element:
+            elements.append(logo_element)
+            elements.append(Spacer(1, 6))
+
+        elements.extend([
+            Paragraph("MELVEX BUSINESS SOLUTIONS", title_style),
             Paragraph(f"BALANCE SHEET STATEMENT — {branch_name.upper()}<br/>As of {timezone.localdate().strftime('%b %d, %Y')}", sub_style),
             Spacer(1, 10)
-        ]
+        ])
 
         data = [
             [Paragraph("<b>ASSETS</b>", styles['Normal']), ""],
@@ -7805,4 +7877,4 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
         response = HttpResponse(buffer, content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="Balance_Sheet_{branch_name}.pdf"'
-        return response        
+        return response
