@@ -6255,6 +6255,111 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         except Exception:
             return Response({"summary": {"total_discounts_granted": 0.0, "total_returns_value": 0.0, "total_returns_count": 0}}, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=['get'], url_path='profit-loss')
+    def profit_loss(self, request):
+        branch_id, start_date, end_date = self._get_filter_params(request)
+
+        # Base querysets
+        sales_qs = Sale.objects.filter(
+            created_at__date__gte=start_date,
+            created_at__date__lte=end_date
+        )
+        expenses_qs = Expense.objects.filter(
+            date__gte=start_date,
+            date__lte=end_date
+        )
+
+        if branch_id:
+            sales_qs = sales_qs.filter(branch_id=branch_id)
+            expenses_qs = expenses_qs.filter(branch_id=branch_id)
+
+        # Total Sales Revenue
+        total_sales = sales_qs.aggregate(
+            total=Sum('total_amount')
+        )['total'] or 0.0
+
+        # Cost of Goods Sold (COGS) aggregated from SaleItems
+        sale_items = SaleItem.objects.filter(
+            sale__in=sales_qs
+        )
+        
+        cogs_expr = ExpressionWrapper(
+            F('quantity') * F('unit_cost'),
+            output_field=DecimalField(max_digits=12, decimal_places=2)
+        )
+        cogs = sale_items.aggregate(
+            total_cogs=Sum(cogs_expr)
+        )['total_cogs'] or 0.0
+
+        # Gross Profit
+        gross_profit = float(total_sales) - float(cogs)
+
+        # Operating Expenses
+        operating_expenses = expenses_qs.aggregate(
+            total=Sum('amount')
+        )['total'] or 0.0
+
+        # Net Profit
+        net_profit = float(gross_profit) - float(operating_expenses)
+
+        return Response({
+            'period': {
+                'start_date': str(start_date),
+                'end_date': str(end_date),
+            },
+            'total_sales': float(total_sales),
+            'total_sales_formatted': f"KSh {float(total_sales):,.2f}",
+            'cost_of_goods_sold': float(cogs),
+            'cost_of_goods_sold_formatted': f"KSh {float(cogs):,.2f}",
+            'gross_profit': float(gross_profit),
+            'gross_profit_formatted': f"KSh {float(gross_profit):,.2f}",
+            'operating_expenses': float(operating_expenses),
+            'operating_expenses_formatted': f"KSh {float(operating_expenses):,.2f}",
+            'net_profit': float(net_profit),
+            'net_profit_formatted': f"KSh {float(net_profit):,.2f}",
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='sales-performance')
+    def sales_performance(self, request):
+        branch_id, start_date, end_date = self._get_filter_params(request)
+
+        sales_qs = Sale.objects.filter(
+            created_at__date__gte=start_date,
+            created_at__date__lte=end_date
+        )
+
+        if branch_id:
+            sales_qs = sales_qs.filter(branch_id=branch_id)
+
+        # Aggregate daily sales trajectory for Recharts
+        daily_breakdown = []
+        curr_date = start_date
+        while curr_date <= end_date:
+            day_sales = sales_qs.filter(
+                created_at__date=curr_date
+            ).aggregate(
+                total=Sum('total_amount')
+            )['total'] or 0.0
+
+            daily_breakdown.append({
+                'date': curr_date.strftime('%b %d'),
+                'full_date': str(curr_date),
+                'gross_sales': float(day_sales),
+            })
+            curr_date += timedelta(days=1)
+
+        total_period_sales = sum(item['gross_sales'] for item in daily_breakdown)
+
+        return Response({
+            'period': {
+                'start_date': str(start_date),
+                'end_date': str(end_date),
+            },
+            'total_sales': float(total_period_sales),
+            'total_sales_formatted': f"KSh {float(total_period_sales):,.2f}",
+            'daily': daily_breakdown
+        }, status=status.HTTP_200_OK)
+    
     # =========================================================================
     # CASHVIEW ENDPOINTS
     # =========================================================================
