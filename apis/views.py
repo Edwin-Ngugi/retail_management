@@ -6095,48 +6095,60 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             for s in sales_qs.order_by('-sale_date')[:50]:
                 bd = getattr(s, 'liquid_payments_breakdown', {})
                 tot = bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
-                if tot > ZERO:
+                amt = float(quantize_money(tot if tot > ZERO else (s.total_amount or ZERO)))
+                if amt > 0:
                     ledger_entries.append({
                         "id": f"SALE-{s.id}",
-                        "date": s.sale_date.strftime('%Y-%m-%d %H:%M'),
+                        "date": s.sale_date.strftime('%Y-%m-%d %H:%M') if hasattr(s.sale_date, 'strftime') else str(s.sale_date)[:16],
                         "reference": s.receipt_number or f"REC-{s.id}",
                         "description": f"Sale - {s.customer_name or 'Walk-in'}",
                         "type": "INFLOW",
-                        "payment_method": s.payment_method,
-                        "amount": float(quantize_money(tot))
+                        "payment_method": s.payment_method or "CASH",
+                        "inflow": amt,
+                        "outflow": 0.0,
+                        "amount": amt
                     })
 
             for r in repayments_qs.order_by('-created_at')[:30]:
+                amt = float(quantize_money(r.amount or ZERO))
                 ledger_entries.append({
                     "id": f"REPAY-{r.id}",
-                    "date": r.created_at.strftime('%Y-%m-%d %H:%M'),
+                    "date": r.created_at.strftime('%Y-%m-%d %H:%M') if hasattr(r.created_at, 'strftime') else str(r.created_at)[:16],
                     "reference": f"REPAY-{r.id}",
-                    "description": f"Customer Repayment - {r.customer.name if r.customer else 'Customer'}",
+                    "description": f"Customer Repayment - {r.customer.name if getattr(r, 'customer', None) else 'Customer'}",
                     "type": "INFLOW",
                     "payment_method": self._normalize_payment_method(r.payment_method),
-                    "amount": float(quantize_money(r.amount))
+                    "inflow": amt,
+                    "outflow": 0.0,
+                    "amount": amt
                 })
 
             for e in expenses_qs.order_by('-date')[:30]:
+                amt = float(quantize_money(e.amount or ZERO))
                 ledger_entries.append({
                     "id": f"EXP-{e.id}",
-                    "date": e.date.strftime('%Y-%m-%d'),
+                    "date": e.date.strftime('%Y-%m-%d') if hasattr(e.date, 'strftime') else str(e.date)[:10],
                     "reference": f"EXP-{e.id}",
                     "description": e.description or "Operating Expense",
                     "type": "OUTFLOW",
-                    "payment_method": "CASH",
-                    "amount": float(quantize_money(e.amount))
+                    "payment_method": getattr(e, 'payment_method', 'CASH') or 'CASH',
+                    "inflow": 0.0,
+                    "outflow": amt,
+                    "amount": amt
                 })
 
             for p in purchases_qs.order_by('-purchase_date')[:30]:
+                amt = float(quantize_money(p.amount_paid or p.total_cost or ZERO))
                 ledger_entries.append({
                     "id": f"PURCH-{p.id}",
-                    "date": p.purchase_date.strftime('%Y-%m-%d'),
+                    "date": p.purchase_date.strftime('%Y-%m-%d') if hasattr(p.purchase_date, 'strftime') else str(p.purchase_date)[:10],
                     "reference": f"PO-{p.id}",
-                    "description": f"Purchase - {p.item.name if p.item else 'Stock'}",
+                    "description": f"Purchase - {p.item.name if getattr(p, 'item', None) else 'Stock'}",
                     "type": "OUTFLOW",
                     "payment_method": self._normalize_payment_method(p.payment_method),
-                    "amount": float(quantize_money(p.amount_paid or p.total_cost))
+                    "inflow": 0.0,
+                    "outflow": amt,
+                    "amount": amt
                 })
 
             return Response({
