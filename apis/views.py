@@ -7623,10 +7623,7 @@ def _get_pdf_logo_element():
             except Exception:
                 pass
     return None
-
-
-class ManagementAnalyticsViewSet(viewsets.ViewSet):
-    # ... existing methods ...
+from django.conf import settings
 
     @action(detail=False, methods=['get'], url_path='export-profit-loss-pdf')
     def export_profit_loss_pdf(self, request):
