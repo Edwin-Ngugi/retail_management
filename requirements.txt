@@ -38,3 +38,4 @@ zope.interface==8.6
 celery
 redis
 gunicorn
+reportlab
