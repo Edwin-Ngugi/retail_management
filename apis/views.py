@@ -7,6 +7,8 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from decimal import Decimal
 from datetime import date, datetime, time, timedelta
+import os
+from django.conf import settings
 
 import io
 from django.http import HttpResponse
@@ -6939,10 +6941,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
 logger = logging.getLogger(__name__)
 
-from django.conf import settings
-class ManagementReportsViewSet(viewsets.ViewSet):
-    permission_classes = [permissions.IsAuthenticated]
-
 try:
     from svglib.svglib import svg2rlg
 except ImportError:
@@ -6950,11 +6948,10 @@ except ImportError:
 
 
 def _get_pdf_logo_element():
-    """Helper to locate and convert logo.svg to a ReportLab Flowable element."""
+    """Helper to locate, scale, and center convert logo.svg to a ReportLab Flowable element."""
     if not svg2rlg:
         return None
 
-    # Search common project paths for logo.svg
     possible_paths = [
         os.path.join(settings.BASE_DIR, 'staticfiles', 'logo.svg'),
         os.path.join(settings.BASE_DIR, 'public', 'logo.svg'),
@@ -6966,13 +6963,38 @@ def _get_pdf_logo_element():
             try:
                 drawing = svg2rlg(path)
                 if drawing:
-                    # Scale down the SVG logo to fit header nicely
-                    drawing.scale(0.2, 0.2)
-                    drawing.hAlign = 'CENTER'
-                    return drawing
+                    # Target dimensions for the header logo
+                    target_width = 120
+                    target_height = 40
+
+                    # Calculate scale factors to maintain aspect ratio
+                    scale_x = target_width / float(drawing.width) if drawing.width else 0.2
+                    scale_y = target_height / float(drawing.height) if drawing.height else 0.2
+                    scale_factor = min(scale_x, scale_y)
+
+                    drawing.width = drawing.width * scale_factor
+                    drawing.height = drawing.height * scale_factor
+                    drawing.scale(scale_factor, scale_factor)
+
+                    # Wrap in a centered single-cell table to force horizontal alignment
+                    logo_table = Table([[drawing]], colWidths=[532])
+                    logo_table.setStyle(TableStyle([
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ('TOPPADDING', (0, 0), (-1, -1), 0),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+                    ]))
+                    return logo_table
             except Exception:
                 pass
     return None
+
+
+class ManagementReportsViewSet(viewsets.ViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+
     def _get_branch_and_dates(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
         start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
@@ -7020,7 +7042,7 @@ def _get_pdf_logo_element():
         return branch_obj, start_date, end_date, start_dt, end_dt
 
     # =========================================================================
-    # 1. PROFIT & LOSS REPORT (/management-reports/profit/)
+    # 1. PROFIT & LOSS REPORT (/management-reports/profit-loss/)
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='profit-loss')
     def profit_report(self, request):
@@ -7186,7 +7208,6 @@ def _get_pdf_logo_element():
 
             customer_debts = sum((s.balance_due for s in credit_sales_qs), ZERO)
 
-            # --- Safe Branch Stock Valuation Calculation ---
             inventory_stock = ZERO
             try:
                 stock_qs = BranchStock.objects.all().select_related('item', 'branch')
@@ -7198,7 +7219,6 @@ def _get_pdf_logo_element():
                     cost = pricing.unit_cost_price if pricing else ZERO
                     inventory_stock += Decimal(str(bs.quantity)) * Decimal(str(cost))
             except Exception:
-                # Fallback to BranchItemPricing if BranchStock evaluation hits an anomaly
                 pricing_qs = BranchItemPricing.objects.all().select_related('item', 'branch')
                 if branch_obj:
                     pricing_qs = pricing_qs.filter(branch=branch_obj)
@@ -7250,319 +7270,11 @@ def _get_pdf_logo_element():
             }, status=status.HTTP_200_OK)
 
     # =========================================================================
-    # 4. DETAILED SALES REPORT (/management-reports/sales/)
+    # PDF EXPORT ACTIONS
     # =========================================================================
-    @action(detail=False, methods=['get'], url_path='sales')
-    def sales_report(self, request):
+    @action(detail=False, methods=['get'], url_path='export-profit-loss-pdf')
+    def export_profit_loss_pdf(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).select_related("branch")
-            items_qs = SaleItem.objects.filter(transaction__sale_date__range=(start_dt, end_dt)).select_related("item")
-            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))).select_related("customer", "branch")
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                items_qs = items_qs.filter(transaction__branch=branch_obj)
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
-
-            total_sales = sales_qs.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
-            total_transactions = sales_qs.count()
-            total_credit_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-
-            cash_sales = ZERO
-            mpesa_sales = ZERO
-            paybill_sales = ZERO
-            credit_sales = ZERO
-
-            for sale in sales_qs:
-                if sale.payment_method == 'CREDIT' or sale.receipt_number.startswith('INV'):
-                    credit_sales += sale.total_amount
-                else:
-                    bd = sale.liquid_payments_breakdown
-                    cash_sales += bd.get('CASH', ZERO)
-                    mpesa_sales += bd.get('MPESA', ZERO)
-                    paybill_sales += bd.get('PAYBILL', ZERO)
-
-            top_products = []
-            for item in items_qs.values('item__name').annotate(
-                total_qty=Sum('quantity_sold'),
-                total_rev=Sum(
-                    ExpressionWrapper(
-                        F('quantity_sold') * F('unit_selling_price'),
-                        output_field=DecimalField(max_digits=12, decimal_places=2)
-                    )
-                )
-            ).order_by('-total_rev')[:8]:
-                top_products.append({
-                    "name": item['item__name'],
-                    "quantity": float(item['total_qty']),
-                    "revenue": float(quantize_money(item['total_rev']))
-                })
-
-            recent_sales = []
-            for s in sales_qs.order_by('-sale_date')[:25]:
-                recent_sales.append({
-                    "id": s.id,
-                    "receipt_number": s.receipt_number,
-                    "date": s.sale_date.strftime('%Y-%m-%d %H:%M'),
-                    "customer": s.customer_name or 'Walk-in Customer',
-                    "payment_method": s.payment_method,
-                    "amount": float(quantize_money(s.total_amount)),
-                    "branch": s.branch.name if s.branch else 'Main'
-                })
-
-            recent_repayments = []
-            for r in repayments_qs.order_by('-created_at')[:15]:
-                recent_repayments.append({
-                    "id": r.id,
-                    "customer": r.customer.name if r.customer else 'Customer',
-                    "date": r.created_at.strftime('%Y-%m-%d %H:%M'),
-                    "payment_method": r.get_payment_method_display(),
-                    "amount": float(quantize_money(r.amount)),
-                    "receipt_number": r.transaction.receipt_number if r.transaction else None
-                })
-
-            return Response({
-                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
-                "summary": {
-                    "total_sales": float(quantize_money(total_sales)),
-                    "total_transactions": total_transactions,
-                    "average_order_value": float(quantize_money(total_sales / total_transactions)) if total_transactions > 0 else 0.0,
-                    "total_credit_repayments": float(quantize_money(total_credit_repayments)),
-                },
-                "payment_channels": {
-                    "cash": float(quantize_money(cash_sales)),
-                    "mpesa": float(quantize_money(mpesa_sales)),
-                    "paybill": float(quantize_money(paybill_sales)),
-                    "credit": float(quantize_money(credit_sales)),
-                    "credit_repayments": float(quantize_money(total_credit_repayments))
-                },
-                "top_products": top_products,
-                "recent_sales": recent_sales,
-                "recent_repayments": recent_repayments
-            }, status=status.HTTP_200_OK)
-
-        except Exception:
-            logger.exception("Sales Report Error")
-            return Response({"summary": {"total_sales": 0.0, "total_transactions": 0, "total_credit_repayments": 0.0}, "payment_channels": {}, "top_products": [], "recent_sales": [], "recent_repayments": []}, status=status.HTTP_200_OK)
-
-    # =========================================================================
-    # 5. STOCK REPORT (/management-reports/stock/)
-    # =========================================================================
-    @action(detail=False, methods=['get'], url_path='stock')
-    def stock_report(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-
-            # Base querysets
-            stock_qs = BranchStock.objects.all().select_related('item', 'branch')
-            movements_qs = StockMovement.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            ).select_related('item', 'branch', 'created_by')
-
-            if branch_obj:
-                stock_qs = stock_qs.filter(branch=branch_obj)
-                movements_qs = movements_qs.filter(branch=branch_obj)
-
-            # 1. Total Valuation & Inventory Holdings
-            total_stock_value = ZERO
-            total_items_count = stock_qs.count()
-            inventory_holdings = []
-
-            for bs in stock_qs:
-                pricing = bs.item.branch_pricings.filter(branch=bs.branch).first()
-                cost = pricing.unit_cost_price if pricing else ZERO
-                selling = pricing.unit_selling_price if pricing else ZERO
-                val = Decimal(str(bs.quantity)) * Decimal(str(cost))
-                total_stock_value += val
-
-                inventory_holdings.append({
-                    "id": bs.id,
-                    "item_name": bs.item.name,
-                    "branch_name": bs.branch.name,
-                    "quantity": float(bs.quantity),
-                    "unit_cost": float(cost),
-                    "unit_selling": float(selling),
-                    "total_value": float(quantize_money(val)),
-                    "is_low_stock": bs.quantity <= (pricing.min_stock_threshold if pricing else Decimal("5.000"))
-                })
-
-            # 2. Aggregate Operations Breakdown
-            operations_summary = {
-                "restock_purchases_qty": 0.0,
-                "sales_qty": 0.0,
-                "transfers_in_qty": 0.0,
-                "transfers_out_qty": 0.0,
-                "customer_returns_qty": 0.0,
-                "supplier_returns_qty": 0.0,
-                "damages_losses_qty": 0.0,
-            }
-
-            movement_type_map = {
-                StockMovement.MovementType.PURCHASE: "restock_purchases_qty",
-                StockMovement.MovementType.SALE: "sales_qty",
-                StockMovement.MovementType.TRANSFER_IN: "transfers_in_qty",
-                StockMovement.MovementType.TRANSFER_OUT: "transfers_out_qty",
-                StockMovement.MovementType.CUSTOMER_RETURN: "customer_returns_qty",
-                StockMovement.MovementType.SUPPLIER_RETURN: "supplier_returns_qty",
-                StockMovement.MovementType.DAMAGE: "damages_losses_qty",
-            }
-
-            for m in movements_qs:
-                key = movement_type_map.get(m.movement_type)
-                if key:
-                    operations_summary[key] += float(m.quantity)
-
-            # 3. Recent Stock Movements Audit Trail
-            recent_movements = []
-            for m in movements_qs.order_by('-created_at')[:40]:
-                recent_movements.append({
-                    "id": m.id,
-                    "date": m.created_at.strftime('%Y-%m-%d %H:%M'),
-                    "item_name": m.item.name,
-                    "movement_type": m.get_movement_type_display(),
-                    "raw_type": m.movement_type,
-                    "quantity": float(m.quantity),
-                    "unit_cost": float(m.unit_cost_price or ZERO),
-                    "reference": m.reference or 'N/A',
-                    "notes": m.notes or '',
-                    "branch": m.branch.name
-                })
-
-            return Response({
-                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
-                "summary": {
-                    "total_stock_value": float(quantize_money(total_stock_value)),
-                    "total_items_count": total_items_count,
-                    **operations_summary
-                },
-                "inventory_holdings": inventory_holdings,
-                "recent_movements": recent_movements
-            }, status=status.HTTP_200_OK)
-
-        except Exception:
-            logger.exception("Stock Operations Report Error")
-            return Response({
-                "summary": {"total_stock_value": 0.0, "total_items_count": 0},
-                "inventory_holdings": [],
-                "recent_movements": []
-            }, status=status.HTTP_200_OK)
-
-    # =========================================================================
-    # 6. DEBTS REPORT (/management-reports/debts/)
-    # =========================================================================
-    @action(detail=False, methods=['get'], url_path='debts')
-    def debts_report(self, request):
-        try:
-            branch_obj, _, _, _, _ = self._get_branch_and_dates(request)
-
-            customers_qs = Customer.objects.all()
-            if branch_obj:
-                customers_qs = customers_qs.filter(sales__branch=branch_obj).distinct()
-
-            customer_debts_list = []
-            total_customer_debts = ZERO
-
-            for cust in customers_qs:
-                bal = cust.total_outstanding_balance
-                if bal > ZERO:
-                    total_customer_debts += bal
-                    customer_debts_list.append({
-                        "customer_id": cust.id,
-                        "customer_name": cust.name,
-                        "phone": cust.phone_number,
-                        "outstanding_balance": float(quantize_money(bal))
-                    })
-
-            purchases_qs = Purchase.objects.filter(payment_method='CREDIT')
-            if branch_obj:
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-
-            total_supplier_debts = sum((p.balance_due for p in purchases_qs), ZERO)
-
-            return Response({
-                "total_customer_debts": float(quantize_money(total_customer_debts)),
-                "total_supplier_debts": float(quantize_money(total_supplier_debts)),
-                "customer_debtors": customer_debts_list
-            }, status=status.HTTP_200_OK)
-        except Exception:
-            logger.exception("Debts Report Error")
-            return Response({"total_customer_debts": 0.0, "total_supplier_debts": 0.0, "customer_debtors": []}, status=status.HTTP_200_OK)
-
-    # =========================================================================
-    # 7. EXPENSES REPORT (/management-reports/expenses/)
-    # =========================================================================
-    @action(detail=False, methods=['get'], url_path='expenses')
-    def expenses_report(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-            if branch_obj:
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-
-            total_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-
-            expense_list = []
-            for exp in expenses_qs.order_by('-date')[:50]:
-                expense_list.append({
-                    "id": exp.id,
-                    "date": exp.date.strftime('%Y-%m-%d'),
-                    "description": exp.description,
-                    "amount": float(quantize_money(exp.amount))
-                })
-
-            return Response({
-                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
-                "total_expenses": float(quantize_money(total_expenses)),
-                "count": len(expense_list),
-                "expenses": expense_list
-            }, status=status.HTTP_200_OK)
-        except Exception:
-            logger.exception("Expenses Report Error")
-            return Response({"total_expenses": 0.0, "count": 0, "expenses": []}, status=status.HTTP_200_OK)
-
-    # =========================================================================
-    # 8. BRANCHES REPORT (/management-reports/branches/)
-    # =========================================================================
-    @action(detail=False, methods=['get'], url_path='branches')
-    def branches_report(self, request):
-        try:
-            _, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-
-            branches = RetailBranch.objects.all()
-            branch_data = []
-
-            for b in branches:
-                sales = SaleTransaction.objects.filter(
-                    branch=b, sale_date__range=(start_dt, end_dt)
-                ).aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
-
-                expenses = Expense.objects.filter(
-                    branch=b, date__range=(start_date, end_date)
-                ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-
-                branch_data.append({
-                    "branch_id": b.id,
-                    "branch_name": b.name,
-                    "revenue": float(quantize_money(sales)),
-                    "expenses": float(quantize_money(expenses)),
-                    "net_contribution": float(quantize_money(sales - expenses))
-                })
-
-            return Response({
-                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
-                "branches": branch_data
-            }, status=status.HTTP_200_OK)
-        except Exception:
-            logger.exception("Branches Report Error")
-            return Response({"branches": []}, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=['get'], url_path='summary')
-    def executive_summary_report(self, request):
-        try:
-            # Unpack date and branch parameters cleanly
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
@@ -7574,291 +7286,481 @@ def _get_pdf_logo_element():
                 items_qs = items_qs.filter(transaction__branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-            # Revenue & COGS calculation
-            total_revenue = sales_qs.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
+            total_sales = sales_qs.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
 
             cogs_expr = ExpressionWrapper(
                 F('quantity_sold') * F('unit_cost_price'),
                 output_field=DecimalField(max_digits=12, decimal_places=2)
             )
             total_cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO))['total']
-            gross_profit = total_revenue - total_cogs
 
-            # Operating Expenses & Net Earnings
-            total_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            net_profit = gross_profit - total_expenses
+            gross_profit = total_sales - total_cogs
+            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            operating_profit = gross_profit - operating_expenses
+            tax = ZERO
+            net_profit = operating_profit - tax
 
-            return Response({
-                "period": f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
-                "summary": {
-                    "total_revenue": float(quantize_money(total_revenue)),
-                    "gross_profit": float(quantize_money(gross_profit)),
-                    "total_expenses": float(quantize_money(total_expenses)),
-                    "net_profit": float(quantize_money(net_profit)),
-                }
-            }, status=status.HTTP_200_OK)
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                rightMargin=40,
+                leftMargin=40,
+                topMargin=40,
+                bottomMargin=40
+            )
 
-        except Exception:
-            logger.exception("Executive Summary Report Error")
-            return Response({
-                "period": timezone.localdate().strftime('%b %Y'),
-                "summary": {
-                    "total_revenue": 0.0,
-                    "gross_profit": 0.0,
-                    "total_expenses": 0.0,
-                    "net_profit": 0.0
-                }
-            }, status=status.HTTP_200_OK)    
+            styles = getSampleStyleSheet()
 
+            company_style = ParagraphStyle(
+                'PdfCompanyHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=18,
+                leading=22,
+                textColor=colors.HexColor('#004D40'),
+                alignment=1,
+                spaceAfter=4
+            )
 
-    @action(detail=False, methods=['get'], url_path='export-profit-loss-pdf')
-    def export_profit_loss_pdf(self, request):
-        branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-        
-        # Calculate financial figures
-        sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-        expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-        
-        if branch_obj:
-            sales_qs = sales_qs.filter(branch=branch_obj)
-            expenses_qs = expenses_qs.filter(branch=branch_obj)
+            subtitle_style = ParagraphStyle(
+                'PdfSubHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=10,
+                leading=14,
+                textColor=colors.HexColor('#475569'),
+                alignment=1,
+                spaceAfter=15
+            )
 
-        total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
-        total_cogs = sum((s.total_cost for s in sales_qs), ZERO)
-        gross_profit = total_sales - total_cogs
-        operating_expenses = sum((quantize_money(e.amount or ZERO) for e in expenses_qs), ZERO)
-        operating_profit = gross_profit - operating_expenses
-        tax = ZERO
-        net_profit = operating_profit - tax
+            label_style = ParagraphStyle(
+                'TableLabel',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=10,
+                textColor=colors.HexColor('#1E293B')
+            )
 
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
-        styles = getSampleStyleSheet()
+            bold_label_style = ParagraphStyle(
+                'TableLabelBold',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=10,
+                textColor=colors.HexColor('#0F172A')
+            )
 
-        title_style = ParagraphStyle(
-            'TitleStyle',
-            parent=styles['Heading1'],
-            fontName='Helvetica-Bold',
-            fontSize=18,
-            leading=22,
-            textColor=colors.HexColor('#004D40'),
-            alignment=1,
-            spaceAfter=6
-        )
-        subtitle_style = ParagraphStyle(
-            'SubTitleStyle',
-            parent=styles['Normal'],
-            fontName='Helvetica',
-            fontSize=10,
-            textColor=colors.HexColor('#64748B'),
-            alignment=1,
-            spaceAfter=20
-        )
+            branch_name = branch_obj.name if branch_obj else "All Branches"
+            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}"
 
-        branch_name = branch_obj.name if branch_obj else "All Branches"
-        period_str = f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+            elements = []
 
-        elements = []
-        
-        # Add Logo SVG if available
-        logo_element = _get_pdf_logo_element()
-        if logo_element:
-            elements.append(logo_element)
-            elements.append(Spacer(1, 6))
+            # 1. Header (Logo + Company Name + Title) ALWAYS AT TOP
+            logo_element = _get_pdf_logo_element()
+            if logo_element:
+                elements.append(logo_element)
+                elements.append(Spacer(1, 8))
 
-        elements.extend([
-            Paragraph("MELVEX BUSINESS SOLUTIONS", title_style),
-            Paragraph(f"PROFIT & LOSS STATEMENT — {branch_name.upper()}<br/>Period: {period_str}", subtitle_style),
-            Spacer(1, 10)
-        ])
+            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
+            elements.append(Paragraph(f"<b>PROFIT & LOSS STATEMENT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
+            elements.append(Spacer(1, 10))
 
-        data = [
-            [Paragraph("<b>Revenue</b>", styles['Normal']), f"KSh {total_sales:,.2f}"],
-            [Paragraph("Less: Cost of Goods Sold", styles['Normal']), f"KSh {total_cogs:,.2f}"],
-            [Paragraph("<b>Gross Profit</b>", styles['Normal']), f"KSh {gross_profit:,.2f}"],
-            [Paragraph("Less: Operating Expenses", styles['Normal']), f"KSh {operating_expenses:,.2f}"],
-            [Paragraph("<b>Operating Profit</b>", styles['Normal']), f"KSh {operating_profit:,.2f}"],
-            [Paragraph("Finance Costs & Tax", styles['Normal']), f"KSh {tax:,.2f}"],
-            [Paragraph("<b>Net Profit / (Loss)</b>", styles['Normal']), f"KSh {net_profit:,.2f}"]
-        ]
+            # 2. Structured Financial Table
+            data = [
+                [Paragraph("Revenue", bold_label_style), f"KSh {total_sales:,.2f}"],
+                [Paragraph("Less: Cost of Goods Sold", label_style), f"KSh {total_cogs:,.2f}"],
+                [Paragraph("Gross Profit", bold_label_style), f"KSh {gross_profit:,.2f}"],
+                [Paragraph("Less: Operating Expenses", label_style), f"KSh {operating_expenses:,.2f}"],
+                [Paragraph("Operating Profit", bold_label_style), f"KSh {operating_profit:,.2f}"],
+                [Paragraph("Finance Costs & Tax", label_style), f"KSh {tax:,.2f}"],
+                [Paragraph("Net Profit / (Loss)", bold_label_style), f"KSh {net_profit:,.2f}"]
+            ]
 
-        table = Table(data, colWidths=[350, 180])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.white),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1E293B')),
-            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#F1F5F9')),
-            ('BACKGROUND', (0, 4), (-1, 4), colors.HexColor('#F1F5F9')),
-            ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#E6FFFA')),
-            ('TEXTCOLOR', (0, 6), (-1, 6), colors.HexColor('#004D40')),
-            ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
-        ]))
+            table = Table(data, colWidths=[340, 192])
+            table.setStyle(TableStyle([
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#F8FAFC')),
+                ('BACKGROUND', (0, 4), (-1, 4), colors.HexColor('#F8FAFC')),
+                ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#E6FFFA')),
+                ('TEXTCOLOR', (1, 6), (1, 6), colors.HexColor('#004D40')),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ('LINEBELOW', (0, 6), (-1, 6), 1.5, colors.HexColor('#004D40')),
+            ]))
 
-        elements.append(table)
-        doc.build(elements)
-        buffer.seek(0)
+            elements.append(table)
+            doc.build(elements)
+            buffer.seek(0)
 
-        response = HttpResponse(buffer, content_type='application/pdf')
-        response['Content-Disposition'] = f'attachment; filename="Profit_Loss_Statement_{branch_name}.pdf"'
-        return response
+            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="Profit_Loss_Statement_{branch_name}.pdf"'
+            return response
+
+        except Exception as e:
+            logger.exception("Export Profit Loss PDF Error")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path='export-cash-flow-pdf')
     def export_cash_flow_pdf(self, request):
-        branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-        
-        sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
-            Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
-        )
-        expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-        repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-        if branch_obj:
-            sales_qs = sales_qs.filter(branch=branch_obj)
-            expenses_qs = expenses_qs.filter(branch=branch_obj)
-            repayments_qs = repayments_qs.filter(branch=branch_obj)
+            # Query cash movements matching web endpoint logic
+            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
+                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+            )
+            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
+            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
 
-        sales_inflow = sum((quantize_money(s.total_amount) for s in sales_qs), ZERO)
-        repayment_inflow = sum((quantize_money(r.amount) for r in repayments_qs), ZERO)
-        total_inflows = sales_inflow + repayment_inflow
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-        operating_outflow = sum((quantize_money(e.amount) for e in expenses_qs), ZERO)
-        net_cash_flow = total_inflows - operating_outflow
+            # Cash Inflows
+            realized_sales_cash = ZERO
+            for s in sales_qs:
+                if not getattr(s, 'is_invoice', False):
+                    bd = s.liquid_payments_breakdown
+                    realized_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
 
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
-        styles = getSampleStyleSheet()
+            customer_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            customer_receipts = realized_sales_cash + customer_repayments
 
-        title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=18, leading=22, textColor=colors.HexColor('#004D40'), alignment=1)
-        sub_style = ParagraphStyle('Sub', parent=styles['Normal'], fontName='Helvetica', fontSize=10, textColor=colors.HexColor('#64748B'), alignment=1, spaceAfter=20)
+            # Cash Outflows
+            direct_purchases = purchases_qs.exclude(payment_method='CREDIT').aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            supplier_repayments = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            supplier_payments = direct_purchases + supplier_repayments
 
-        branch_name = branch_obj.name if branch_obj else "All Branches"
-        period_str = f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+            operating_expenses = expenses_qs.exclude(description__icontains='salary').exclude(description__icontains='wage').aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            salaries_and_wages = expenses_qs.filter(Q(description__icontains='salary') | Q(description__icontains='wage')).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
-        elements = []
+            net_operating_cash = customer_receipts - supplier_payments - operating_expenses - salaries_and_wages
 
-        # Add Logo SVG if available
-        logo_element = _get_pdf_logo_element()
-        if logo_element:
-            elements.append(logo_element)
-            elements.append(Spacer(1, 6))
+            equipment_purchased = ZERO
+            net_investing_cash = -equipment_purchased
 
-        elements.extend([
-            Paragraph("MELVEX BUSINESS SOLUTIONS", title_style),
-            Paragraph(f"CASH FLOW STATEMENT — {branch_name.upper()}<br/>Period: {period_str}", sub_style),
-            Spacer(1, 10)
-        ])
+            capital_loan_received = ZERO
+            loan_repayment = ZERO
+            drawings = ZERO
+            net_financing_cash = capital_loan_received - loan_repayment - drawings
 
-        data = [
-            [Paragraph("<b>Operating Cash Inflows</b>", styles['Normal']), ""],
-            [Paragraph("Cash Sales & Immediate Receipts", styles['Normal']), f"KSh {sales_inflow:,.2f}"],
-            [Paragraph("Customer Credit Repayments", styles['Normal']), f"KSh {repayment_inflow:,.2f}"],
-            [Paragraph("<b>Total Cash Inflows</b>", styles['Normal']), f"KSh {total_inflows:,.2f}"],
-            [Paragraph("<b>Operating Cash Outflows</b>", styles['Normal']), ""],
-            [Paragraph("Operating & Overhead Expenses", styles['Normal']), f"KSh {operating_outflow:,.2f}"],
-            [Paragraph("<b>Total Cash Outflows</b>", styles['Normal']), f"KSh {operating_outflow:,.2f}"],
-            [Paragraph("<b>Net Cash Movement</b>", styles['Normal']), f"KSh {net_cash_flow:,.2f}"]
-        ]
+            net_increase_in_cash = net_operating_cash + net_investing_cash + net_financing_cash
+            opening_cash = ZERO
+            closing_cash = opening_cash + net_increase_in_cash
 
-        table = Table(data, colWidths=[350, 180])
-        table.setStyle(TableStyle([
-            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
-            ('TOPPADDING', (0, 0), (-1, -1), 7),
-            ('BACKGROUND', (0, 3), (-1, 3), colors.HexColor('#F1F5F9')),
-            ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#F1F5F9')),
-            ('BACKGROUND', (0, 7), (-1, 7), colors.HexColor('#E6FFFA')),
-            ('TEXTCOLOR', (0, 7), (-1, 7), colors.HexColor('#004D40')),
-            ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
-        ]))
+            # ReportLab PDF Generation Setup
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                rightMargin=40,
+                leftMargin=40,
+                topMargin=40,
+                bottomMargin=40
+            )
 
-        elements.append(table)
-        doc.build(elements)
-        buffer.seek(0)
+            styles = getSampleStyleSheet()
 
-        response = HttpResponse(buffer, content_type='application/pdf')
-        response['Content-Disposition'] = f'attachment; filename="Cash_Flow_Statement_{branch_name}.pdf"'
-        return response
+            company_style = ParagraphStyle(
+                'CompanyTitle',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=18,
+                leading=22,
+                textColor=colors.HexColor('#004D40'),
+                alignment=1,
+                spaceAfter=4
+            )
+
+            subtitle_style = ParagraphStyle(
+                'SubTitle',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=10,
+                leading=14,
+                textColor=colors.HexColor('#475569'),
+                alignment=1,
+                spaceAfter=15
+            )
+
+            label_style = ParagraphStyle(
+                'LabelNormal',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=10,
+                textColor=colors.HexColor('#1E293B')
+            )
+
+            bold_label_style = ParagraphStyle(
+                'LabelBold',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=10,
+                textColor=colors.HexColor('#0F172A')
+            )
+
+            branch_name = branch_obj.name if branch_obj else "All Branches"
+            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}"
+
+            elements = []
+
+            # Centered Logo Wrapper
+            logo_element = _get_pdf_logo_element()
+            if logo_element:
+                elements.append(logo_element)
+                elements.append(Spacer(1, 8))
+
+            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
+            elements.append(Paragraph(f"<b>CASH FLOW STATEMENT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
+            elements.append(Spacer(1, 10))
+
+            # Financial Data Table
+            data = [
+                [Paragraph("<b>OPERATING ACTIVITIES</b>", bold_label_style), ""],
+                [Paragraph("Customer receipts", label_style), f"KSh {customer_receipts:,.2f}"],
+                [Paragraph("Supplier payments", label_style), f"KSh {supplier_payments:,.2f}"],
+                [Paragraph("Operating expenses", label_style), f"KSh {operating_expenses:,.2f}"],
+                [Paragraph("Salaries & wages", label_style), f"KSh {salaries_and_wages:,.2f}"],
+                [Paragraph("Net operating cash", bold_label_style), f"KSh {net_operating_cash:,.2f}"],
+                [Paragraph("<b>INVESTING ACTIVITIES</b>", bold_label_style), ""],
+                [Paragraph("Equipment purchased", label_style), f"KSh {equipment_purchased:,.2f}"],
+                [Paragraph("Net investing cash", bold_label_style), f"KSh {net_investing_cash:,.2f}"],
+                [Paragraph("<b>FINANCING ACTIVITIES</b>", bold_label_style), ""],
+                [Paragraph("Capital loan received", label_style), f"KSh {capital_loan_received:,.2f}"],
+                [Paragraph("Loan repayment", label_style), f"KSh {loan_repayment:,.2f}"],
+                [Paragraph("Drawings", label_style), f"KSh {drawings:,.2f}"],
+                [Paragraph("Net financing cash", bold_label_style), f"KSh {net_financing_cash:,.2f}"],
+                [Paragraph("Net increase in cash", bold_label_style), f"KSh {net_increase_in_cash:,.2f}"],
+                [Paragraph("Opening cash", label_style), f"KSh {opening_cash:,.2f}"],
+                [Paragraph("CLOSING CASH", bold_label_style), f"KSh {closing_cash:,.2f}"]
+            ]
+
+            table = Table(data, colWidths=[340, 192])
+            table.setStyle(TableStyle([
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
+                ('BACKGROUND', (0, 5), (-1, 5), colors.HexColor('#F8FAFC')),
+                ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#F1F5F9')),
+                ('BACKGROUND', (0, 8), (-1, 8), colors.HexColor('#F8FAFC')),
+                ('BACKGROUND', (0, 9), (-1, 9), colors.HexColor('#F1F5F9')),
+                ('BACKGROUND', (0, 13), (-1, 13), colors.HexColor('#F8FAFC')),
+                ('BACKGROUND', (0, 16), (-1, 16), colors.HexColor('#E6FFFA')),
+                ('TEXTCOLOR', (1, 16), (1, 16), colors.HexColor('#004D40')),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ('LINEBELOW', (0, 16), (-1, 16), 1.5, colors.HexColor('#004D40')),
+            ]))
+
+            elements.append(table)
+            doc.build(elements)
+            buffer.seek(0)
+
+            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="Cash_Flow_Statement_{branch_name}.pdf"'
+            return response
+
+        except Exception as e:
+            logger.exception("Export Cash Flow PDF Error")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path='export-balance-sheet-pdf')
     def export_balance_sheet_pdf(self, request):
-        branch_obj, _, _, _, _ = self._get_branch_and_dates(request)
-        
-        pricing_qs = BranchItemPricing.objects.filter(branch=branch_obj) if branch_obj else BranchItemPricing.objects.all()
-        stock_value = sum((p.remaining_stock_value for p in pricing_qs), ZERO)
-        
-        receivables_qs = SaleTransaction.objects.filter(payment_method='CREDIT', is_paid=False)
-        if branch_obj:
-            receivables_qs = receivables_qs.filter(branch=branch_obj)
-        receivables_value = sum((s.balance_due for s in receivables_qs), ZERO)
+        try:
+            branch_obj, _, end_date, _, end_dt = self._get_branch_and_dates(request)
 
-        total_assets = stock_value + receivables_value
+            # 1. Cash, Bank & M-Pesa Inflow/Outflow Balance
+            sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).exclude(
+                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+            )
+            repayments_qs = CreditRepayment.objects.filter(Q(date__lte=end_date) | Q(created_at__lte=end_dt))
+            expenses_qs = Expense.objects.filter(Q(date__lte=end_date) | Q(created_at__lte=end_dt))
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__lte=end_dt) | Q(created_at__lte=end_dt))
+            supplier_payments_qs = SupplierPayment.objects.filter(created_at__lte=end_dt)
 
-        payables_qs = Purchase.objects.filter(payment_method='CREDIT')
-        if branch_obj:
-            payables_qs = payables_qs.filter(branch=branch_obj)
-        payables_value = sum((p.balance_due for p in payables_qs), ZERO)
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
 
-        net_equity = total_assets - payables_value
+            tot_sales_cash = ZERO
+            for s in sales_qs:
+                if not getattr(s, 'is_invoice', False):
+                    bd = s.liquid_payments_breakdown
+                    tot_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
 
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
-        styles = getSampleStyleSheet()
+            tot_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            tot_inflows = tot_sales_cash + tot_repayments
 
-        title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=18, leading=22, textColor=colors.HexColor('#004D40'), alignment=1)
-        sub_style = ParagraphStyle('Sub', parent=styles['Normal'], fontName='Helvetica', fontSize=10, textColor=colors.HexColor('#64748B'), alignment=1, spaceAfter=20)
+            tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            tot_purchases_direct = purchases_qs.exclude(payment_method='CREDIT').aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            tot_supplier_repay = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            tot_outflows = tot_expenses + tot_purchases_direct + tot_supplier_repay
 
-        branch_name = branch_obj.name if branch_obj else "All Branches"
+            cash_bank_mpesa = max(ZERO, tot_inflows - tot_outflows)
 
-        elements = []
+            # 2. Customer Receivables
+            credit_sales_qs = SaleTransaction.objects.filter(payment_method=SaleTransaction.PaymentMethod.CREDIT)
+            if branch_obj:
+                credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
+            customer_debts = sum((s.balance_due for s in credit_sales_qs), ZERO)
 
-        # Add Logo SVG if available
-        logo_element = _get_pdf_logo_element()
-        if logo_element:
-            elements.append(logo_element)
-            elements.append(Spacer(1, 6))
+            # 3. Inventory Stock Valuation
+            inventory_stock = ZERO
+            try:
+                stock_qs = BranchStock.objects.all().select_related('item', 'branch')
+                if branch_obj:
+                    stock_qs = stock_qs.filter(branch=branch_obj)
 
-        elements.extend([
-            Paragraph("MELVEX BUSINESS SOLUTIONS", title_style),
-            Paragraph(f"BALANCE SHEET STATEMENT — {branch_name.upper()}<br/>As of {timezone.localdate().strftime('%b %d, %Y')}", sub_style),
-            Spacer(1, 10)
-        ])
+                for bs in stock_qs:
+                    pricing = bs.item.branch_pricings.filter(branch=bs.branch).first()
+                    cost = pricing.unit_cost_price if pricing else ZERO
+                    inventory_stock += Decimal(str(bs.quantity)) * Decimal(str(cost))
+            except Exception:
+                pricing_qs = BranchItemPricing.objects.all().select_related('item', 'branch')
+                if branch_obj:
+                    pricing_qs = pricing_qs.filter(branch=branch_obj)
+                for pr in pricing_qs:
+                    inventory_stock += pr.remaining_stock * pr.unit_cost_price
 
-        data = [
-            [Paragraph("<b>ASSETS</b>", styles['Normal']), ""],
-            [Paragraph("Inventory Asset Value", styles['Normal']), f"KSh {stock_value:,.2f}"],
-            [Paragraph("Customer Receivables", styles['Normal']), f"KSh {receivables_value:,.2f}"],
-            [Paragraph("<b>Total Assets</b>", styles['Normal']), f"KSh {total_assets:,.2f}"],
-            [Paragraph("<b>LIABILITIES</b>", styles['Normal']), ""],
-            [Paragraph("Accounts Payable (Suppliers)", styles['Normal']), f"KSh {payables_value:,.2f}"],
-            [Paragraph("<b>Total Liabilities</b>", styles['Normal']), f"KSh {payables_value:,.2f}"],
-            [Paragraph("<b>EQUITY</b>", styles['Normal']), f"KSh {net_equity:,.2f}"]
-        ]
+            equipment = ZERO
+            total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
 
-        table = Table(data, colWidths=[350, 180])
-        table.setStyle(TableStyle([
-            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
-            ('TOPPADDING', (0, 0), (-1, -1), 7),
-            ('BACKGROUND', (0, 3), (-1, 3), colors.HexColor('#F1F5F9')),
-            ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#F1F5F9')),
-            ('BACKGROUND', (0, 7), (-1, 7), colors.HexColor('#E6FFFA')),
-            ('TEXTCOLOR', (0, 7), (-1, 7), colors.HexColor('#004D40')),
-            ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
-        ]))
+            # 4. Supplier Payables (Liabilities)
+            credit_purchases_qs = Purchase.objects.filter(payment_method='CREDIT')
+            if branch_obj:
+                credit_purchases_qs = credit_purchases_qs.filter(branch=branch_obj)
 
-        elements.append(table)
-        doc.build(elements)
-        buffer.seek(0)
+            supplier_debts = sum((p.balance_due for p in credit_purchases_qs), ZERO)
+            bank_loan = ZERO
+            total_liabilities = supplier_debts + bank_loan
 
-        response = HttpResponse(buffer, content_type='application/pdf')
-        response['Content-Disposition'] = f'attachment; filename="Balance_Sheet_{branch_name}.pdf"'
-        return response
+            # 5. Equity & Capital
+            capital_and_retained_profits = total_assets - total_liabilities
+            liabilities_plus_equity = total_liabilities + capital_and_retained_profits
+
+            # --- ReportLab PDF Document Setup ---
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                rightMargin=40,
+                leftMargin=40,
+                topMargin=40,
+                bottomMargin=40
+            )
+
+            styles = getSampleStyleSheet()
+
+            company_style = ParagraphStyle(
+                'BsCompanyHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=18,
+                leading=22,
+                textColor=colors.HexColor('#004D40'),
+                alignment=1,
+                spaceAfter=4
+            )
+
+            subtitle_style = ParagraphStyle(
+                'BsSubHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=10,
+                leading=14,
+                textColor=colors.HexColor('#475569'),
+                alignment=1,
+                spaceAfter=15
+            )
+
+            label_style = ParagraphStyle(
+                'BsLabelNormal',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=10,
+                textColor=colors.HexColor('#1E293B')
+            )
+
+            bold_label_style = ParagraphStyle(
+                'BsLabelBold',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=10,
+                textColor=colors.HexColor('#0F172A')
+            )
+
+            branch_name = branch_obj.name if branch_obj else "All Branches"
+            as_at_str = end_date.strftime('%b %d, %Y')
+
+            elements = []
+
+            # Centered SVG Logo Header
+            logo_element = _get_pdf_logo_element()
+            if logo_element:
+                elements.append(logo_element)
+                elements.append(Spacer(1, 8))
+
+            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
+            elements.append(Paragraph(f"<b>BALANCE SHEET STATEMENT — {branch_name.upper()}</b><br/>As of {as_at_str}", subtitle_style))
+            elements.append(Spacer(1, 10))
+
+            # Balance Sheet Data Table
+            data = [
+                [Paragraph("<b>ASSETS</b>", bold_label_style), ""],
+                [Paragraph("Cash & Bank / M-Pesa", label_style), f"KSh {cash_bank_mpesa:,.2f}"],
+                [Paragraph("Customer Receivables (Debts)", label_style), f"KSh {customer_debts:,.2f}"],
+                [Paragraph("Inventory Stock Asset Value", label_style), f"KSh {inventory_stock:,.2f}"],
+                [Paragraph("Equipment & Fixed Assets", label_style), f"KSh {equipment:,.2f}"],
+                [Paragraph("Total Assets", bold_label_style), f"KSh {total_assets:,.2f}"],
+                [Paragraph("<b>LIABILITIES</b>", bold_label_style), ""],
+                [Paragraph("Accounts Payable (Suppliers)", label_style), f"KSh {supplier_debts:,.2f}"],
+                [Paragraph("Bank Loans & Borrowings", label_style), f"KSh {bank_loan:,.2f}"],
+                [Paragraph("Total Liabilities", bold_label_style), f"KSh {total_liabilities:,.2f}"],
+                [Paragraph("<b>EQUITY</b>", bold_label_style), ""],
+                [Paragraph("Capital & Retained Earnings", label_style), f"KSh {capital_and_retained_profits:,.2f}"],
+                [Paragraph("TOTAL LIABILITIES & EQUITY", bold_label_style), f"KSh {liabilities_plus_equity:,.2f}"]
+            ]
+
+            table = Table(data, colWidths=[340, 192])
+            table.setStyle(TableStyle([
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
+                ('BACKGROUND', (0, 5), (-1, 5), colors.HexColor('#F8FAFC')),
+                ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#F1F5F9')),
+                ('BACKGROUND', (0, 9), (-1, 9), colors.HexColor('#F8FAFC')),
+                ('BACKGROUND', (0, 10), (-1, 10), colors.HexColor('#F1F5F9')),
+                ('BACKGROUND', (0, 12), (-1, 12), colors.HexColor('#E6FFFA')),
+                ('TEXTCOLOR', (1, 12), (1, 12), colors.HexColor('#004D40')),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ('LINEBELOW', (0, 12), (-1, 12), 1.5, colors.HexColor('#004D40')),
+            ]))
+
+            elements.append(table)
+            doc.build(elements)
+            buffer.seek(0)
+
+            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="Balance_Sheet_{branch_name}.pdf"'
+            return response
+
+        except Exception as e:
+            logger.exception("Export Balance Sheet PDF Error")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
