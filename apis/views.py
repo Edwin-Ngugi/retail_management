@@ -5959,6 +5959,48 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             start_date = datetime(today.year, today.month, 1).date()
             end_date = datetime(today.year, today.month, last_day).date()
 
+        def _get_filter_params(self, request):
+        branch_id = request.query_params.get('branch_id')
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+        year = request.query_params.get('year')
+        month = request.query_params.get('month')
+
+        today = timezone.now().date()
+        start_date = None
+        end_date = None
+
+        if start_date_str and end_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            except ValueError:
+                pass
+
+        if not start_date or not end_date:
+            if year and month:
+                try:
+                    y, m = int(year), int(month)
+                    start_date = date(y, m, 1)
+                    last_day = calendar.monthrange(y, m)[1]
+                    end_date = date(y, m, last_day)
+                except ValueError:
+                    pass
+            elif year:
+                try:
+                    y = int(year)
+                    start_date = date(y, 1, 1)
+                    end_date = date(y, 12, 31)
+                except ValueError:
+                    pass
+
+        if not start_date or not end_date:
+            start_date = date(today.year, today.month, 1)
+            last_day = calendar.monthrange(today.year, today.month)[1]
+            end_date = date(today.year, today.month, last_day)
+
+        return branch_id, start_date, end_date    
+
         tz = timezone.get_current_timezone()
         start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
         end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
@@ -6366,7 +6408,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
+
     # =========================================================================
     # CASHVIEW ENDPOINTS
     # =========================================================================
