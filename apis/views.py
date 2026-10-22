@@ -7293,35 +7293,57 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # 1. CASH-BASIS REVENUE AGGREGATION
             # -----------------------------------------------------------------
-            # A) Non-credit sales (exclude full credit sales & invoices)
-            cash_sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date
+            ).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
 
-            # B) Credit Repayments collected in this period
             repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                date__gte=start_date,
+                date__lte=end_date
+            )
+
+            expenses_qs = Expense.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date
             )
 
             if branch_obj:
-                cash_sales_qs = cash_sales_qs.filter(branch=branch_obj)
+                sales_qs = sales_qs.filter(branch=branch_obj)
                 repayments_qs = repayments_qs.filter(
                     Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
                 )
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-            # Single-method cash sales total
-            single_sales_revenue = cash_sales_qs.exclude(payment_method='SPLIT').aggregate(
+            # A) Find all transactions that have split entries
+            split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
+
+            # B) Single-Method Transactions (Excludes any sale present in SalePayment table or marked SPLIT)
+            non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
+            
+            single_sales_revenue = non_split_sales.aggregate(
                 total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
             )['total']
 
-            # Split payments non-credit amounts
-            split_payments_revenue = SalePayment.objects.filter(
-                transaction__in=cash_sales_qs
-            ).exclude(method='CREDIT').aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            # C) Split Payments (Excludes CREDIT, routes PAYBILL/BANK, MPESA/SEND_MONEY/TILL, and CASH)
+            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs).exclude(method='CREDIT')
+            
+            split_payments_revenue = split_payments_qs.aggregate(
+                total=Coalesce(
+                    Sum(
+                        'amount',
+                        filter=Q(method__icontains='PAYBILL') | 
+                               Q(method__icontains='BANK') | 
+                               Q(method__in=['CASH', 'MPESA', 'SEND_MONEY', 'TILL'])
+                    ),
+                    ZERO,
+                    output_field=DecimalField()
+                )
             )['total']
 
-            # Collected credit repayments
+            # D) Credit Repayments
             repayments_revenue = repayments_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
@@ -7329,21 +7351,17 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             revenue = single_sales_revenue + split_payments_revenue + repayments_revenue
 
             # -----------------------------------------------------------------
-            # 2. COST OF GOODS SOLD & OPERATING EXPENSES
+            # 2. COST OF GOODS SOLD & EXPENSES
             # -----------------------------------------------------------------
             items_qs = SaleItem.objects.filter(
-                transaction__sale_date__range=(start_dt, end_dt)
+                transaction__sale_date__date__gte=start_date,
+                transaction__sale_date__date__lte=end_date
             ).exclude(
                 Q(transaction__payment_method='CREDIT') | Q(transaction__receipt_number__startswith='INV')
             )
 
-            expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
-
             if branch_obj:
                 items_qs = items_qs.filter(transaction__branch=branch_obj)
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
 
             cogs_expr = ExpressionWrapper(
                 F('quantity_sold') * F('unit_cost_price'),
@@ -7372,12 +7390,8 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         except Exception:
             logger.exception("Profit Report Error")
             return Response({
-                "revenue": 0.0,
-                "cogs": 0.0,
-                "gross_profit": 0.0,
-                "operating_expenses": 0.0,
-                "operating_profit": 0.0,
-                "net_profit": 0.0
+                "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
+                "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
             }, status=status.HTTP_200_OK)
 
     # =========================================================================
@@ -7570,29 +7584,87 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-            items_qs = SaleItem.objects.filter(transaction__sale_date__range=(start_dt, end_dt))
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            # -----------------------------------------------------------------
+            # 1. CASH-BASIS REVENUE AGGREGATION
+            # -----------------------------------------------------------------
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date
+            ).exclude(
+                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+            )
+
+            repayments_qs = CreditRepayment.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date
+            )
+
+            expenses_qs = Expense.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date
+            )
+
+            items_qs = SaleItem.objects.filter(
+                transaction__sale_date__date__gte=start_date,
+                transaction__sale_date__date__lte=end_date
+            ).exclude(
+                Q(transaction__payment_method='CREDIT') | Q(transaction__receipt_number__startswith='INV')
+            )
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
-                items_qs = items_qs.filter(transaction__branch=branch_obj)
+                repayments_qs = repayments_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+                )
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
+                items_qs = items_qs.filter(transaction__branch=branch_obj)
 
-            total_sales = sales_qs.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
+            # Split payments routing
+            split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
+            non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
 
+            single_sales_revenue = non_split_sales.aggregate(
+                total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
+            )['total']
+
+            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs).exclude(method='CREDIT')
+            split_payments_revenue = split_payments_qs.aggregate(
+                total=Coalesce(
+                    Sum(
+                        'amount',
+                        filter=Q(method__icontains='PAYBILL') | 
+                               Q(method__icontains='BANK') | 
+                               Q(method__in=['CASH', 'MPESA', 'SEND_MONEY', 'TILL'])
+                    ),
+                    ZERO,
+                    output_field=DecimalField()
+                )
+            )['total']
+
+            repayments_revenue = repayments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
+
+            total_sales = single_sales_revenue + split_payments_revenue + repayments_revenue
+
+            # -----------------------------------------------------------------
+            # 2. COST OF GOODS SOLD & EXPENSES
+            # -----------------------------------------------------------------
             cogs_expr = ExpressionWrapper(
                 F('quantity_sold') * F('unit_cost_price'),
                 output_field=DecimalField(max_digits=12, decimal_places=2)
             )
-            total_cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO))['total']
+            total_cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO, output_field=DecimalField()))['total']
 
             gross_profit = total_sales - total_cogs
-            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
             operating_profit = gross_profit - operating_expenses
             tax = ZERO
             net_profit = operating_profit - tax
 
+            # -----------------------------------------------------------------
+            # 3. REPORTLAB PDF BUILD
+            # -----------------------------------------------------------------
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(
                 buffer,
@@ -7648,7 +7720,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             elements = []
 
-            # 1. Header (Logo + Company Name + Title) ALWAYS AT TOP
             logo_element = _get_pdf_logo_element()
             if logo_element:
                 elements.append(logo_element)
@@ -7658,7 +7729,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             elements.append(Paragraph(f"<b>PROFIT & LOSS STATEMENT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
             elements.append(Spacer(1, 10))
 
-            # 2. Structured Financial Table
             data = [
                 [Paragraph("Revenue", bold_label_style), f"KSh {total_sales:,.2f}"],
                 [Paragraph("Less: Cost of Goods Sold", label_style), f"KSh {total_cogs:,.2f}"],
