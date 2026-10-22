@@ -6547,7 +6547,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
 
-            # Base Repayments, Expenses, and Stock Movements (Purchases + Adjustments In)
+            # Base Repayments, Expenses, and Stock Movements
             repayments_qs = CreditRepayment.objects.filter(
                 date__gte=start_date,
                 date__lte=end_date
@@ -6576,16 +6576,21 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 purchase_movements_qs = purchase_movements_qs.filter(branch_id=branch_id)
 
             # -----------------------------------------------------------------
-            # 1. CHANNEL INFLOWS (INCLUDING SPLIT PAYMENTS VIA SALE PAYMENT)
+            # 1. CHANNEL INFLOWS (PREVENT DOUBLE COUNTING OF SPLIT PAYMENTS)
             # -----------------------------------------------------------------
-            # A) Single-Method Transactions Totals
-            single_sales_totals = sales_qs.exclude(payment_method='SPLIT').aggregate(
+            # Find all sales that have split payments attached
+            split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
+
+            # A) Single-Method Transactions (Excludes any sale present in SalePayment table or marked SPLIT)
+            non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
+            
+            single_sales_totals = non_split_sales.aggregate(
                 cash=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
                 paybill=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
                 send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
             )
 
-            # B) Split Payment Child Entries Totals
+            # B) Split Payment Child Entries ONLY
             split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs)
             split_totals = split_payments_qs.aggregate(
                 cash=Coalesce(Sum('amount', filter=Q(method='CASH')), ZERO, output_field=DecimalField()),
@@ -6606,7 +6611,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             tot_send_money = single_sales_totals['send_money'] + split_totals['send_money'] + repayment_totals['send_money']
 
             # -----------------------------------------------------------------
-            # 2. OUTFLOWS (PURCHASES & ADJUSTMENTS IN FROM STOCKMOVEMENT + EXPENSES)
+            # 2. OUTFLOWS (PURCHASES & EXPENSES)
             # -----------------------------------------------------------------
             purchases_cost = purchase_movements_qs.aggregate(
                 total=Coalesce(
