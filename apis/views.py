@@ -5959,7 +5959,22 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             start_date = datetime(today.year, today.month, 1).date()
             end_date = datetime(today.year, today.month, last_day).date()
 
-        def _get_filter_params(self, request):
+
+
+        tz = timezone.get_current_timezone()
+        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
+        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
+
+        branch_obj = None
+        if branch_param and str(branch_param).lower() != "all":
+            try:
+                branch_obj = RetailBranch.objects.get(pk=branch_param)
+            except (RetailBranch.DoesNotExist, ValueError):
+                branch_obj = None
+
+        return branch_obj, start_date, end_date, start_dt, end_dt
+
+    def _get_filter_params(self, request):
             branch_id = request.query_params.get('branch_id')
             start_date_str = request.query_params.get('start_date')
             end_date_str = request.query_params.get('end_date')
@@ -5999,20 +6014,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 last_day = calendar.monthrange(today.year, today.month)[1]
                 end_date = date(today.year, today.month, last_day)
 
-            return branch_id, start_date, end_date    
-
-        tz = timezone.get_current_timezone()
-        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
-        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
-
-        branch_obj = None
-        if branch_param and str(branch_param).lower() != "all":
-            try:
-                branch_obj = RetailBranch.objects.get(pk=branch_param)
-            except (RetailBranch.DoesNotExist, ValueError):
-                branch_obj = None
-
-        return branch_obj, start_date, end_date, start_dt, end_dt
+            return branch_id, start_date, end_date
 
     # =========================================================================
     # DASHBOARD & FINANCIALS
