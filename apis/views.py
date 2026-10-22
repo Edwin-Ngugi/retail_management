@@ -6680,7 +6680,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "id": "SUMMARY-PURCHASES",
                     "reference": "SUM-PURCHASES",
                     "date": date_str,
-                    "description": "Total Cost of Goods Purchased & Adjustments In",
+                    "description": "Total Cost of Goods Purchased",
                     "type": "OUTFLOW",
                     "payment_method": "PURCHASE",
                     "channel": "STOCK_PURCHASE",
