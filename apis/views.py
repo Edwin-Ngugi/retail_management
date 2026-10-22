@@ -6539,13 +6539,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
             
-            # EXCLUDE CREDIT SALES AND INVOICES TO PREVENT DOUBLE COUNTING
+            # Base Querysets
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
             repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
             expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))).exclude(payment_method='CREDIT')
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -6554,7 +6554,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
 
             # -----------------------------------------------------------------
-            # 1. DATABASE AGGREGATIONS (Full Period Totals)
+            # 1. AGGREGATIONS FOR CHANNEL INFLOWS (CASH, PAYBILL, SEND_MONEY)
             # -----------------------------------------------------------------
             sales_totals = sales_qs.aggregate(
                 cash=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
@@ -6570,24 +6570,41 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()),
             )
 
-            total_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
-            total_purchases = purchases_qs.aggregate(total=Coalesce(Sum('amount_paid'), Sum('total_cost'), ZERO, output_field=DecimalField()))['total']
+            # Combined Channel Inflows
+            total_cash = sales_totals['cash'] + repayment_totals['cash']
+            total_paybill = sales_totals['paybill'] + repayment_totals['paybill']
+            total_send_money = sales_totals['send_money'] + repayment_totals['send_money']
 
-            # Summaries
-            tot_cash = sales_totals['cash'] + repayment_totals['cash']
-            tot_paybill = sales_totals['paybill'] + repayment_totals['paybill']
-            tot_send_money = sales_totals['send_money'] + repayment_totals['send_money']
-            tot_repayments = repayment_totals['total']
-
-            tot_in = sales_totals['total'] + tot_repayments
-            tot_out = total_expenses + total_purchases
+            total_inflow = sales_totals['total'] + repayment_totals['total']
 
             # -----------------------------------------------------------------
-            # 2. LEDGER RECENT ENTRIES (For display table)
+            # 2. AGGREGATIONS FOR OUTFLOWS (PURCHASES & EXPENSES)
+            # -----------------------------------------------------------------
+            # Total Cost of Goods Purchases
+            purchases_totals = purchases_qs.aggregate(
+                total=Coalesce(
+                    Sum(ExpressionWrapper(F('quantity') * F('unit_cost_price'), output_field=DecimalField(max_digits=12, decimal_places=2))),
+                    ZERO,
+                    output_field=DecimalField()
+                )
+            )
+            total_purchases_cost = purchases_totals['total']
+
+            # Total Operating Expenses
+            expenses_totals = expenses_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )
+            total_expenses = expenses_totals['total']
+
+            total_outflow = total_purchases_cost + total_expenses
+            net_position = total_inflow - total_outflow
+
+            # -----------------------------------------------------------------
+            # 3. RECENT ENTRIES (Table Display)
             # -----------------------------------------------------------------
             ledger_entries = []
 
-            for s in sales_qs.order_by('-sale_date')[:50]:
+            for s in sales_qs.order_by('-sale_date')[:30]:
                 amt = float(quantize_money(s.total_amount or ZERO))
                 if amt > 0:
                     ledger_entries.append({
@@ -6602,7 +6619,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "amount": amt
                     })
 
-            for r in repayments_qs.order_by('-created_at')[:30]:
+            for r in repayments_qs.order_by('-created_at')[:20]:
                 amt = float(quantize_money(r.amount or ZERO))
                 if amt > 0:
                     cust_name = r.customer.name if r.customer else "Customer"
@@ -6618,7 +6635,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "amount": amt
                     })
 
-            for e in expenses_qs.order_by('-date')[:30]:
+            for e in expenses_qs.order_by('-date')[:20]:
                 amt = float(quantize_money(e.amount or ZERO))
                 if amt > 0:
                     ledger_entries.append({
@@ -6633,8 +6650,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "amount": amt
                     })
 
-            for p in purchases_qs.order_by('-purchase_date')[:30]:
-                amt = float(quantize_money(p.amount_paid or p.total_cost or ZERO))
+            for p in purchases_qs.order_by('-purchase_date')[:20]:
+                amt = float(quantize_money(p.total_cost))
                 if amt > 0:
                     item_name = p.item.name if p.item else "Stock"
                     ledger_entries.append({
@@ -6651,15 +6668,16 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             return Response({
                 "summary": {
-                    "total_inflow": float(quantize_money(tot_in)),
-                    "total_outflow": float(quantize_money(tot_out)),
-                    "net_cash_flow": float(quantize_money(tot_in - tot_out)),
+                    "total_inflows": float(quantize_money(total_inflow)),
+                    "total_outflows": float(quantize_money(total_outflow)),
+                    "net_position": float(quantize_money(net_position)),
                 },
-                "channel_totals": {
-                    "cash": float(quantize_money(tot_cash)),
-                    "paybill": float(quantize_money(tot_paybill)),
-                    "send_money": float(quantize_money(tot_send_money)),
-                    "credit_repayments": float(quantize_money(tot_repayments)),
+                "breakdown": {
+                    "total_cash": float(quantize_money(total_cash)),
+                    "total_paybill": float(quantize_money(total_paybill)),
+                    "total_send_money": float(quantize_money(total_send_money)),
+                    "total_goods_purchases": float(quantize_money(total_purchases_cost)),
+                    "total_expenses": float(quantize_money(total_expenses)),
                 },
                 "count": len(ledger_entries),
                 "results": ledger_entries,
@@ -6669,8 +6687,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         except Exception as e:
             logger.exception("Cash Book Error")
             return Response({
-                "summary": {"total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0},
-                "channel_totals": {"cash": 0.0, "paybill": 0.0, "send_money": 0.0, "credit_repayments": 0.0},
+                "summary": {"total_inflows": 0.0, "total_outflows": 0.0, "net_position": 0.0},
+                "breakdown": {
+                    "total_cash": 0.0,
+                    "total_paybill": 0.0,
+                    "total_send_money": 0.0,
+                    "total_goods_purchases": 0.0,
+                    "total_expenses": 0.0
+                },
                 "entries": []
             }, status=status.HTTP_200_OK)
 
