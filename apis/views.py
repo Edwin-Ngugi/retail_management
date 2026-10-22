@@ -6533,169 +6533,181 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             }, status=status.HTTP_200_OK)
         except Exception:
             return Response({"summary": {"total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0}, "entries": []}, status=status.HTTP_200_OK)
-
+                      
     @action(detail=False, methods=['get'], url_path='cash-book')
     def cash_book(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            
-            # Base Querysets
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
+            branch_id, start_date, end_date = self._get_filter_params(request)
+
+            # Base Querysets with accurate DateField / DateTimeField filters
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date
+            ).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
-            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
 
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
+            repayments_qs = CreditRepayment.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date
+            )
+
+            expenses_qs = Expense.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date
+            )
+
+            purchases_qs = Purchase.objects.filter(
+                purchase_date__date__gte=start_date,
+                purchase_date__date__lte=end_date
+            )
+
+            # Branch Filtering
+            if branch_id and str(branch_id).lower() != 'all':
+                sales_qs = sales_qs.filter(branch_id=branch_id)
+                repayments_qs = repayments_qs.filter(
+                    Q(branch_id=branch_id) | Q(transaction__branch_id=branch_id)
+                )
+                expenses_qs = expenses_qs.filter(branch_id=branch_id)
+                purchases_qs = purchases_qs.filter(branch_id=branch_id)
 
             # -----------------------------------------------------------------
-            # 1. AGGREGATIONS FOR CHANNEL INFLOWS (CASH, PAYBILL, SEND_MONEY)
+            # 1. SQL AGGREGATIONS FOR THE 5 SUMMARY BREAKDOWNS
             # -----------------------------------------------------------------
             sales_totals = sales_qs.aggregate(
                 cash=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
                 paybill=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
                 send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
-                total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField()),
             )
 
             repayment_totals = repayments_qs.aggregate(
                 cash=Coalesce(Sum('amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
                 paybill=Coalesce(Sum('amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
                 send_money=Coalesce(Sum('amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()),
             )
 
-            # Combined Channel Inflows
-            total_cash = sales_totals['cash'] + repayment_totals['cash']
-            total_paybill = sales_totals['paybill'] + repayment_totals['paybill']
-            total_send_money = sales_totals['send_money'] + repayment_totals['send_money']
-
-            total_inflow = sales_totals['total'] + repayment_totals['total']
-
-            # -----------------------------------------------------------------
-            # 2. AGGREGATIONS FOR OUTFLOWS (PURCHASES & EXPENSES)
-            # -----------------------------------------------------------------
-            # Total Cost of Goods Purchases
             purchases_totals = purchases_qs.aggregate(
                 total=Coalesce(
-                    Sum(ExpressionWrapper(F('quantity') * F('unit_cost_price'), output_field=DecimalField(max_digits=12, decimal_places=2))),
+                    Sum(
+                        ExpressionWrapper(
+                            F('quantity') * F('unit_cost_price'),
+                            output_field=DecimalField(max_digits=12, decimal_places=2)
+                        )
+                    ),
                     ZERO,
                     output_field=DecimalField()
                 )
             )
-            total_purchases_cost = purchases_totals['total']
 
-            # Total Operating Expenses
             expenses_totals = expenses_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )
-            total_expenses = expenses_totals['total']
 
-            total_outflow = total_purchases_cost + total_expenses
-            net_position = total_inflow - total_outflow
+            # Combine Totals
+            tot_cash = sales_totals['cash'] + repayment_totals['cash']
+            tot_paybill = sales_totals['paybill'] + repayment_totals['paybill']
+            tot_send_money = sales_totals['send_money'] + repayment_totals['send_money']
+            tot_purchases = purchases_totals['total']
+            tot_expenses = expenses_totals['total']
+
+            tot_inflow = tot_cash + tot_paybill + tot_send_money
+            tot_outflow = tot_purchases + tot_expenses
+            net_position = tot_inflow - tot_outflow
+
+            date_str = str(end_date)
 
             # -----------------------------------------------------------------
-            # 3. RECENT ENTRIES (Table Display)
+            # 2. EXACT 5 SUMMARY LEDGER ROWS
             # -----------------------------------------------------------------
-            ledger_entries = []
-
-            for s in sales_qs.order_by('-sale_date')[:30]:
-                amt = float(quantize_money(s.total_amount or ZERO))
-                if amt > 0:
-                    ledger_entries.append({
-                        "id": f"SALE-{s.id}",
-                        "date": s.sale_date.strftime('%Y-%m-%d %H:%M') if hasattr(s.sale_date, 'strftime') else str(s.sale_date)[:16],
-                        "reference": s.receipt_number or f"REC-{s.id}",
-                        "description": f"Sale - {s.customer_name or 'Walk-in'}",
-                        "type": "INFLOW",
-                        "payment_method": self._normalize_payment_method(s.payment_method),
-                        "inflow": amt,
-                        "outflow": 0.0,
-                        "amount": amt
-                    })
-
-            for r in repayments_qs.order_by('-created_at')[:20]:
-                amt = float(quantize_money(r.amount or ZERO))
-                if amt > 0:
-                    cust_name = r.customer.name if r.customer else "Customer"
-                    ledger_entries.append({
-                        "id": f"REPAY-{r.id}",
-                        "date": r.created_at.strftime('%Y-%m-%d %H:%M') if hasattr(r.created_at, 'strftime') else str(r.date)[:10],
-                        "reference": f"REPAY-{r.id}",
-                        "description": f"Credit Repayment - {cust_name}",
-                        "type": "INFLOW",
-                        "payment_method": self._normalize_payment_method(r.payment_method),
-                        "inflow": amt,
-                        "outflow": 0.0,
-                        "amount": amt
-                    })
-
-            for e in expenses_qs.order_by('-date')[:20]:
-                amt = float(quantize_money(e.amount or ZERO))
-                if amt > 0:
-                    ledger_entries.append({
-                        "id": f"EXP-{e.id}",
-                        "date": e.date.strftime('%Y-%m-%d') if hasattr(e.date, 'strftime') else str(e.date)[:10],
-                        "reference": f"EXP-{e.id}",
-                        "description": e.description or "Operating Expense",
-                        "type": "OUTFLOW",
-                        "payment_method": "CASH",
-                        "inflow": 0.0,
-                        "outflow": amt,
-                        "amount": amt
-                    })
-
-            for p in purchases_qs.order_by('-purchase_date')[:20]:
-                amt = float(quantize_money(p.total_cost))
-                if amt > 0:
-                    item_name = p.item.name if p.item else "Stock"
-                    ledger_entries.append({
-                        "id": f"PURCH-{p.id}",
-                        "date": p.purchase_date.strftime('%Y-%m-%d') if hasattr(p.purchase_date, 'strftime') else str(p.purchase_date)[:10],
-                        "reference": f"PO-{p.id}",
-                        "description": f"Purchase - {item_name}",
-                        "type": "OUTFLOW",
-                        "payment_method": self._normalize_payment_method(p.payment_method),
-                        "inflow": 0.0,
-                        "outflow": amt,
-                        "amount": amt
-                    })
+            summary_entries = [
+                {
+                    "id": "SUMMARY-CASH",
+                    "reference": "SUM-CASH",
+                    "date": date_str,
+                    "description": "Total Cash Collections & Repayments",
+                    "type": "INFLOW",
+                    "payment_method": "CASH",
+                    "channel": "CASH",
+                    "inflow": float(quantize_money(tot_cash)),
+                    "outflow": 0.0,
+                    "amount": float(quantize_money(tot_cash))
+                },
+                {
+                    "id": "SUMMARY-PAYBILL",
+                    "reference": "SUM-PAYBILL",
+                    "date": date_str,
+                    "description": "Total Paybill Collections",
+                    "type": "INFLOW",
+                    "payment_method": "PAYBILL",
+                    "channel": "PAYBILL",
+                    "inflow": float(quantize_money(tot_paybill)),
+                    "outflow": 0.0,
+                    "amount": float(quantize_money(tot_paybill))
+                },
+                {
+                    "id": "SUMMARY-SENDMONEY",
+                    "reference": "SUM-SENDMONEY",
+                    "date": date_str,
+                    "description": "Total Send Money / M-Pesa Collections",
+                    "type": "INFLOW",
+                    "payment_method": "SEND_MONEY",
+                    "channel": "SEND_MONEY",
+                    "inflow": float(quantize_money(tot_send_money)),
+                    "outflow": 0.0,
+                    "amount": float(quantize_money(tot_send_money))
+                },
+                {
+                    "id": "SUMMARY-PURCHASES",
+                    "reference": "SUM-PURCHASES",
+                    "date": date_str,
+                    "description": "Total Cost of Goods Purchased",
+                    "type": "OUTFLOW",
+                    "payment_method": "PURCHASE",
+                    "channel": "STOCK_PURCHASE",
+                    "inflow": 0.0,
+                    "outflow": float(quantize_money(tot_purchases)),
+                    "amount": float(quantize_money(tot_purchases))
+                },
+                {
+                    "id": "SUMMARY-EXPENSES",
+                    "reference": "SUM-EXPENSES",
+                    "date": date_str,
+                    "description": "Total Operating Expenses",
+                    "type": "OUTFLOW",
+                    "payment_method": "EXPENSE",
+                    "channel": "EXPENSE",
+                    "inflow": 0.0,
+                    "outflow": float(quantize_money(tot_expenses)),
+                    "amount": float(quantize_money(tot_expenses))
+                }
+            ]
 
             return Response({
                 "summary": {
-                    "total_inflows": float(quantize_money(total_inflow)),
-                    "total_outflows": float(quantize_money(total_outflow)),
+                    "total_inflows": float(quantize_money(tot_inflow)),
+                    "total_outflows": float(quantize_money(tot_outflow)),
                     "net_position": float(quantize_money(net_position)),
+                    "total_inflow": float(quantize_money(tot_inflow)),
+                    "total_outflow": float(quantize_money(tot_outflow)),
+                    "net_cash_flow": float(quantize_money(net_position)),
                 },
-                "breakdown": {
-                    "total_cash": float(quantize_money(total_cash)),
-                    "total_paybill": float(quantize_money(total_paybill)),
-                    "total_send_money": float(quantize_money(total_send_money)),
-                    "total_goods_purchases": float(quantize_money(total_purchases_cost)),
-                    "total_expenses": float(quantize_money(total_expenses)),
-                },
-                "count": len(ledger_entries),
-                "results": ledger_entries,
-                "entries": ledger_entries
+                "count": len(summary_entries),
+                "results": summary_entries,
+                "entries": summary_entries,
+                "records": summary_entries
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
-            logger.exception("Cash Book Error")
+            logger.exception("Cash Book Aggregation Error")
             return Response({
-                "summary": {"total_inflows": 0.0, "total_outflows": 0.0, "net_position": 0.0},
-                "breakdown": {
-                    "total_cash": 0.0,
-                    "total_paybill": 0.0,
-                    "total_send_money": 0.0,
-                    "total_goods_purchases": 0.0,
-                    "total_expenses": 0.0
+                "summary": {
+                    "total_inflows": 0.0, "total_outflows": 0.0, "net_position": 0.0,
+                    "total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0
                 },
-                "entries": []
+                "count": 0,
+                "results": [],
+                "entries": [],
+                "records": []
             }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='inventory-overview')
