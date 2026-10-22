@@ -6539,7 +6539,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_id, start_date, end_date = self._get_filter_params(request)
 
-            # Base Querysets with accurate DateField / DateTimeField filters
+            # Base Sales QuerySet (excluding Credit / Invoice sales)
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__date__gte=start_date,
                 sale_date__date__lte=end_date
@@ -6547,6 +6547,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
 
+            # Base Repayments, Expenses, and Stock Movements (Purchases + Adjustments In)
             repayments_qs = CreditRepayment.objects.filter(
                 date__gte=start_date,
                 date__lte=end_date
@@ -6557,36 +6558,57 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 date__lte=end_date
             )
 
-            purchases_qs = Purchase.objects.filter(
-                purchase_date__date__gte=start_date,
-                purchase_date__date__lte=end_date
+            purchase_movements_qs = StockMovement.objects.filter(
+                movement_type__in=[
+                    StockMovement.MovementType.PURCHASE,
+                    StockMovement.MovementType.ADJUSTMENT_IN,
+                ],
+                date__gte=start_date,
+                date__lte=end_date
             )
 
-            # Branch Filtering
             if branch_id and str(branch_id).lower() != 'all':
                 sales_qs = sales_qs.filter(branch_id=branch_id)
                 repayments_qs = repayments_qs.filter(
                     Q(branch_id=branch_id) | Q(transaction__branch_id=branch_id)
                 )
                 expenses_qs = expenses_qs.filter(branch_id=branch_id)
-                purchases_qs = purchases_qs.filter(branch_id=branch_id)
+                purchase_movements_qs = purchase_movements_qs.filter(branch_id=branch_id)
 
             # -----------------------------------------------------------------
-            # 1. SQL AGGREGATIONS FOR THE 5 SUMMARY BREAKDOWNS
+            # 1. CHANNEL INFLOWS (INCLUDING SPLIT PAYMENTS VIA SALE PAYMENT)
             # -----------------------------------------------------------------
-            sales_totals = sales_qs.aggregate(
+            # A) Single-Method Transactions Totals
+            single_sales_totals = sales_qs.exclude(payment_method='SPLIT').aggregate(
                 cash=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
                 paybill=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
                 send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
             )
 
+            # B) Split Payment Child Entries Totals
+            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs)
+            split_totals = split_payments_qs.aggregate(
+                cash=Coalesce(Sum('amount', filter=Q(method='CASH')), ZERO, output_field=DecimalField()),
+                paybill=Coalesce(Sum('amount', filter=Q(method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('amount', filter=Q(method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+            )
+
+            # C) Credit Repayments Totals
             repayment_totals = repayments_qs.aggregate(
                 cash=Coalesce(Sum('amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
                 paybill=Coalesce(Sum('amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
                 send_money=Coalesce(Sum('amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
             )
 
-            purchases_totals = purchases_qs.aggregate(
+            # Consolidated Channel Sums
+            tot_cash = single_sales_totals['cash'] + split_totals['cash'] + repayment_totals['cash']
+            tot_paybill = single_sales_totals['paybill'] + split_totals['paybill'] + repayment_totals['paybill']
+            tot_send_money = single_sales_totals['send_money'] + split_totals['send_money'] + repayment_totals['send_money']
+
+            # -----------------------------------------------------------------
+            # 2. OUTFLOWS (PURCHASES & ADJUSTMENTS IN FROM STOCKMOVEMENT + EXPENSES)
+            # -----------------------------------------------------------------
+            purchases_cost = purchase_movements_qs.aggregate(
                 total=Coalesce(
                     Sum(
                         ExpressionWrapper(
@@ -6597,27 +6619,20 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     ZERO,
                     output_field=DecimalField()
                 )
-            )
+            )['total']
 
-            expenses_totals = expenses_qs.aggregate(
+            expenses_total = expenses_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )
-
-            # Combine Totals
-            tot_cash = sales_totals['cash'] + repayment_totals['cash']
-            tot_paybill = sales_totals['paybill'] + repayment_totals['paybill']
-            tot_send_money = sales_totals['send_money'] + repayment_totals['send_money']
-            tot_purchases = purchases_totals['total']
-            tot_expenses = expenses_totals['total']
+            )['total']
 
             tot_inflow = tot_cash + tot_paybill + tot_send_money
-            tot_outflow = tot_purchases + tot_expenses
+            tot_outflow = purchases_cost + expenses_total
             net_position = tot_inflow - tot_outflow
 
             date_str = str(end_date)
 
             # -----------------------------------------------------------------
-            # 2. EXACT 5 SUMMARY LEDGER ROWS
+            # 3. 5 LEDGER SUMMARY ROWS
             # -----------------------------------------------------------------
             summary_entries = [
                 {
@@ -6660,13 +6675,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "id": "SUMMARY-PURCHASES",
                     "reference": "SUM-PURCHASES",
                     "date": date_str,
-                    "description": "Total Cost of Goods Purchased",
+                    "description": "Total Cost of Goods Purchased & Adjustments In",
                     "type": "OUTFLOW",
                     "payment_method": "PURCHASE",
                     "channel": "STOCK_PURCHASE",
                     "inflow": 0.0,
-                    "outflow": float(quantize_money(tot_purchases)),
-                    "amount": float(quantize_money(tot_purchases))
+                    "outflow": float(quantize_money(purchases_cost)),
+                    "amount": float(quantize_money(purchases_cost))
                 },
                 {
                     "id": "SUMMARY-EXPENSES",
@@ -6677,8 +6692,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "payment_method": "EXPENSE",
                     "channel": "EXPENSE",
                     "inflow": 0.0,
-                    "outflow": float(quantize_money(tot_expenses)),
-                    "amount": float(quantize_money(tot_expenses))
+                    "outflow": float(quantize_money(expenses_total)),
+                    "amount": float(quantize_money(expenses_total))
                 }
             ]
 
