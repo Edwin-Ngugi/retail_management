@@ -6539,7 +6539,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
             
-            # EXCLUDE CREDIT SALES AND INVOICES (e.g. INV 1_1) TO PREVENT DOUBLE COUNTING
+            # EXCLUDE CREDIT SALES AND INVOICES TO PREVENT DOUBLE COUNTING
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
@@ -6553,15 +6553,43 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
 
-            ledger_entries = []
-            tot_in = ZERO
-            tot_out = ZERO
+            # -----------------------------------------------------------------
+            # 1. DATABASE AGGREGATIONS (Full Period Totals)
+            # -----------------------------------------------------------------
+            sales_totals = sales_qs.aggregate(
+                cash=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
+                paybill=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+                total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField()),
+            )
 
-            # Inflow: Realized Sales Only
+            repayment_totals = repayments_qs.aggregate(
+                cash=Coalesce(Sum('amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
+                paybill=Coalesce(Sum('amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()),
+            )
+
+            total_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
+            total_purchases = purchases_qs.aggregate(total=Coalesce(Sum('amount_paid'), Sum('total_cost'), ZERO, output_field=DecimalField()))['total']
+
+            # Summaries
+            tot_cash = sales_totals['cash'] + repayment_totals['cash']
+            tot_paybill = sales_totals['paybill'] + repayment_totals['paybill']
+            tot_send_money = sales_totals['send_money'] + repayment_totals['send_money']
+            tot_repayments = repayment_totals['total']
+
+            tot_in = sales_totals['total'] + tot_repayments
+            tot_out = total_expenses + total_purchases
+
+            # -----------------------------------------------------------------
+            # 2. LEDGER RECENT ENTRIES (For display table)
+            # -----------------------------------------------------------------
+            ledger_entries = []
+
             for s in sales_qs.order_by('-sale_date')[:50]:
                 amt = float(quantize_money(s.total_amount or ZERO))
                 if amt > 0:
-                    tot_in += Decimal(str(amt))
                     ledger_entries.append({
                         "id": f"SALE-{s.id}",
                         "date": s.sale_date.strftime('%Y-%m-%d %H:%M') if hasattr(s.sale_date, 'strftime') else str(s.sale_date)[:16],
@@ -6574,11 +6602,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "amount": amt
                     })
 
-            # Inflow: Credit Repayments (e.g. REPAY-8)
             for r in repayments_qs.order_by('-created_at')[:30]:
                 amt = float(quantize_money(r.amount or ZERO))
                 if amt > 0:
-                    tot_in += Decimal(str(amt))
                     cust_name = r.customer.name if r.customer else "Customer"
                     ledger_entries.append({
                         "id": f"REPAY-{r.id}",
@@ -6592,11 +6618,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "amount": amt
                     })
 
-            # Outflow: Operating Expenses
             for e in expenses_qs.order_by('-date')[:30]:
                 amt = float(quantize_money(e.amount or ZERO))
                 if amt > 0:
-                    tot_out += Decimal(str(amt))
                     ledger_entries.append({
                         "id": f"EXP-{e.id}",
                         "date": e.date.strftime('%Y-%m-%d') if hasattr(e.date, 'strftime') else str(e.date)[:10],
@@ -6609,11 +6633,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "amount": amt
                     })
 
-            # Outflow: Purchases
             for p in purchases_qs.order_by('-purchase_date')[:30]:
                 amt = float(quantize_money(p.amount_paid or p.total_cost or ZERO))
                 if amt > 0:
-                    tot_out += Decimal(str(amt))
                     item_name = p.item.name if p.item else "Stock"
                     ledger_entries.append({
                         "id": f"PURCH-{p.id}",
@@ -6633,6 +6655,12 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "total_outflow": float(quantize_money(tot_out)),
                     "net_cash_flow": float(quantize_money(tot_in - tot_out)),
                 },
+                "channel_totals": {
+                    "cash": float(quantize_money(tot_cash)),
+                    "paybill": float(quantize_money(tot_paybill)),
+                    "send_money": float(quantize_money(tot_send_money)),
+                    "credit_repayments": float(quantize_money(tot_repayments)),
+                },
                 "count": len(ledger_entries),
                 "results": ledger_entries,
                 "entries": ledger_entries
@@ -6642,6 +6670,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             logger.exception("Cash Book Error")
             return Response({
                 "summary": {"total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0},
+                "channel_totals": {"cash": 0.0, "paybill": 0.0, "send_money": 0.0, "credit_repayments": 0.0},
                 "entries": []
             }, status=status.HTTP_200_OK)
 
