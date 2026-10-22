@@ -7290,25 +7290,69 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-            items_qs = SaleItem.objects.filter(transaction__sale_date__range=(start_dt, end_dt))
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            # -----------------------------------------------------------------
+            # 1. CASH-BASIS REVENUE AGGREGATION
+            # -----------------------------------------------------------------
+            # A) Non-credit sales (exclude full credit sales & invoices)
+            cash_sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
+                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+            )
+
+            # B) Credit Repayments collected in this period
+            repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
 
             if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
+                cash_sales_qs = cash_sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+                )
+
+            # Single-method cash sales total
+            single_sales_revenue = cash_sales_qs.exclude(payment_method='SPLIT').aggregate(
+                total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
+            )['total']
+
+            # Split payments non-credit amounts
+            split_payments_revenue = SalePayment.objects.filter(
+                transaction__in=cash_sales_qs
+            ).exclude(method='CREDIT').aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
+
+            # Collected credit repayments
+            repayments_revenue = repayments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
+
+            revenue = single_sales_revenue + split_payments_revenue + repayments_revenue
+
+            # -----------------------------------------------------------------
+            # 2. COST OF GOODS SOLD & OPERATING EXPENSES
+            # -----------------------------------------------------------------
+            items_qs = SaleItem.objects.filter(
+                transaction__sale_date__range=(start_dt, end_dt)
+            ).exclude(
+                Q(transaction__payment_method='CREDIT') | Q(transaction__receipt_number__startswith='INV')
+            )
+
+            expenses_qs = Expense.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+
+            if branch_obj:
                 items_qs = items_qs.filter(transaction__branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
-
-            revenue = sales_qs.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
 
             cogs_expr = ExpressionWrapper(
                 F('quantity_sold') * F('unit_cost_price'),
                 output_field=DecimalField(max_digits=12, decimal_places=2)
             )
-            cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO))['total']
+            cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO, output_field=DecimalField()))['total']
 
             gross_profit = revenue - cogs
-            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
             operating_profit = gross_profit - operating_expenses
 
             finance_costs_and_tax = ZERO
@@ -7324,9 +7368,17 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "finance_costs_and_tax": float(quantize_money(finance_costs_and_tax)),
                 "net_profit": float(quantize_money(net_profit)),
             }, status=status.HTTP_200_OK)
+
         except Exception:
             logger.exception("Profit Report Error")
-            return Response({"revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0, "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0}, status=status.HTTP_200_OK)
+            return Response({
+                "revenue": 0.0,
+                "cogs": 0.0,
+                "gross_profit": 0.0,
+                "operating_expenses": 0.0,
+                "operating_profit": 0.0,
+                "net_profit": 0.0
+            }, status=status.HTTP_200_OK)
 
     # =========================================================================
     # 2. CASH FLOW REPORT (/management-reports/cash-flow/)
