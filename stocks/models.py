@@ -397,8 +397,12 @@ class BranchItemPricing(models.Model):
 
         movements = movements.order_by("created_at", "id")
 
-        inbound_types = {
+        purchase_types = {
+            StockMovement.MovementType.OPENING_STOCK,
             StockMovement.MovementType.PURCHASE,
+        }
+
+        inbound_qty_adjustments = {
             StockMovement.MovementType.CUSTOMER_RETURN,
             StockMovement.MovementType.TRANSFER_IN,
             StockMovement.MovementType.ADJUSTMENT_IN,
@@ -419,7 +423,7 @@ class BranchItemPricing(models.Model):
 
             movement_type = movement.movement_type
 
-            if movement_type in inbound_types:
+            if movement_type in purchase_types:
                 movement_cost = (
                     Decimal(str(movement.unit_cost_price))
                     if movement.unit_cost_price is not None
@@ -436,6 +440,11 @@ class BranchItemPricing(models.Model):
                 else:
                     current_value += quantity * movement_cost
                     current_qty += quantity
+                    last_known_cost = current_value / current_qty
+
+            elif movement_type in inbound_qty_adjustments:
+                current_qty += quantity
+                if current_qty > ZERO:
                     last_known_cost = current_value / current_qty
 
             elif movement_type in outbound_types:
@@ -2523,10 +2532,6 @@ class Expense(models.Model):
         return f"{self.description} - KSh {self.amount} ({branch_name})"
 
 
-import uuid
-from django.db import models
-from django.conf import settings
-
 class PendingApproval(models.Model):
     class RequestType(models.TextChoices):
         SALE_ENTRY = "SALE_ENTRY", "Sale Entry"
@@ -2754,14 +2759,20 @@ def recalculate_wac_sales_cost(branch, item):
     total_value = opening_qty * opening_cost
     last_known_cost = opening_cost
 
-    inbound_types = {
+    # PURCHASES ONLY (Adds new purchase value and recalculates WAC)
+    purchase_types = {
         StockMovement.MovementType.OPENING_STOCK,
         StockMovement.MovementType.PURCHASE,
+    }
+
+    # INBOUND ADJUSTMENTS / TRANSFERS (Recalculates WAC across new total quantity without adding new purchase value)
+    inbound_qty_adjustments = {
         StockMovement.MovementType.CUSTOMER_RETURN,
         StockMovement.MovementType.TRANSFER_IN,
         StockMovement.MovementType.ADJUSTMENT_IN,
     }
 
+    # OUTBOUND MOVEMENTS
     outbound_types = {
         StockMovement.MovementType.SALE,
         StockMovement.MovementType.SUPPLIER_RETURN,
@@ -2792,7 +2803,7 @@ def recalculate_wac_sales_cost(branch, item):
         if quantity <= ZERO:
             continue
 
-        if movement.movement_type in inbound_types:
+        if movement.movement_type in purchase_types:
             movement_cost = movement.unit_cost_price or ZERO
             movement_cost = Decimal(str(movement_cost))
             if movement_cost <= ZERO:
@@ -2805,6 +2816,12 @@ def recalculate_wac_sales_cost(branch, item):
             else:
                 total_value += quantity * movement_cost
                 total_qty += quantity
+                last_known_cost = total_value / total_qty
+
+        elif movement.movement_type in inbound_qty_adjustments:
+            # Increase quantity and recalculate WAC rate using current total_value
+            total_qty += quantity
+            if total_qty > ZERO:
                 last_known_cost = total_value / total_qty
 
         elif movement.movement_type in outbound_types:
