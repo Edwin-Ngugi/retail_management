@@ -1248,7 +1248,7 @@ class Purchase(models.Model):
         related_name="purchases_created",
     )
 
-    created_at = models.DateTimeField(auto_auto_now_add=True) if hasattr(models.DateTimeField, "auto_auto_now_add") else models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(default=timezone.now, verbose_name="Payment Date / Created At")
 
     @property
     def total_cost(self):
