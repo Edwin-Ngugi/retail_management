@@ -6024,27 +6024,33 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # Query base objects
+            # -----------------------------------------------------------------
+            # 1. BASE QUERYSETS
+            # -----------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
             
-            # Purchase querysets (StockMovement + Purchase model)
-            purchases_mov_qs = StockMovement.objects.filter(
-                movement_type=StockMovement.MovementType.PURCHASE
-            ).filter(
+            # Pure Operating Expenses (Exclude Supplier Repayments)
+            expenses_qs = Expense.objects.filter(
                 Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            purchases_model_qs = Purchase.objects.filter(
+            ).exclude(description__icontains='Supplier Repayment')
+            
+            purchases_qs = Purchase.objects.filter(
                 Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            
+            supplier_payments_qs = SupplierPayment.objects.filter(
+                created_at__range=(start_dt, end_dt)
             )
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
-                purchases_mov_qs = purchases_mov_qs.filter(branch=branch_obj)
-                purchases_model_qs = purchases_model_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
 
-            # 1. Financial Performance
+            # -----------------------------------------------------------------
+            # 2. FINANCIAL PERFORMANCE & OPEX
+            # -----------------------------------------------------------------
             total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
             cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
             operating_expenses = sum((quantize_money(e.amount or ZERO) for e in expenses_qs), ZERO)
@@ -6052,7 +6058,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             gross_profit = total_sales - cogs
             net_profit = gross_profit - operating_expenses
 
-            # 2. Inventory & SKUs Metrics
+            # -----------------------------------------------------------------
+            # 3. INVENTORY & SKUS METRICS
+            # -----------------------------------------------------------------
             pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
             if branch_obj:
                 pricings_qs = pricings_qs.filter(branch=branch_obj)
@@ -6073,16 +6081,32 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             active_skus = Item.objects.filter(branch_pricings__in=pricings_qs).distinct().count() if branch_obj else Item.objects.count()
 
-            # 3. Purchases Calculation (Combines movements & model purchases without double counting)
-            purchases_mov_sum = sum((quantize_money(m.quantity * (m.unit_cost_price or ZERO)) for m in purchases_mov_qs), ZERO)
-            purchases_model_sum = sum((quantize_money(p.total_cost or ZERO) for p in purchases_model_qs), ZERO)
-            
-            purchases_total = max(purchases_mov_sum, purchases_model_sum)
+            # -----------------------------------------------------------------
+            # 4. PURCHASES & SUPPLIER CASH OUTFLOW (NO DOUBLE COUNTING)
+            # -----------------------------------------------------------------
+            # Direct cash/mobile purchases that do NOT have a SupplierPayment entry
+            direct_purchases = purchases_qs.exclude(
+                payment_method='CREDIT'
+            ).filter(
+                supplier_payments__isnull=True
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
 
-            # 4. Cash Position
-            available_funds = total_sales - operating_expenses - purchases_total
+            # Actual settlements made against supplier accounts
+            supplier_repayments = supplier_payments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO)
+            )['total']
 
-            # 5. Trajectory Graph
+            # True total supplier/inventory cash spent in this period
+            purchases_total = direct_purchases + supplier_repayments
+
+            # -----------------------------------------------------------------
+            # 5. CASH POSITION
+            # -----------------------------------------------------------------
+            available_funds = max(ZERO, total_sales - operating_expenses - purchases_total)
+
+            # -----------------------------------------------------------------
+            # 6. TRAJECTORY GRAPH DATA
+            # -----------------------------------------------------------------
             trajectory_data = []
             current_day = start_date
             while current_day <= end_date:
@@ -7507,13 +7531,23 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV'))
-            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            # -----------------------------------------------------------------
+            # BASE QUERYSETS
+            # -----------------------------------------------------------------
+            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
+                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+            )
+            repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            purchases_qs = Purchase.objects.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            supplier_payments_qs = SupplierPayment.objects.filter(
+                created_at__range=(start_dt, end_dt)
+            )
             
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
-            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
-            
-            # Exclude supplier repayment entries from operating expenses to prevent double counting
+            # Pure expenses excluding supplier repayments
             expenses_qs = Expense.objects.filter(
                 Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
             ).exclude(description__icontains='Supplier Repayment')
@@ -7525,7 +7559,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-            # 1. Customer Receipts
+            # -----------------------------------------------------------------
+            # 1. OPERATING ACTIVITIES
+            # -----------------------------------------------------------------
             realized_sales_cash = ZERO
             for s in sales_qs:
                 if not getattr(s, 'is_invoice', False):
@@ -7535,38 +7571,59 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             customer_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             customer_receipts = realized_sales_cash + customer_repayments
 
-            # 2. Supplier Outflows (Exclude direct purchases that already have a SupplierPayment record)
-            direct_purchases_without_payments = purchases_qs.exclude(
+            # Supplier Outflows (Direct Cash Purchases + Supplier Repayments)
+            direct_purchases = purchases_qs.exclude(
                 payment_method='CREDIT'
             ).filter(
                 supplier_payments__isnull=True
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
 
             actual_supplier_payments = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            
-            # Pure total cash paid to suppliers/restocks
-            total_supplier_cash_outflow = direct_purchases_without_payments + actual_supplier_payments
+            supplier_payments = direct_purchases + actual_supplier_payments
 
-            # 3. Operating Expenses & Wages (Strictly OpEx)
-            operating_expenses = expenses_qs.exclude(
-                Q(description__icontains='salary') | Q(description__icontains='wage')
-            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            # Filter non-opex items out of OpEx calculation
+            non_opex_filter = Q(description__icontains='salary') | Q(description__icontains='wage') | \
+                             Q(description__icontains='equipment') | Q(description__icontains='asset') | \
+                             Q(description__icontains='loan') | Q(description__icontains='drawing') | \
+                             Q(description__icontains='capital')
+
+            operating_expenses = expenses_qs.exclude(non_opex_filter).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
             salaries_and_wages = expenses_qs.filter(
                 Q(description__icontains='salary') | Q(description__icontains='wage')
             ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
-            net_operating_cash = customer_receipts - total_supplier_cash_outflow - operating_expenses - salaries_and_wages
+            net_operating_cash = customer_receipts - supplier_payments - operating_expenses - salaries_and_wages
 
-            # 4. Investing & Financing
-            equipment_purchased = ZERO
+            # -----------------------------------------------------------------
+            # 2. INVESTING ACTIVITIES (Calculates or defaults to 0.0)
+            # -----------------------------------------------------------------
+            equipment_purchased = expenses_qs.filter(
+                Q(description__icontains='equipment') | Q(description__icontains='asset') | Q(description__icontains='machinery')
+            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
             net_investing_cash = -equipment_purchased
 
-            capital_loan_received = ZERO
-            loan_repayment = ZERO
-            drawings = ZERO
-            net_financing_cash = capital_loan_received - loan_repayment - drawings
+            # -----------------------------------------------------------------
+            # 3. FINANCING ACTIVITIES (Calculates or defaults to 0.0)
+            # -----------------------------------------------------------------
+            capital_plus_loan_received = expenses_qs.filter(
+                Q(description__icontains='capital') | Q(description__icontains='loan received')
+            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
+            loan_repayment = expenses_qs.filter(
+                description__icontains='loan repayment'
+            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            drawings = expenses_qs.filter(
+                Q(description__icontains='drawing') | Q(description__icontains='drawings')
+            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            net_financing_cash = capital_plus_loan_received - loan_repayment - drawings
+
+            # -----------------------------------------------------------------
+            # 4. CASH SUMMARY
+            # -----------------------------------------------------------------
             net_increase_in_cash = net_operating_cash + net_investing_cash + net_financing_cash
             opening_cash = ZERO
             closing_cash = opening_cash + net_increase_in_cash
@@ -7575,7 +7632,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "period": start_date.strftime('%B %Y'),
                 "operating_activities": {
                     "customer_receipts": float(quantize_money(customer_receipts)),
-                    "supplier_payments": float(quantize_money(total_supplier_cash_outflow)),
+                    "supplier_payments": float(quantize_money(supplier_payments)),
                     "operating_expenses": float(quantize_money(operating_expenses)),
                     "salaries_and_wages": float(quantize_money(salaries_and_wages)),
                     "net_operating_cash": float(quantize_money(net_operating_cash)),
@@ -7585,7 +7642,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "net_investing_cash": float(quantize_money(net_investing_cash)),
                 },
                 "financing_activities": {
-                    "capital_loan_received": float(quantize_money(capital_loan_received)),
+                    "capital_plus_loan_received": float(quantize_money(capital_plus_loan_received)),
                     "loan_repayment": float(quantize_money(loan_repayment)),
                     "drawings": float(quantize_money(drawings)),
                     "net_financing_cash": float(quantize_money(net_financing_cash)),
@@ -7594,9 +7651,28 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "opening_cash": float(quantize_money(opening_cash)),
                 "closing_cash": float(quantize_money(closing_cash)),
             }, status=status.HTTP_200_OK)
+
         except Exception:
             logger.exception("Cash Flow Report Error")
-            return Response({"net_increase_in_cash": 0.0, "closing_cash": 0.0}, status=status.HTTP_200_OK)
+            # Always return full zero-structure even on exception
+            return Response({
+                "period": timezone.localdate().strftime('%B %Y'),
+                "operating_activities": {
+                    "customer_receipts": 0.0, "supplier_payments": 0.0,
+                    "operating_expenses": 0.0, "salaries_and_wages": 0.0,
+                    "net_operating_cash": 0.0,
+                },
+                "investing_activities": {
+                    "equipment_purchased": 0.0, "net_investing_cash": 0.0,
+                },
+                "financing_activities": {
+                    "capital_plus_loan_received": 0.0, "loan_repayment": 0.0,
+                    "drawings": 0.0, "net_financing_cash": 0.0,
+                },
+                "net_increase_in_cash": 0.0,
+                "opening_cash": 0.0,
+                "closing_cash": 0.0,
+            }, status=status.HTTP_200_OK)
 
     # =========================================================================
     # 3. BALANCE SHEET REPORT (/management-reports/balance-sheet/)
