@@ -1395,29 +1395,56 @@ class SupplierPayment(models.Model):
     def clean(self):
         super().clean()
         if self.purchase_id:
-            balance = self.purchase.balance_due
-            if self.amount > balance:
+            # Exclude current payment amount if editing an existing record
+            other_payments_sum = SupplierPayment.objects.filter(
+                purchase=self.purchase
+            ).exclude(pk=self.pk).aggregate(
+                total=models.functions.Coalesce(models.Sum('amount'), Decimal("0.00"))
+            )['total']
+
+            # Effective available balance for this transaction
+            total_purchase_cost = getattr(self.purchase, 'total_amount', Decimal("0.00"))
+            available_balance = total_purchase_cost - other_payments_sum
+
+            if self.amount and self.amount > available_balance:
                 raise ValidationError(
-                    f"Repayment amount (KSh {self.amount}) exceeds outstanding balance (KSh {balance})."
+                    f"Repayment amount (KSh {self.amount}) exceeds outstanding balance (KSh {available_balance})."
                 )
 
     @db_transaction.atomic
     def save(self, *args, **kwargs):
         self.full_clean()
+        
+        is_new = self.pk is None
+        old_amount = Decimal("0.00")
+        
+        if not is_new:
+            # Fetch original payment amount to calculate amount_paid delta
+            orig = SupplierPayment.objects.filter(pk=self.pk).values('amount').first()
+            if orig:
+                old_amount = Decimal(str(orig['amount'] or ZERO))
+
         super().save(*args, **kwargs)
 
-        # Update purchase model amount_paid field
+        # 1. Update purchase model amount_paid field by the delta difference
         p = self.purchase
-        p.amount_paid = Decimal(str(p.amount_paid or ZERO)) + Decimal(str(self.amount))
+        amount_delta = Decimal(str(self.amount or ZERO)) - old_amount
+        p.amount_paid = Decimal(str(p.amount_paid or ZERO)) + amount_delta
         p.save(update_fields=["amount_paid"])
 
-        # Record expense entry for cashbook accounting
-        Expense.objects.create(
+        # 2. Synchronize expense entry for cashbook accounting
+        expense_date = self.created_at.date() if self.created_at else timezone.localdate()
+        expense_desc = f"Supplier Repayment ({p.item.name}): {self.notes}".strip()
+
+        Expense.objects.update_or_create(
             branch=p.branch,
-            retailer=p.branch.retailer if p.branch else None,
-            description=f"Supplier Repayment ({p.item.name}): {self.notes}".strip(),
-            amount=self.amount,
-            date=timezone.localdate(),
+            description__icontains=f"Supplier Repayment ({p.item.name})",
+            defaults={
+                "retailer": p.branch.retailer if p.branch else None,
+                "description": expense_desc,
+                "amount": self.amount,
+                "date": expense_date,
+            }
         )
 
     def __str__(self):
