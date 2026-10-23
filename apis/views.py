@@ -6024,17 +6024,27 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # Base querysets
+            # Query base objects
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
             expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
             
+            # Purchase querysets (StockMovement + Purchase model)
+            purchases_mov_qs = StockMovement.objects.filter(
+                movement_type=StockMovement.MovementType.PURCHASE
+            ).filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            purchases_model_qs = Purchase.objects.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            )
+
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                purchases_mov_qs = purchases_mov_qs.filter(branch=branch_obj)
+                purchases_model_qs = purchases_model_qs.filter(branch=branch_obj)
 
-            # 1. Profitability Metrics
+            # 1. Financial Performance
             total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
             cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
             operating_expenses = sum((quantize_money(e.amount or ZERO) for e in expenses_qs), ZERO)
@@ -6042,7 +6052,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             gross_profit = total_sales - cogs
             net_profit = gross_profit - operating_expenses
 
-            # 2. Inventory Metrics
+            # 2. Inventory & SKUs Metrics
             pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
             if branch_obj:
                 pricings_qs = pricings_qs.filter(branch=branch_obj)
@@ -6063,15 +6073,16 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             active_skus = Item.objects.filter(branch_pricings__in=pricings_qs).distinct().count() if branch_obj else Item.objects.count()
 
-            # 3. Daily Movement Metrics
-            todays_receipts = total_sales
-            todays_payments = operating_expenses
-            purchases_amount = sum((quantize_money(p.total_cost or ZERO) for p in purchases_qs), ZERO)
+            # 3. Purchases Calculation (Combines movements & model purchases without double counting)
+            purchases_mov_sum = sum((quantize_money(m.quantity * (m.unit_cost_price or ZERO)) for m in purchases_mov_qs), ZERO)
+            purchases_model_sum = sum((quantize_money(p.total_cost or ZERO) for p in purchases_model_qs), ZERO)
+            
+            purchases_total = max(purchases_mov_sum, purchases_model_sum)
 
-            # 4. Cash Position / Available Funds
+            # 4. Cash Position
             available_funds = total_sales - operating_expenses
 
-            # 5. Daily Performance Trajectory Data (for Graph)
+            # 5. Trajectory Graph
             trajectory_data = []
             current_day = start_date
             while current_day <= end_date:
@@ -6091,10 +6102,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 })
                 current_day += timedelta(days=1)
 
+            formatted_receipts = self._format_currency(total_sales)
+            formatted_payments = self._format_currency(operating_expenses)
+            formatted_purchases = self._format_currency(purchases_total)
+
             return Response({
                 "profitability": {
                     "total_sales": float(total_sales),
-                    "total_sales_formatted": self._format_currency(total_sales),
+                    "total_sales_formatted": formatted_receipts,
                     "cogs": float(cogs),
                     "cogs_formatted": self._format_currency(cogs),
                     "gross_profit": float(gross_profit),
@@ -6109,9 +6124,12 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "out_of_stock_items": out_of_stock_count,
                 },
                 "cash_flow": {
-                    "todays_receipts_formatted": self._format_currency(todays_receipts),
-                    "todays_payments_formatted": self._format_currency(todays_payments),
-                    "todays_purchases_formatted": self._format_currency(purchases_amount),
+                    "receipts_formatted": formatted_receipts,
+                    "payments_formatted": formatted_payments,
+                    "purchases_formatted": formatted_purchases,
+                    "todays_receipts_formatted": formatted_receipts,
+                    "todays_payments_formatted": formatted_payments,
+                    "todays_purchases_formatted": formatted_purchases,
                     "total_available_funds_formatted": self._format_currency(available_funds),
                 },
                 "trajectory": trajectory_data
