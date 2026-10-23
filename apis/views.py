@@ -6080,7 +6080,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             purchases_total = max(purchases_mov_sum, purchases_model_sum)
 
             # 4. Cash Position
-            available_funds = total_sales - operating_expenses
+            available_funds = total_sales - operating_expenses - purchases_total
 
             # 5. Trajectory Graph
             trajectory_data = []
