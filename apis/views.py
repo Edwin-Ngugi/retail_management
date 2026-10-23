@@ -6652,24 +6652,26 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
 
-            # Base Repayments, Expenses, and Stock Movements
+            # Base Repayments, Expenses, Purchases, and Supplier Payments
             repayments_qs = CreditRepayment.objects.filter(
                 date__gte=start_date,
                 date__lte=end_date
             )
 
+            # Exclude supplier repayment entries from general operating expenses
             expenses_qs = Expense.objects.filter(
                 date__gte=start_date,
                 date__lte=end_date
+            ).exclude(description__icontains='Supplier Repayment')
+
+            purchases_qs = Purchase.objects.filter(
+                purchase_date__date__gte=start_date,
+                purchase_date__date__lte=end_date
             )
 
-            purchase_movements_qs = StockMovement.objects.filter(
-                movement_type__in=[
-                    StockMovement.MovementType.PURCHASE,
-                    StockMovement.MovementType.ADJUSTMENT_IN,
-                ],
-                date__gte=start_date,
-                date__lte=end_date
+            supplier_payments_qs = SupplierPayment.objects.filter(
+                created_at__date__gte=start_date,
+                created_at__date__lte=end_date
             )
 
             if branch_id and str(branch_id).lower() != 'all':
@@ -6678,15 +6680,15 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     Q(branch_id=branch_id) | Q(transaction__branch_id=branch_id)
                 )
                 expenses_qs = expenses_qs.filter(branch_id=branch_id)
-                purchase_movements_qs = purchase_movements_qs.filter(branch_id=branch_id)
+                purchases_qs = purchases_qs.filter(branch_id=branch_id)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch_id=branch_id)
 
             # -----------------------------------------------------------------
             # 1. CHANNEL INFLOWS (PREVENT DOUBLE COUNTING OF SPLIT PAYMENTS)
             # -----------------------------------------------------------------
-            # Find all sales that have split payments attached
             split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
 
-            # A) Single-Method Transactions (Excludes any sale present in SalePayment table or marked SPLIT)
+            # A) Single-Method Transactions
             non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
             
             single_sales_totals = non_split_sales.aggregate(
@@ -6716,21 +6718,24 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             tot_send_money = single_sales_totals['send_money'] + split_totals['send_money'] + repayment_totals['send_money']
 
             # -----------------------------------------------------------------
-            # 2. OUTFLOWS (PURCHASES & EXPENSES)
+            # 2. OUTFLOWS (PURCHASES & OPERATING EXPENSES)
             # -----------------------------------------------------------------
-            purchases_cost = purchase_movements_qs.aggregate(
-                total=Coalesce(
-                    Sum(
-                        ExpressionWrapper(
-                            F('quantity') * F('unit_cost_price'),
-                            output_field=DecimalField(max_digits=12, decimal_places=2)
-                        )
-                    ),
-                    ZERO,
-                    output_field=DecimalField()
-                )
+            # Direct cash purchases (excluding credit orders with existing supplier payments)
+            direct_purchases = purchases_qs.exclude(
+                payment_method='CREDIT'
+            ).filter(
+                supplier_payments__isnull=True
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+
+            # Settlement payments made against supplier accounts
+            supplier_repayments = supplier_payments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO)
             )['total']
 
+            # Total inventory/supplier cash spent
+            purchases_cost = direct_purchases + supplier_repayments
+
+            # Operating Expenses excluding supplier repayments
             expenses_total = expenses_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
@@ -6742,7 +6747,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             date_str = str(end_date)
 
             # -----------------------------------------------------------------
-            # 3. 5 LEDGER SUMMARY ROWS
+            # 3. SUMMARY ROWS
             # -----------------------------------------------------------------
             summary_entries = [
                 {
@@ -6785,7 +6790,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "id": "SUMMARY-PURCHASES",
                     "reference": "SUM-PURCHASES",
                     "date": date_str,
-                    "description": "Total Cost of Goods Purchased",
+                    "description": "Total Cost of Goods Purchased & Supplier Outflows",
                     "type": "OUTFLOW",
                     "payment_method": "PURCHASE",
                     "channel": "STOCK_PURCHASE",
