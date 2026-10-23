@@ -7990,25 +7990,25 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # 1. CASH-BASIS REVENUE AGGREGATION
             # -----------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(
-                sale_date__date__gte=start_date,
-                sale_date__date__lte=end_date
+                Q(sale_date__range=(start_dt, end_dt)) | Q(sale_date__date__range=(start_date, end_date))
             ).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
 
             repayments_qs = CreditRepayment.objects.filter(
-                date__gte=start_date,
-                date__lte=end_date
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
             )
 
+            # Pure operating expenses excluding supplier repayments
             expenses_qs = Expense.objects.filter(
-                date__gte=start_date,
-                date__lte=end_date
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            ).exclude(
+                description__icontains='Supplier Repayment'
             )
 
             items_qs = SaleItem.objects.filter(
-                transaction__sale_date__date__gte=start_date,
-                transaction__sale_date__date__lte=end_date
+                Q(transaction__sale_date__range=(start_dt, end_dt)) |
+                Q(transaction__sale_date__date__range=(start_date, end_date))
             ).exclude(
                 Q(transaction__payment_method='CREDIT') | Q(transaction__receipt_number__startswith='INV')
             )
@@ -8063,6 +8063,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             operating_profit = gross_profit - operating_expenses
             tax = ZERO
             net_profit = operating_profit - tax
+
+            # Helper function for PDF currency formatting
+            def fmt_pdf_curr(val):
+                num = float(val or 0)
+                if num < 0:
+                    return f"(KSh {abs(num):,.2f})"
+                return f"KSh {num:,.2f}"
 
             # -----------------------------------------------------------------
             # 3. REPORTLAB PDF BUILD
@@ -8132,13 +8139,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             elements.append(Spacer(1, 10))
 
             data = [
-                [Paragraph("Revenue", bold_label_style), f"KSh {total_sales:,.2f}"],
-                [Paragraph("Less: Cost of Goods Sold", label_style), f"KSh {total_cogs:,.2f}"],
-                [Paragraph("Gross Profit", bold_label_style), f"KSh {gross_profit:,.2f}"],
-                [Paragraph("Less: Operating Expenses", label_style), f"KSh {operating_expenses:,.2f}"],
-                [Paragraph("Operating Profit", bold_label_style), f"KSh {operating_profit:,.2f}"],
-                [Paragraph("Finance Costs & Tax", label_style), f"KSh {tax:,.2f}"],
-                [Paragraph("Net Profit / (Loss)", bold_label_style), f"KSh {net_profit:,.2f}"]
+                [Paragraph("Revenue", bold_label_style), fmt_pdf_curr(total_sales)],
+                [Paragraph("Less: Cost of Goods Sold", label_style), fmt_pdf_curr(total_cogs)],
+                [Paragraph("Gross Profit", bold_label_style), fmt_pdf_curr(gross_profit)],
+                [Paragraph("Less: Operating Expenses", label_style), fmt_pdf_curr(operating_expenses)],
+                [Paragraph("Operating Profit", bold_label_style), fmt_pdf_curr(operating_profit)],
+                [Paragraph("Finance Costs & Tax", label_style), fmt_pdf_curr(tax)],
+                [Paragraph("Net Profit / (Loss)", bold_label_style), fmt_pdf_curr(net_profit)]
             ]
 
             table = Table(data, colWidths=[340, 192])
@@ -8173,14 +8180,20 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # Query cash movements matching web endpoint logic
+            # -----------------------------------------------------------------
+            # 1. BASE QUERYSETS (UNIFIED OUTFLOW & INFLOW FILTERS)
+            # -----------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
             repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
             purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
             supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            
+            # Pure operating expenses excluding supplier repayments
+            expenses_qs = Expense.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            ).exclude(description__icontains='Supplier Repayment')
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -8189,7 +8202,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-            # Cash Inflows
+            # -----------------------------------------------------------------
+            # 2. CASH INFLOWS
+            # -----------------------------------------------------------------
             realized_sales_cash = ZERO
             for s in sales_qs:
                 if not getattr(s, 'is_invoice', False):
@@ -8199,8 +8214,14 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             customer_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             customer_receipts = realized_sales_cash + customer_repayments
 
-            # Cash Outflows
-            direct_purchases = purchases_qs.exclude(payment_method='CREDIT').aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            # -----------------------------------------------------------------
+            # 3. CASH OUTFLOWS (EXCLUDE DOUBLE-COUNTED SUPPLIER PAYMENTS)
+            # -----------------------------------------------------------------
+            # Direct cash purchases without existing supplier payment records
+            direct_purchases = purchases_qs.exclude(payment_method='CREDIT').filter(
+                supplier_payments__isnull=True
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+
             supplier_repayments = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             supplier_payments = direct_purchases + supplier_repayments
 
@@ -8221,7 +8242,16 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             opening_cash = ZERO
             closing_cash = opening_cash + net_increase_in_cash
 
-            # ReportLab PDF Generation Setup
+            # Helper function for currency formatting
+            def fmt_pdf_curr(val):
+                num = float(val or 0)
+                if num < 0:
+                    return f"(KSh {abs(num):,.2f})"
+                return f"KSh {num:,.2f}"
+
+            # -----------------------------------------------------------------
+            # 4. REPORTLAB PDF SETUP
+            # -----------------------------------------------------------------
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(
                 buffer,
@@ -8290,22 +8320,22 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # Financial Data Table
             data = [
                 [Paragraph("<b>OPERATING ACTIVITIES</b>", bold_label_style), ""],
-                [Paragraph("Customer receipts", label_style), f"KSh {customer_receipts:,.2f}"],
-                [Paragraph("Supplier payments", label_style), f"KSh {supplier_payments:,.2f}"],
-                [Paragraph("Operating expenses", label_style), f"KSh {operating_expenses:,.2f}"],
-                [Paragraph("Salaries & wages", label_style), f"KSh {salaries_and_wages:,.2f}"],
-                [Paragraph("Net operating cash", bold_label_style), f"KSh {net_operating_cash:,.2f}"],
+                [Paragraph("Customer receipts", label_style), fmt_pdf_curr(customer_receipts)],
+                [Paragraph("Supplier payments", label_style), fmt_pdf_curr(supplier_payments)],
+                [Paragraph("Operating expenses", label_style), fmt_pdf_curr(operating_expenses)],
+                [Paragraph("Salaries & wages", label_style), fmt_pdf_curr(salaries_and_wages)],
+                [Paragraph("Net operating cash", bold_label_style), fmt_pdf_curr(net_operating_cash)],
                 [Paragraph("<b>INVESTING ACTIVITIES</b>", bold_label_style), ""],
-                [Paragraph("Equipment purchased", label_style), f"KSh {equipment_purchased:,.2f}"],
-                [Paragraph("Net investing cash", bold_label_style), f"KSh {net_investing_cash:,.2f}"],
+                [Paragraph("Equipment purchased", label_style), fmt_pdf_curr(equipment_purchased)],
+                [Paragraph("Net investing cash", bold_label_style), fmt_pdf_curr(net_investing_cash)],
                 [Paragraph("<b>FINANCING ACTIVITIES</b>", bold_label_style), ""],
-                [Paragraph("Capital loan received", label_style), f"KSh {capital_loan_received:,.2f}"],
-                [Paragraph("Loan repayment", label_style), f"KSh {loan_repayment:,.2f}"],
-                [Paragraph("Drawings", label_style), f"KSh {drawings:,.2f}"],
-                [Paragraph("Net financing cash", bold_label_style), f"KSh {net_financing_cash:,.2f}"],
-                [Paragraph("Net increase in cash", bold_label_style), f"KSh {net_increase_in_cash:,.2f}"],
-                [Paragraph("Opening cash", label_style), f"KSh {opening_cash:,.2f}"],
-                [Paragraph("CLOSING CASH", bold_label_style), f"KSh {closing_cash:,.2f}"]
+                [Paragraph("Capital loan received", label_style), fmt_pdf_curr(capital_loan_received)],
+                [Paragraph("Loan repayment", label_style), fmt_pdf_curr(loan_repayment)],
+                [Paragraph("Drawings", label_style), fmt_pdf_curr(drawings)],
+                [Paragraph("Net financing cash", bold_label_style), fmt_pdf_curr(net_financing_cash)],
+                [Paragraph("Net increase in cash", bold_label_style), fmt_pdf_curr(net_increase_in_cash)],
+                [Paragraph("Opening cash", label_style), fmt_pdf_curr(opening_cash)],
+                [Paragraph("CLOSING CASH", bold_label_style), fmt_pdf_curr(closing_cash)]
             ]
 
             table = Table(data, colWidths=[340, 192])
@@ -8344,12 +8374,19 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         try:
             branch_obj, _, end_date, _, end_dt = self._get_branch_and_dates(request)
 
-            # 1. Cash, Bank & M-Pesa Inflow/Outflow Balance
+            # -----------------------------------------------------------------
+            # 1. CASH, BANK & M-PESA INFLOW/OUTFLOW BALANCE (UNIFIED LOGIC)
+            # -----------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
             repayments_qs = CreditRepayment.objects.filter(Q(date__lte=end_date) | Q(created_at__lte=end_dt))
-            expenses_qs = Expense.objects.filter(Q(date__lte=end_date) | Q(created_at__lte=end_dt))
+            
+            # Pure operating expenses excluding supplier repayments
+            expenses_qs = Expense.objects.filter(
+                Q(date__lte=end_date) | Q(created_at__lte=end_dt)
+            ).exclude(description__icontains='Supplier Repayment')
+            
             purchases_qs = Purchase.objects.filter(Q(purchase_date__lte=end_dt) | Q(created_at__lte=end_dt))
             supplier_payments_qs = SupplierPayment.objects.filter(created_at__lte=end_dt)
 
@@ -8369,20 +8406,28 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             tot_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             tot_inflows = tot_sales_cash + tot_repayments
 
+            # Outflows without double-counting
             tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            tot_purchases_direct = purchases_qs.exclude(payment_method='CREDIT').aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            tot_purchases_direct = purchases_qs.exclude(payment_method='CREDIT').filter(
+                supplier_payments__isnull=True
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
             tot_supplier_repay = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            
             tot_outflows = tot_expenses + tot_purchases_direct + tot_supplier_repay
 
             cash_bank_mpesa = max(ZERO, tot_inflows - tot_outflows)
 
-            # 2. Customer Receivables
+            # -----------------------------------------------------------------
+            # 2. CUSTOMER RECEIVABLES
+            # -----------------------------------------------------------------
             credit_sales_qs = SaleTransaction.objects.filter(payment_method=SaleTransaction.PaymentMethod.CREDIT)
             if branch_obj:
                 credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
             customer_debts = sum((s.balance_due for s in credit_sales_qs), ZERO)
 
-            # 3. Inventory Stock Valuation
+            # -----------------------------------------------------------------
+            # 3. INVENTORY STOCK VALUATION
+            # -----------------------------------------------------------------
             inventory_stock = ZERO
             try:
                 stock_qs = BranchStock.objects.all().select_related('item', 'branch')
@@ -8403,7 +8448,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             equipment = ZERO
             total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
 
-            # 4. Supplier Payables (Liabilities)
+            # -----------------------------------------------------------------
+            # 4. SUPPLIER PAYABLES (LIABILITIES)
+            # -----------------------------------------------------------------
             credit_purchases_qs = Purchase.objects.filter(payment_method='CREDIT')
             if branch_obj:
                 credit_purchases_qs = credit_purchases_qs.filter(branch=branch_obj)
@@ -8412,11 +8459,22 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             bank_loan = ZERO
             total_liabilities = supplier_debts + bank_loan
 
-            # 5. Equity & Capital
+            # -----------------------------------------------------------------
+            # 5. EQUITY & CAPITAL
+            # -----------------------------------------------------------------
             capital_and_retained_profits = total_assets - total_liabilities
             liabilities_plus_equity = total_liabilities + capital_and_retained_profits
 
-            # --- ReportLab PDF Document Setup ---
+            # Helper function for currency formatting
+            def fmt_pdf_curr(val):
+                num = float(val or 0)
+                if num < 0:
+                    return f"(KSh {abs(num):,.2f})"
+                return f"KSh {num:,.2f}"
+
+            # -----------------------------------------------------------------
+            # 6. REPORTLAB PDF SETUP
+            # -----------------------------------------------------------------
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(
                 buffer,
@@ -8485,18 +8543,18 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # Balance Sheet Data Table
             data = [
                 [Paragraph("<b>ASSETS</b>", bold_label_style), ""],
-                [Paragraph("Cash & Bank / M-Pesa", label_style), f"KSh {cash_bank_mpesa:,.2f}"],
-                [Paragraph("Customer Receivables (Debts)", label_style), f"KSh {customer_debts:,.2f}"],
-                [Paragraph("Inventory Stock Asset Value", label_style), f"KSh {inventory_stock:,.2f}"],
-                [Paragraph("Equipment & Fixed Assets", label_style), f"KSh {equipment:,.2f}"],
-                [Paragraph("Total Assets", bold_label_style), f"KSh {total_assets:,.2f}"],
+                [Paragraph("Cash & Bank / M-Pesa", label_style), fmt_pdf_curr(cash_bank_mpesa)],
+                [Paragraph("Customer Receivables (Debts)", label_style), fmt_pdf_curr(customer_debts)],
+                [Paragraph("Inventory Stock Asset Value", label_style), fmt_pdf_curr(inventory_stock)],
+                [Paragraph("Equipment & Fixed Assets", label_style), fmt_pdf_curr(equipment)],
+                [Paragraph("Total Assets", bold_label_style), fmt_pdf_curr(total_assets)],
                 [Paragraph("<b>LIABILITIES</b>", bold_label_style), ""],
-                [Paragraph("Accounts Payable (Suppliers)", label_style), f"KSh {supplier_debts:,.2f}"],
-                [Paragraph("Bank Loans & Borrowings", label_style), f"KSh {bank_loan:,.2f}"],
-                [Paragraph("Total Liabilities", bold_label_style), f"KSh {total_liabilities:,.2f}"],
+                [Paragraph("Accounts Payable (Suppliers)", label_style), fmt_pdf_curr(supplier_debts)],
+                [Paragraph("Bank Loans & Borrowings", label_style), fmt_pdf_curr(bank_loan)],
+                [Paragraph("Total Liabilities", bold_label_style), fmt_pdf_curr(total_liabilities)],
                 [Paragraph("<b>EQUITY</b>", bold_label_style), ""],
-                [Paragraph("Capital & Retained Earnings", label_style), f"KSh {capital_and_retained_profits:,.2f}"],
-                [Paragraph("TOTAL LIABILITIES & EQUITY", bold_label_style), f"KSh {liabilities_plus_equity:,.2f}"]
+                [Paragraph("Capital & Retained Earnings", label_style), fmt_pdf_curr(capital_and_retained_profits)],
+                [Paragraph("TOTAL LIABILITIES & EQUITY", bold_label_style), fmt_pdf_curr(liabilities_plus_equity)]
             ]
 
             table = Table(data, colWidths=[340, 192])
