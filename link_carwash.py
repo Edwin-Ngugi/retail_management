@@ -1,59 +1,91 @@
 import os
 import sys
 import django
+from decimal import Decimal, ROUND_HALF_UP
 
-# -----------------------------------------------------------------------------
-# 1. SETUP DJANGO ENVIRONMENT
-# -----------------------------------------------------------------------------
-# Replace 'myproject.settings' with your actual settings module path (e.g. 'config.settings', 'core.settings')
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+# Set up Django environment
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # Adjust settings module path if needed
 django.setup()
 
-# -----------------------------------------------------------------------------
-# 2. IMPORTS (Must be after django.setup())
-# -----------------------------------------------------------------------------
-from decimal import Decimal
-from django.db import transaction, models
-from django.db.models import F
-
-# Replace 'myapp' with the actual app name where models.py is located
-from stocks.models import Purchase, StockMovement
+from django.db import transaction
+from stocks.models import Purchase, StockMovement, SupplierPayment  # Adjust app name if needed
 
 
-def mark_historical_purchases_as_paid():
+def quantize_money(value):
+    """Ensure Decimal has 2 decimal places with proper rounding."""
+    if value is None:
+        return Decimal("0.00")
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def create_purchases_and_payments_from_movements():
     """
-    Updates all existing Purchase records to ensure amount_paid matches total_cost,
-    sets payment_method to CASH for any historical credit purchases, and updates
-    associated StockMovements.
+    Converts standalone PURCHASE StockMovements into Purchase and SupplierPayment records.
     """
-    print("Starting historical purchases payment backfill...")
+    print("Starting conversion of StockMovement restocks to Purchase & SupplierPayment records...")
+
+    purchase_movements = StockMovement.objects.filter(
+        movement_type=StockMovement.MovementType.PURCHASE
+    )
+
+    purchases_created = 0
+    payments_created = 0
 
     with transaction.atomic():
-        # 1. Update existing Purchase records where amount_paid is less than total_cost
-        # Expressed as: amount_paid = quantity * unit_cost_price
-        purchases_updated = Purchase.objects.filter(
-            payment_method=Purchase.PaymentMethod.CREDIT
-        ).update(
-            payment_method=Purchase.PaymentMethod.CASH,
-            amount_paid=F('quantity') * F('unit_cost_price')
-        )
+        for mov in purchase_movements:
+            unit_cost = quantize_money(mov.unit_cost_price or 0)
+            qty = Decimal(str(mov.quantity or 0))
+            calc_total = quantize_money(qty * unit_cost)
 
-        # 2. Ensure non-credit purchases with zero amount_paid are updated as well
-        unpaid_cash_purchases = Purchase.objects.filter(
-            amount_paid=Decimal("0.00")
-        ).update(
-            amount_paid=F('quantity') * F('unit_cost_price')
-        )
+            if calc_total <= Decimal("0.00"):
+                continue
 
-        # 3. Update notes/reference on historical StockMovement entries if needed
-        movements_updated = StockMovement.objects.filter(
-            movement_type=StockMovement.MovementType.PURCHASE
-        ).count()
+            # 1. Find or create Purchase record
+            purchase_obj = Purchase.objects.filter(
+                branch=mov.branch,
+                item=mov.item,
+                quantity=mov.quantity,
+                purchase_date=mov.date
+            ).first()
 
-        print(f"Successfully updated {purchases_updated} credit purchase(s) to CASH.")
-        print(f"Successfully updated {unpaid_cash_purchases} zero-paid purchase(s) to fully paid.")
-        print(f"Verified {movements_updated} purchase stock movement(s) in ledger.")
+            if not purchase_obj:
+                # Set payment_method to CREDIT and amount_paid to 0 so balance_due == calc_total
+                purchase_obj = Purchase.objects.create(
+                    branch=mov.branch,
+                    item=mov.item,
+                    quantity=mov.quantity,
+                    unit_cost_price=unit_cost,
+                    payment_method=Purchase.PaymentMethod.CREDIT,
+                    amount_paid=Decimal("0.00"),
+                    purchase_date=mov.date,
+                    supplier_name="Direct Supplier",
+                    created_by=mov.created_by
+                )
+                purchases_created += 1
+            else:
+                # Reset amount_paid to 0 temporarily if SupplierPayment doesn't exist yet
+                if not SupplierPayment.objects.filter(purchase=purchase_obj).exists():
+                    purchase_obj.payment_method = Purchase.PaymentMethod.CREDIT
+                    purchase_obj.amount_paid = Decimal("0.00")
+                    purchase_obj.save(update_fields=["payment_method", "amount_paid"])
+
+            # 2. Create SupplierPayment record
+            if not SupplierPayment.objects.filter(purchase=purchase_obj).exists():
+                SupplierPayment.objects.create(
+                    purchase=purchase_obj,
+                    amount=purchase_obj.total_cost,
+                    payment_method=SupplierPayment.PaymentMethod.CASH,
+                    notes=f"Auto-backfilled historical restock payment for {mov.item.name}"
+                )
+                payments_created += 1
+
+                # Update payment_method to CASH once fully paid
+                purchase_obj.payment_method = Purchase.PaymentMethod.CASH
+                purchase_obj.save(update_fields=["payment_method"])
+
+    print(f"Successfully created {purchases_created} Purchase record(s).")
+    print(f"Successfully generated {payments_created} Supplier Payment(s).")
 
 
 if __name__ == "__main__":
-    mark_historical_purchases_as_paid()
+    create_purchases_and_payments_from_movements()
