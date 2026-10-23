@@ -6023,39 +6023,102 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     def dashboard_cards(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            # Base querysets
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
             expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
             
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
 
+            # 1. Profitability Metrics
             total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
-            total_cost = sum((s.total_cost for s in sales_qs), ZERO)
+            cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
             operating_expenses = sum((quantize_money(e.amount or ZERO) for e in expenses_qs), ZERO)
-            gross_profit = total_sales - total_cost
+            
+            gross_profit = total_sales - cogs
             net_profit = gross_profit - operating_expenses
+
+            # 2. Inventory Metrics
+            pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
+            if branch_obj:
+                pricings_qs = pricings_qs.filter(branch=branch_obj)
+
+            total_stock_value = ZERO
+            low_stock_count = 0
+            out_of_stock_count = 0
+
+            for p in pricings_qs:
+                rem_stock = p.remaining_stock
+                stock_val = rem_stock * (p.unit_cost_price or ZERO)
+                total_stock_value += stock_val
+
+                if rem_stock <= 0:
+                    out_of_stock_count += 1
+                elif rem_stock <= (p.min_stock_threshold or ZERO):
+                    low_stock_count += 1
+
+            active_skus = Item.objects.filter(branch_pricings__in=pricings_qs).distinct().count() if branch_obj else Item.objects.count()
+
+            # 3. Daily Movement Metrics
+            todays_receipts = total_sales
+            todays_payments = operating_expenses
+            purchases_amount = sum((quantize_money(p.total_cost or ZERO) for p in purchases_qs), ZERO)
+
+            # 4. Cash Position / Available Funds
+            available_funds = total_sales - operating_expenses
+
+            # 5. Daily Performance Trajectory Data (for Graph)
+            trajectory_data = []
+            current_day = start_date
+            while current_day <= end_date:
+                day_sales = sales_qs.filter(sale_date__date=current_day)
+                day_expenses = expenses_qs.filter(date=current_day)
+
+                d_sales = sum((quantize_money(s.total_amount or ZERO) for s in day_sales), ZERO)
+                d_cogs = sum((quantize_money(s.total_cost or ZERO) for s in day_sales), ZERO)
+                d_exp = sum((quantize_money(e.amount or ZERO) for e in day_expenses), ZERO)
+                d_net_profit = (d_sales - d_cogs) - d_exp
+
+                trajectory_data.append({
+                    "date": current_day.strftime('%b %d'),
+                    "total_sales": float(d_sales),
+                    "cogs": float(d_cogs),
+                    "net_profit": float(d_net_profit)
+                })
+                current_day += timedelta(days=1)
 
             return Response({
                 "profitability": {
+                    "total_sales": float(total_sales),
                     "total_sales_formatted": self._format_currency(total_sales),
+                    "cogs": float(cogs),
+                    "cogs_formatted": self._format_currency(cogs),
+                    "gross_profit": float(gross_profit),
                     "gross_profit_formatted": self._format_currency(gross_profit),
+                    "net_profit": float(net_profit),
                     "net_profit_formatted": self._format_currency(net_profit),
                 },
                 "inventory": {
-                    "total_stock_value_formatted": self._format_currency(0),
-                    "product_skus": Item.objects.count(),
-                    "low_stock_items": 0,
-                    "out_of_stock_items": 0,
+                    "total_stock_value_formatted": self._format_currency(total_stock_value),
+                    "product_skus": active_skus,
+                    "low_stock_items": low_stock_count,
+                    "out_of_stock_items": out_of_stock_count,
                 },
                 "cash_flow": {
-                    "todays_receipts_formatted": self._format_currency(total_sales),
-                    "todays_payments_formatted": self._format_currency(operating_expenses),
-                    "net_cash_movement_formatted": self._format_currency(total_sales - operating_expenses),
-                    "total_available_funds_formatted": self._format_currency(total_sales - operating_expenses),
-                }
+                    "todays_receipts_formatted": self._format_currency(todays_receipts),
+                    "todays_payments_formatted": self._format_currency(todays_payments),
+                    "todays_purchases_formatted": self._format_currency(purchases_amount),
+                    "total_available_funds_formatted": self._format_currency(available_funds),
+                },
+                "trajectory": trajectory_data
             }, status=status.HTTP_200_OK)
-        except Exception:
+
+        except Exception as e:
+            logger.exception("Dashboard Cards Error: %s", e)
             return Response({}, status=status.HTTP_200_OK)
 
     # =========================================================================
@@ -6935,7 +6998,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             total_spend = sum((p.total_cost for p in purchases_qs), ZERO)
             total_paid = sum((quantize_money(p.amount_paid or ZERO) for p in purchases_qs), ZERO)
             outstanding_payables = sum((p.balance_due for p in purchases_qs if p.is_credit), ZERO)
-            total_units = sum((Decimal(str(p.quantity or 0)) for p in purchases_qs), ZERO)
+            total_units = sum((Decimal(str(p.quantity or ZERO)) for p in purchases_qs), ZERO)
 
             return Response({
                 "summary": {
@@ -6947,7 +7010,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "supplier_returns_count": returns_qs.count()
                 }
             }, status=status.HTTP_200_OK)
-        except Exception:
+        except Exception as e:
+            logger.exception("Error loading purchases overview: %s", e)
             return Response({"summary": {"total_procurement_spend": 0.0, "total_paid_suppliers": 0.0, "outstanding_payables": 0.0, "purchase_orders_count": 0, "total_units_purchased": 0, "supplier_returns_count": 0}}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='purchase-requisitions')
@@ -6963,6 +7027,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "id": p.id,
                 "req_number": f"REQ-{p.id}",
                 "item_name": p.item.name,
+                "branch_name": p.branch.name,
                 "current_stock": float(p.remaining_stock),
                 "reorder_level": float(p.min_stock_threshold or 0),
                 "unit_cost_price": float(p.unit_cost_price or 0),
@@ -6970,7 +7035,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             } for p in low_stock_items]
 
             return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
-        except Exception:
+        except Exception as e:
+            logger.exception("Error loading purchase requisitions: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='purchase-orders')
@@ -6984,16 +7050,20 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             results = [{
                 "id": p.id,
                 "po_number": f"PO-{p.id}",
-                "purchase_date": p.purchase_date.strftime('%Y-%m-%d %H:%M') if hasattr(p.purchase_date, 'strftime') else str(p.purchase_date)[:10],
+                "purchase_date": p.purchase_date.strftime('%Y-%m-%d %H:%M') if hasattr(p.purchase_date, 'strftime') else str(p.purchase_date)[:16],
                 "supplier_name": p.supplier_name or (p.supplier.name if p.supplier else "Direct Supplier"),
                 "item_name": p.item.name if p.item else f"Item #{p.item_id}",
                 "quantity": float(p.quantity or 0),
+                "unit_cost_price": float(p.unit_cost_price or 0),
                 "total_cost": float(p.total_cost),
-                "payment_method": p.payment_method
-            } for p in purchases_qs.select_related('item', 'supplier').order_by('-purchase_date')[:100]]
+                "amount_paid": float(p.amount_paid or 0),
+                "balance_due": float(p.balance_due),
+                "payment_method": p.get_payment_method_display() if hasattr(p, 'get_payment_method_display') else p.payment_method
+            } for p in purchases_qs.select_related('item', 'supplier', 'branch').order_by('-purchase_date')[:100]]
 
             return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
-        except Exception:
+        except Exception as e:
+            logger.exception("Error loading purchase orders: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='goods-received')
@@ -7001,11 +7071,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # Query all inbound stock movement types from the StockMovement table
             inbound_types = [
                 StockMovement.MovementType.PURCHASE,
                 StockMovement.MovementType.TRANSFER_IN,
                 StockMovement.MovementType.ADJUSTMENT_IN,
+                StockMovement.MovementType.CUSTOMER_RETURN,
             ]
 
             movements_qs = StockMovement.objects.filter(
@@ -7018,23 +7088,22 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 movements_qs = movements_qs.filter(branch=branch_obj)
 
             results = []
-            for mov in movements_qs.select_related('item', 'batch', 'created_by').order_by('-created_at')[:100]:
+            for mov in movements_qs.select_related('item', 'batch', 'created_by', 'branch').order_by('-created_at')[:100]:
                 qty = float(mov.quantity or 0)
                 unit_cost = float(mov.unit_cost_price or 0)
-                
-                # Format reference GRN code
-                ref_code = mov.reference or (f"GRN-{mov.id}")
+                ref_code = mov.reference or f"GRN-{mov.id}"
 
                 results.append({
                     "id": mov.id,
                     "grn_number": ref_code,
                     "received_date": mov.date.strftime('%Y-%m-%d') if hasattr(mov.date, 'strftime') else str(mov.created_at)[:10],
                     "item_name": mov.item.name if mov.item else f"Item #{mov.item_id}",
+                    "branch_name": mov.branch.name if mov.branch else "Main Branch",
                     "quantity_received": qty,
                     "unit_cost_price": unit_cost,
                     "total_cost": qty * unit_cost,
                     "movement_type": mov.get_movement_type_display(),
-                    "notes": mov.notes or f"Stock Entry ({mov.get_movement_type_display()})"
+                    "notes": mov.notes or f"Stock In ({mov.get_movement_type_display()})"
                 })
 
             return Response({
@@ -7043,7 +7112,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
-            logger.exception("Goods Received Error")
+            logger.exception("Goods Received Error: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='supplier-invoices')
@@ -7051,8 +7120,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
             credit_purchases = Purchase.objects.filter(
-                payment_method=Purchase.PaymentMethod.CREDIT,
-                purchase_date__range=(start_dt, end_dt)
+                payment_method=Purchase.PaymentMethod.CREDIT
+            ).filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
             )
             if branch_obj:
                 credit_purchases = credit_purchases.filter(branch=branch_obj)
@@ -7060,16 +7130,18 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             results = [{
                 "id": p.id,
                 "invoice_number": f"INV-SUP-{p.id}",
-                "purchase_date": p.purchase_date.strftime('%Y-%m-%d'),
+                "purchase_date": p.purchase_date.strftime('%Y-%m-%d %H:%M') if hasattr(p.purchase_date, 'strftime') else str(p.purchase_date)[:10],
                 "supplier_name": p.supplier_name or (p.supplier.name if p.supplier else "Vendor"),
                 "item_name": p.item.name if p.item else f"Item #{p.item_id}",
                 "total_cost": float(p.total_cost),
                 "amount_paid": float(p.amount_paid or 0),
-                "balance_due": float(p.balance_due)
+                "balance_due": float(p.balance_due),
+                "status": "PAID" if p.is_fully_paid else ("PARTIALLY_PAID" if p.amount_paid > 0 else "UNPAID")
             } for p in credit_purchases.select_related('item', 'supplier').order_by('-purchase_date')[:100]]
 
             return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
-        except Exception:
+        except Exception as e:
+            logger.exception("Error fetching supplier invoices: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='purchase-returns')
@@ -7083,7 +7155,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             results = [{
                 "id": ret.id,
                 "return_number": f"RET-SUP-{ret.id}",
-                "date": ret.date.strftime('%Y-%m-%d'),
+                "date": ret.date.strftime('%Y-%m-%d') if hasattr(ret.date, 'strftime') else str(ret.date)[:10],
                 "supplier_name": ret.supplier_name or "Vendor",
                 "item_name": ret.item.name if ret.item else f"Item #{ret.item_id}",
                 "quantity": float(ret.quantity or 0),
@@ -7091,7 +7163,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             } for ret in returns_qs.select_related('item').order_by('-date')[:100]]
 
             return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
-        except Exception:
+        except Exception as e:
+            logger.exception("Error fetching purchase returns: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='supplier-payments')
@@ -7108,12 +7181,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "payment_date": pmt.created_at.strftime('%Y-%m-%d %H:%M'),
                 "supplier_name": pmt.purchase.supplier_name or (pmt.purchase.supplier.name if pmt.purchase.supplier else "Vendor"),
                 "item_name": pmt.purchase.item.name if pmt.purchase and pmt.purchase.item else "Stock Item",
-                "payment_method": pmt.payment_method,
-                "amount": float(pmt.amount or 0)
+                "payment_method": pmt.get_payment_method_display() if hasattr(pmt, 'get_payment_method_display') else pmt.payment_method,
+                "amount": float(pmt.amount or 0),
+                "notes": pmt.notes or ""
             } for pmt in payments_qs.select_related('purchase', 'purchase__item', 'purchase__supplier').order_by('-created_at')[:100]]
 
             return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
-        except Exception:
+        except Exception as e:
+            logger.exception("Error fetching supplier payments: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='suppliers-list')
@@ -7140,7 +7215,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 })
 
             return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
-        except Exception:
+        except Exception as e:
+            logger.exception("Error fetching suppliers list: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='purchase-reports')
@@ -7153,16 +7229,19 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             settled_cash = sum((p.total_cost for p in purchases_qs if not p.is_credit), ZERO)
             credit_value = sum((p.total_cost for p in purchases_qs if p.is_credit), ZERO)
+            total_repaid = sum((p.amount_paid for p in purchases_qs if p.is_credit), ZERO)
 
             return Response({
                 "audit_summary": {
                     "total_purchases_count": purchases_qs.count(),
                     "settled_cash_purchases": float(settled_cash),
-                    "credit_purchases_value": float(credit_value)
+                    "credit_purchases_value": float(credit_value),
+                    "total_credit_repaid": float(total_repaid)
                 }
             }, status=status.HTTP_200_OK)
-        except Exception:
-            return Response({"audit_summary": {"total_purchases_count": 0, "settled_cash_purchases": 0.0, "credit_purchases_value": 0.0}}, status=status.HTTP_200_OK)            
+        except Exception as e:
+            logger.exception("Error loading purchase reports: %s", e)
+            return Response({"audit_summary": {"total_purchases_count": 0, "settled_cash_purchases": 0.0, "credit_purchases_value": 0.0, "total_credit_repaid": 0.0}}, status=status.HTTP_200_OK)
 
     # =========================================================================
     # CASH MODULE ALIAS / FALLBACK ENDPOINTS

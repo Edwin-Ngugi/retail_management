@@ -2740,39 +2740,35 @@ def recalculate_wac_sales_cost(branch, item):
 
     opening_qty = Decimal(str(pricing.opening_stock or ZERO))
 
-    opening_cost = (
-        pricing.opening_stock_unit_cost_price
-        if pricing.opening_stock_unit_cost_price is not None
-        else (pricing.unit_cost_price or ZERO)
-    )
-
+    # 1. Determine baseline opening cost price
+    opening_cost = pricing.opening_stock_unit_cost_price or ZERO
     opening_cost = Decimal(str(opening_cost))
-    if opening_cost < ZERO:
-        opening_cost = ZERO
 
-    if opening_qty > ZERO and opening_cost <= ZERO:
-        fallback_cost = Decimal(str(pricing.unit_cost_price or ZERO))
-        if fallback_cost > ZERO:
-            opening_cost = fallback_cost
+    # Fallback to current unit_cost_price if opening cost is zero
+    if opening_cost <= ZERO:
+        opening_cost = Decimal(str(pricing.unit_cost_price or ZERO))
+
+    # Cross-branch catalog fallback: if this branch has 0.00, check other branch pricings for this item
+    if opening_cost <= ZERO:
+        other_pricing = BranchItemPricing.objects.filter(
+            item=item, 
+            opening_stock_unit_cost_price__gt=ZERO
+        ).first()
+        if other_pricing:
+            opening_cost = Decimal(str(other_pricing.opening_stock_unit_cost_price))
 
     total_qty = opening_qty
     total_value = opening_qty * opening_cost
     last_known_cost = opening_cost
 
-    # PURCHASES ONLY (Adds new purchase value and recalculates WAC)
-    purchase_types = {
+    inbound_types = {
         StockMovement.MovementType.OPENING_STOCK,
         StockMovement.MovementType.PURCHASE,
-    }
-
-    # INBOUND ADJUSTMENTS / TRANSFERS (Recalculates WAC across new total quantity without adding new purchase value)
-    inbound_qty_adjustments = {
         StockMovement.MovementType.CUSTOMER_RETURN,
         StockMovement.MovementType.TRANSFER_IN,
         StockMovement.MovementType.ADJUSTMENT_IN,
     }
 
-    # OUTBOUND MOVEMENTS
     outbound_types = {
         StockMovement.MovementType.SALE,
         StockMovement.MovementType.SUPPLIER_RETURN,
@@ -2791,7 +2787,6 @@ def recalculate_wac_sales_cost(branch, item):
         )
 
     movements = movements_qs.order_by("created_at", "id")
-
     sales_to_update = {}
 
     for movement in movements:
@@ -2803,11 +2798,12 @@ def recalculate_wac_sales_cost(branch, item):
         if quantity <= ZERO:
             continue
 
-        if movement.movement_type in purchase_types:
-            movement_cost = movement.unit_cost_price or ZERO
-            movement_cost = Decimal(str(movement_cost))
+        if movement.movement_type in inbound_types:
+            movement_cost = Decimal(str(movement.unit_cost_price or ZERO))
+            
+            # If movement cost is zero, fallback to last known cost or baseline cost
             if movement_cost <= ZERO:
-                movement_cost = last_known_cost
+                movement_cost = last_known_cost if last_known_cost > ZERO else opening_cost
 
             if total_qty <= ZERO:
                 total_qty = quantity
@@ -2816,12 +2812,6 @@ def recalculate_wac_sales_cost(branch, item):
             else:
                 total_value += quantity * movement_cost
                 total_qty += quantity
-                last_known_cost = total_value / total_qty
-
-        elif movement.movement_type in inbound_qty_adjustments:
-            # Increase quantity and recalculate WAC rate using current total_value
-            total_qty += quantity
-            if total_qty > ZERO:
                 last_known_cost = total_value / total_qty
 
         elif movement.movement_type in outbound_types:
@@ -2857,6 +2847,7 @@ def recalculate_wac_sales_cost(branch, item):
 
     final_wac = quantize_money(final_wac)
 
+    # Save calculated WAC back to BranchItemPricing
     BranchItemPricing.objects.filter(pk=pricing.pk).update(unit_cost_price=final_wac)
 
     for sale_id, new_unit_cost in sales_to_update.items():

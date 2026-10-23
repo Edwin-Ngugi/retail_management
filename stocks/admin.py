@@ -32,6 +32,7 @@ from .models import (
     StockTransfer,
     MonthlyTransactionArchive,
     Supplier,
+    SupplierPayment,
     SupplierReturn,
     recalculate_wac_sales_cost,
 )
@@ -341,6 +342,13 @@ class StockMovementInline(admin.TabularInline):
         return qs.filter(branch__retailer=request.user)
 
 
+class SupplierPaymentInline(admin.TabularInline):
+    model = SupplierPayment
+    extra = 0
+    readonly_fields = ("created_at",)
+    fields = ("amount", "payment_method", "notes", "created_at")
+
+
 class PurchaseInline(admin.TabularInline):
     model = Purchase
     extra = 0
@@ -519,7 +527,6 @@ class BranchItemPricingAdmin(TenantAwareModelAdmin):
 
     readonly_fields = (
         "display_remaining_stock_value",
-        
     )
 
     actions = [
@@ -897,35 +904,36 @@ class StockTransferAdmin(TenantAwareModelAdmin):
 
 
 # =============================================================================
-# PURCHASE
-# =============================================================================
-
-
-# =============================================================================
-# PURCHASE
+# PURCHASE & SUPPLIER PAYMENTS
 # =============================================================================
 
 
 @admin.register(Purchase)
 class PurchaseAdmin(TenantAwareModelAdmin):
     list_display = (
+        "po_number_display",
         "item",
         "branch",
-        "supplier",
-        "supplier_name",
+        "supplier_display",
         "quantity",
         "unit_cost_price",
+        "total_cost_display",
+        "amount_paid",
+        "balance_due_display",
+        "payment_method",
         "purchase_date",
         "created_by",
     )
 
     list_filter = (
         "branch",
+        "payment_method",
         "purchase_date",
         "created_at",
     )
 
     search_fields = (
+        "id",
         "item__name",
         "item__code",
         "item__sku",
@@ -941,7 +949,15 @@ class PurchaseAdmin(TenantAwareModelAdmin):
         "created_by",
     ]
 
-    readonly_fields = ("created_at",)
+    readonly_fields = (
+        "total_cost_display",
+        "balance_due_display",
+        "created_at",
+    )
+
+    inlines = [SupplierPaymentInline]
+
+    ordering = ("-purchase_date", "-id")
 
     def get_queryset(self, request):
         return (
@@ -954,6 +970,41 @@ class PurchaseAdmin(TenantAwareModelAdmin):
                 "created_by",
             )
         )
+
+    @admin.display(description="PO Number")
+    def po_number_display(self, obj):
+        return f"PO-{obj.id}"
+
+    @admin.display(description="Supplier")
+    def supplier_display(self, obj):
+        return obj.supplier_name or (obj.supplier.name if obj.supplier else "Direct Supplier")
+
+    @admin.display(description="Total Cost (KSh)")
+    def total_cost_display(self, obj):
+        return f"KSh {obj.total_cost:,.2f}"
+
+    @admin.display(description="Balance Due (KSh)")
+    def balance_due_display(self, obj):
+        return f"KSh {obj.balance_due:,.2f}"
+
+
+@admin.register(SupplierPayment)
+class SupplierPaymentAdmin(TenantAwareModelAdmin):
+    list_display = (
+        "id",
+        "purchase",
+        "amount",
+        "payment_method",
+        "created_at",
+    )
+    list_filter = ("payment_method", "created_at")
+    search_fields = (
+        "purchase__id",
+        "purchase__item__name",
+        "purchase__supplier_name",
+    )
+    ordering = ("-created_at",)
+
 
 @admin.register(MonthlyTransactionArchive)
 class MonthlyTransactionArchiveAdmin(TenantAwareModelAdmin):
@@ -990,6 +1041,8 @@ class MonthlyTransactionArchiveAdmin(TenantAwareModelAdmin):
     ]
 
     readonly_fields = ("archived_at",)
+
+
 # =============================================================================
 # SALES & CREDIT REPAYMENTS
 # =============================================================================
@@ -1390,14 +1443,6 @@ class DamageRecordAdmin(TenantAwareModelAdmin):
                 "created_by",
             )
         )
-
-
-# =============================================================================
-# STOCK ADJUSTMENTS
-# =============================================================================
-
-
-
 
 
 # =============================================================================

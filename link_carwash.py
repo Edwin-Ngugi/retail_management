@@ -1,55 +1,50 @@
 import os
-import sys
 import django
 
-# 1. Setup Django environment settings
-# Replace 'myproject.settings' with your actual Django settings module path
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # Replace with your settings module
 django.setup()
 
-# 2. Imports after django.setup()
 from django.db import transaction
-from stocks.models import StockMovement, RetailBranch, Item, recalculate_wac_sales_cost
+from stocks.models import BranchItemPricing, StockMovement, recalculate_wac_sales_cost  # Replace 'myapp' with your app name
 
 
-@transaction.atomic
-def convert_adjustments_to_purchases():
-    # Fetch all StockMovements with movement_type = ADJUSTMENT_IN
-    adjustments = StockMovement.objects.filter(
-        movement_type=StockMovement.MovementType.ADJUSTMENT_IN
-    )
+def repair_carwash_costs():
+    print("1. Copying valid cost prices to zero-cost branch items...")
 
-    count = adjustments.count()
-    print(f"Found {count} ADJUSTMENT_IN movements to convert.")
+    zero_pricings = BranchItemPricing.objects.filter(opening_stock_unit_cost_price=0)
 
-    if count == 0:
-        print("No movements to convert.")
-        return
+    for p in zero_pricings:
+        # Find if this item has a valid cost price in any other branch
+        valid_pricing = BranchItemPricing.objects.filter(
+            item_id=p.item_id, 
+            opening_stock_unit_cost_price__gt=0
+        ).first()
 
-    # Track affected (branch, item) pairs to recalculate WAC afterwards
-    affected_pairs = set()
+        if valid_pricing:
+            p.opening_stock_unit_cost_price = valid_pricing.opening_stock_unit_cost_price
+            p.unit_cost_price = valid_pricing.opening_stock_unit_cost_price
+            p.save(update_fields=["opening_stock_unit_cost_price", "unit_cost_price"])
 
-    for movement in adjustments:
-        affected_pairs.add((movement.branch_id, movement.item_id))
-        
-        # If reference isn't set, build a reference identifier
-        if not movement.reference:
-            movement.reference = f"PURCHASE-CONVERTED-{movement.pk}"
-            
-        movement.movement_type = StockMovement.MovementType.PURCHASE
-        movement.save()
+    print("2. Backfilling Stock Movements with valid cost prices...")
+    zero_movements = StockMovement.objects.filter(unit_cost_price__isnull=True) | StockMovement.objects.filter(unit_cost_price=0)
 
-    print("Updated movement types to PURCHASE.")
+    for m in zero_movements:
+        pricing = BranchItemPricing.objects.filter(branch_id=m.branch_id, item_id=m.item_id).first()
+        if pricing and pricing.opening_stock_unit_cost_price > 0:
+            m.unit_cost_price = pricing.opening_stock_unit_cost_price
+            m.save(update_fields=["unit_cost_price"])
 
-    # Recalculate WAC & COGS for all affected branch-item combinations
-    print("Recalculating WAC for affected items...")
-    for branch_id, item_id in affected_pairs:
-        branch = RetailBranch.objects.get(pk=branch_id)
-        item = Item.objects.get(pk=item_id)
-        recalculate_wac_sales_cost(branch, item)
+    print("3. Recalculating WAC for all items...")
+    all_pricings = BranchItemPricing.objects.select_related("branch", "item").all()
+    total = all_pricings.count()
 
-    print("Conversion and WAC recalculation completed successfully!")
+    for idx, p in enumerate(all_pricings, start=1):
+        with transaction.atomic():
+            wac = recalculate_wac_sales_cost(p.branch, p.item)
+            print(f"[{idx}/{total}] {p.item.name} @ {p.branch.name} -> Restored WAC: KSh {wac}")
+
+    print("Repair process finished successfully!")
 
 
 if __name__ == "__main__":
-    convert_adjustments_to_purchases()
+    repair_carwash_costs()
