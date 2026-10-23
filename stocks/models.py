@@ -1387,7 +1387,7 @@ class SupplierPayment(models.Model):
     )
 
     notes = models.TextField(blank=True, default="")
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(default=timezone.now, verbose_name="Payment Date / Created At")
 
     class Meta:
         ordering = ["-created_at"]
