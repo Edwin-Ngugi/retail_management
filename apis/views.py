@@ -7408,6 +7408,179 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
         return branch_obj, start_date, end_date, start_dt, end_dt
 
+
+    @action(detail=False, methods=['get'], url_path='cash-operations')
+    def cash_operations_report(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            # -----------------------------------------------------------------
+            # 1. BASE QUERYSETS
+            # -----------------------------------------------------------------
+            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
+                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+            )
+            repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            purchases_qs = Purchase.objects.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+            
+            # Pure expenses excluding supplier repayments
+            expenses_qs = Expense.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            ).exclude(description__icontains='Supplier Repayment')
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+
+            # -----------------------------------------------------------------
+            # 2. CHANNEL INFLOW BREAKDOWN
+            # -----------------------------------------------------------------
+            cash_inflow = ZERO
+            mpesa_inflow = ZERO
+            paybill_inflow = ZERO
+
+            # Process Sales Payments via SalePayment child entries & single payment fallbacks
+            split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
+            
+            # A) Single-method Sales
+            single_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
+            s_agg = single_sales.aggregate(
+                cash=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
+                paybill=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+            )
+            
+            # B) Split-method Sales Payments
+            split_payments = SalePayment.objects.filter(transaction__in=sales_qs)
+            sp_agg = split_payments.aggregate(
+                cash=Coalesce(Sum('amount', filter=Q(method='CASH')), ZERO, output_field=DecimalField()),
+                paybill=Coalesce(Sum('amount', filter=Q(method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('amount', filter=Q(method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+            )
+
+            # C) Credit Repayments
+            r_agg = repayments_qs.aggregate(
+                cash=Coalesce(Sum('amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
+                paybill=Coalesce(Sum('amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+            )
+
+            cash_inflow = s_agg['cash'] + sp_agg['cash'] + r_agg['cash']
+            paybill_inflow = s_agg['paybill'] + sp_agg['paybill'] + r_agg['paybill']
+            mpesa_inflow = s_agg['send_money'] + sp_agg['send_money'] + r_agg['send_money']
+
+            total_inflows = cash_inflow + mpesa_inflow + paybill_inflow
+
+            # -----------------------------------------------------------------
+            # 3. OUTFLOW ALLOCATION BREAKDOWN
+            # -----------------------------------------------------------------
+            direct_purchases = purchases_qs.exclude(payment_method='CREDIT').filter(
+                supplier_payments__isnull=True
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
+
+            supplier_settlements = supplier_payments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
+            
+            total_supplier_outflow = direct_purchases + supplier_settlements
+
+            salaries_wages = expenses_qs.filter(
+                Q(description__icontains='salary') | Q(description__icontains='wage')
+            ).aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
+
+            operating_expenses = expenses_qs.exclude(
+                Q(description__icontains='salary') | Q(description__icontains='wage')
+            ).aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
+
+            total_outflows = total_supplier_outflow + operating_expenses + salaries_wages
+            net_position = total_inflows - total_outflows
+
+            # -----------------------------------------------------------------
+            # 4. DAILY TRAJECTORY GRAPH
+            # -----------------------------------------------------------------
+            daily_trajectory = []
+            curr = start_date
+            while curr <= end_date:
+                d_sales = sales_qs.filter(sale_date__date=curr)
+                d_expenses = expenses_qs.filter(date=curr)
+                d_supp_payments = supplier_payments_qs.filter(created_at__date=curr)
+
+                d_inflow = d_sales.aggregate(total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField()))['total']
+                d_outflow = (
+                    expenses_qs.filter(date=curr).aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total'] +
+                    supplier_payments_qs.filter(created_at__date=curr).aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
+                )
+
+                daily_trajectory.append({
+                    "date": curr.strftime('%b %d'),
+                    "inflow": float(quantize_money(d_inflow)),
+                    "outflow": float(quantize_money(d_outflow)),
+                    "net": float(quantize_money(d_inflow - d_outflow))
+                })
+                curr += timedelta(days=1)
+
+            # Quantized outputs
+            q_inflow = float(quantize_money(total_inflows))
+            q_outflow = float(quantize_money(total_outflows))
+            q_net = float(quantize_money(net_position))
+
+            return Response({
+                "period": start_date.strftime('%B %Y'),
+                # Top-level legacy keys for backward compatibility
+                "total_cash_inflows": q_inflow,
+                "total_cash_outflows": q_outflow,
+                "net_cash_flow": q_net,
+                "cash_inflows": float(quantize_money(cash_inflow)),
+                "mpesa_inflows": float(quantize_money(mpesa_inflow)),
+                "paybill_inflows": float(quantize_money(paybill_inflow)),
+                "supplier_outflows": float(quantize_money(total_supplier_outflow)),
+                "operating_expenses": float(quantize_money(operating_expenses)),
+                "salaries_and_wages": float(quantize_money(salaries_wages)),
+                # Grouped structured keys for analytics views
+                "summary": {
+                    "total_inflows": q_inflow,
+                    "total_outflows": q_outflow,
+                    "net_cash_flow": q_net,
+                    "total_inflow": q_inflow,
+                    "total_outflow": q_outflow,
+                    "net_position": q_net,
+                },
+                "channels": {
+                    "cash": float(quantize_money(cash_inflow)),
+                    "mpesa": float(quantize_money(mpesa_inflow)),
+                    "paybill": float(quantize_money(paybill_inflow)),
+                },
+                "outflows_breakdown": {
+                    "supplier_payments": float(quantize_money(total_supplier_outflow)),
+                    "operating_expenses": float(quantize_money(operating_expenses)),
+                    "salaries_and_wages": float(quantize_money(salaries_wages)),
+                },
+                "trajectory": daily_trajectory
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Cash Operations Report Error: %s", e)
+            return Response({
+                "total_cash_inflows": 0.0,
+                "total_cash_outflows": 0.0,
+                "net_cash_flow": 0.0,
+                "summary": {
+                    "total_inflows": 0.0, "total_outflows": 0.0, "net_cash_flow": 0.0,
+                    "total_inflow": 0.0, "total_outflow": 0.0, "net_position": 0.0,
+                },
+                "channels": {"cash": 0.0, "mpesa": 0.0, "paybill": 0.0},
+                "outflows_breakdown": {"supplier_payments": 0.0, "operating_expenses": 0.0, "salaries_and_wages": 0.0},
+                "trajectory": []
+            }, status=status.HTTP_200_OK)
+
     # =========================================================================
     # 1. PROFIT & LOSS REPORT (/management-reports/profit-loss/)
     # =========================================================================
