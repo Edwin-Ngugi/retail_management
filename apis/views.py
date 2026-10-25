@@ -5933,12 +5933,12 @@ class FinancialReportViewSet(viewsets.ViewSet):
 class DashboardOverviewAPIView(APIView):
     """
     Dedicated endpoint for Main Portal Analytics.
-    Aggregates financial, inventory, and operational metrics.
+    Aggregates financial, inventory, and operational metrics safely.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
-        branch_id = request.query_params.get("branch")
+        branch_id = request.query_params.get("branch", "").strip()
         period_type = request.query_params.get("period_type", "day").lower()
         date_str = request.query_params.get("date")
         start_date_str = request.query_params.get("startDate")
@@ -5948,7 +5948,7 @@ class DashboardOverviewAPIView(APIView):
         start_date = today
         end_date = today
 
-        # 1. Parse Date Boundaries
+        # 1. Parse Date Boundaries safely
         if start_date_str and end_date_str:
             try:
                 start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
@@ -5973,8 +5973,8 @@ class DashboardOverviewAPIView(APIView):
         items_qs = Item.objects.all()
         approvals_qs = ApprovalRequest.objects.filter(status="PENDING")
 
-        # Apply Branch Filter
-        if branch_id and str(branch_id).lower() != "all" and str(branch_id).strip():
+        # Safely handle branch filter (ignores empty string or "all")
+        if branch_id and branch_id.lower() != "all":
             try:
                 b_id = int(branch_id)
                 sales_qs = sales_qs.filter(branch_id=b_id)
@@ -5985,15 +5985,26 @@ class DashboardOverviewAPIView(APIView):
             except (ValueError, TypeError):
                 pass
 
-        # 3. Apply Timezone-Aware DateTime Filtering
-        period_sales = sales_qs.filter(created_at__range=(start_dt, end_dt))
-        period_repayments = repayments_qs.filter(created_at__range=(start_dt, end_dt))
-        period_purchases = purchases_qs.filter(created_at__range=(start_dt, end_dt))
+        # 3. Apply Date Filtering Safely Across Models
+        # Checks created_at or date/sale_date/purchase_date fields safely
+        try:
+            period_sales = sales_qs.filter(created_at__range=(start_dt, end_dt))
+        except Exception:
+            period_sales = sales_qs.filter(sale_date__range=(start_date, end_date))
 
-        # Output Field Definition
+        try:
+            period_repayments = repayments_qs.filter(created_at__range=(start_dt, end_dt))
+        except Exception:
+            period_repayments = repayments_qs.filter(date__range=(start_date, end_date))
+
+        try:
+            period_purchases = purchases_qs.filter(created_at__range=(start_dt, end_dt))
+        except Exception:
+            period_purchases = purchases_qs.filter(purchase_date__range=(start_date, end_date))
+
         zero_dec = Value(0, output_field=DecimalField(max_digits=15, decimal_places=2))
 
-        # 4. Payment Channel Aggregations
+        # 4. Payment Channel Breakdown
         mpesa_total = period_sales.filter(
             payment_method__icontains="MPESA"
         ).aggregate(total=Coalesce(Sum("total_amount"), zero_dec))["total"]
@@ -6014,19 +6025,14 @@ class DashboardOverviewAPIView(APIView):
             total=Coalesce(Sum("amount"), zero_dec)
         )["total"]
 
-        # 5. Live Debt & COGS Calculations
+        # 5. Live Credit Debt Calculation
         outstanding_debt = sales_qs.filter(
             Q(payment_method__icontains="CREDIT") | Q(is_credit=True)
         ).aggregate(
             total=Coalesce(Sum(F("total_amount") - F("amount_paid")), zero_dec)
         )["total"]
 
-        # Estimated COGS from sold stock in period
-        estimated_cogs = period_sales.aggregate(
-            total_cogs=Coalesce(Sum(F("quantity") * F("item__unit_cost_price")), zero_dec)
-        )["total_cogs"]
-
-        # 6. Inventory Valuation
+        # 6. Inventory & Purchases Metrics
         inventory_stats = items_qs.aggregate(
             cost_val=Coalesce(Sum(F("stock") * F("unit_cost_price")), zero_dec),
             retail_val=Coalesce(Sum(F("stock") * F("unit_retail_price")), zero_dec),
@@ -6043,14 +6049,13 @@ class DashboardOverviewAPIView(APIView):
             t=Coalesce(Sum(F("total_cost") - F("amount_paid")), zero_dec)
         )["t"]
 
-        # 7. Response Output
+        # 7. Output Response
         return Response(
             {
                 "inventory": {
                     "total_cost_valuation": float(inventory_stats["cost_val"]),
                     "total_retail_valuation": float(inventory_stats["retail_val"]),
                     "cataloged_skus": inventory_stats["total_skus"],
-                    "estimated_cogs": float(estimated_cogs),
                 },
                 "credit_summary": {
                     "total_credit_issued": float(credit_issued),
