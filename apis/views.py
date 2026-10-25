@@ -5933,7 +5933,7 @@ class FinancialReportViewSet(viewsets.ViewSet):
 class DashboardOverviewAPIView(APIView):
     """
     Dedicated endpoint for Main Portal Analytics.
-    Aggregates financial, inventory, and operational metrics based on models.py schema.
+    Aggregates financial, inventory, and operational metrics with split payments & repayment routing.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -5990,27 +5990,67 @@ class DashboardOverviewAPIView(APIView):
                     purchases_qs = purchases_qs.filter(branch__name__iexact=branch_param)
                     pricings_qs = pricings_qs.filter(branch__name__iexact=branch_param)
 
-            # 4. Period Filtering
+            # 4. Apply Date Filters
             period_sales = sales_qs.filter(sale_date__range=(start_dt, end_dt))
             period_sale_items = sale_items_qs.filter(transaction__sale_date__range=(start_dt, end_dt))
-            period_repayments = repayments_qs.filter(date__range=(start_date, end_date))
+            
+            try:
+                period_repayments = repayments_qs.filter(date__range=(start_date, end_date))
+            except Exception:
+                period_repayments = repayments_qs.filter(created_at__range=(start_dt, end_dt))
+
             period_purchases = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
 
             zero_dec = Value(0, output_field=DecimalField(max_digits=15, decimal_places=2))
 
-            # 5. Channel Totals
-            mpesa_total = period_sales.filter(
-                payment_method__icontains="MPESA"
-            ).aggregate(t=Coalesce(Sum("total_amount"), zero_dec))["t"]
+            # 5. Channel Breakdown with Split Payments & Repayment Handling
+            channel_totals = {
+                "SEND_MONEY": Decimal("0.00"),
+                "PAYBILL": Decimal("0.00"),
+                "CASH": Decimal("0.00"),
+                "CREDIT": Decimal("0.00")
+            }
 
-            cash_total = period_sales.filter(
-                payment_method__icontains="CASH"
-            ).aggregate(t=Coalesce(Sum("total_amount"), zero_dec))["t"]
+            # A. Process Period Sales (Standard & Split)
+            for tx in period_sales.prefetch_related('split_payments'):
+                split_qs = tx.split_payments.all()
+                if tx.payment_method == SaleTransaction.PaymentMethod.SPLIT or split_qs.exists():
+                    for sp in split_qs:
+                        amt = Decimal(str(sp.amount or 0))
+                        method = str(sp.method or "").upper()
+                        if "PAYBILL" in method or "BANK" in method:
+                            channel_totals["PAYBILL"] += amt
+                        elif "SEND_MONEY" in method or "MPESA" in method or "TILL" in method:
+                            channel_totals["SEND_MONEY"] += amt
+                        elif "CREDIT" in method:
+                            channel_totals["CREDIT"] += amt
+                        else:
+                            channel_totals["CASH"] += amt
+                else:
+                    amt = Decimal(str(tx.amount_paid if tx.amount_paid is not None and tx.amount_paid > Decimal("0.00") else tx.total_amount or 0))
+                    method = str(tx.payment_method or "").upper()
+                    
+                    if tx.payment_method == SaleTransaction.PaymentMethod.CREDIT:
+                        channel_totals["CREDIT"] += Decimal(str(tx.total_amount or 0))
+                    elif "PAYBILL" in method or "BANK" in method:
+                        channel_totals["PAYBILL"] += amt
+                    elif "SEND_MONEY" in method or "MPESA" in method or "TILL" in method:
+                        channel_totals["SEND_MONEY"] += amt
+                    else:
+                        channel_totals["CASH"] += amt
 
-            paybill_total = period_sales.filter(
-                Q(payment_method__icontains="PAYBILL") | Q(payment_method__icontains="TILL")
-            ).aggregate(t=Coalesce(Sum("total_amount"), zero_dec))["t"]
+            # B. Add Period Credit Repayments to Inflow Channels
+            for rep in period_repayments:
+                amt = Decimal(str(rep.amount or 0))
+                method = str(rep.payment_method or "").upper()
+                if "PAYBILL" in method or "BANK" in method:
+                    channel_totals["PAYBILL"] += amt
+                elif "SEND_MONEY" in method or "MPESA" in method or "TILL" in method:
+                    channel_totals["SEND_MONEY"] += amt
+                else:
+                    channel_totals["CASH"] += amt
 
+            # 6. Credit Aggregations
             credit_issued = period_sales.filter(
                 payment_method=SaleTransaction.PaymentMethod.CREDIT
             ).aggregate(t=Coalesce(Sum("total_amount"), zero_dec))["t"]
@@ -6019,20 +6059,17 @@ class DashboardOverviewAPIView(APIView):
                 t=Coalesce(Sum("amount"), zero_dec)
             )["t"]
 
-            # 6. Outstanding Debt Collection
             outstanding_debt = sales_qs.filter(
                 payment_method=SaleTransaction.PaymentMethod.CREDIT
             ).aggregate(
                 t=Coalesce(Sum(F("total_amount") - F("amount_paid")), zero_dec)
             )["t"]
 
-            # 7. Estimated Sales COGS
+            # 7. Inventory & Purchases Metrics
             estimated_cogs = period_sale_items.aggregate(
                 t=Coalesce(Sum(F("quantity_sold") * F("unit_cost_price")), zero_dec)
             )["t"]
 
-            # 8. Inventory Valuation via BranchItemPricing
-            # Calculates live remaining stock valuation using BranchItemPricing.unit_cost_price
             cataloged_skus = pricings_qs.values("item_id").distinct().count()
             
             total_cost_valuation = Decimal("0.00")
@@ -6044,7 +6081,6 @@ class DashboardOverviewAPIView(APIView):
                     total_cost_valuation += rem_stock * Decimal(str(pricing.unit_cost_price or 0))
                     total_retail_valuation += rem_stock * Decimal(str(pricing.unit_selling_price or 0))
 
-            # 9. Restock Valuation & Unpaid Supplier Liabilities
             purchases_cost = period_purchases.aggregate(
                 t=Coalesce(Sum(F("quantity") * F("unit_cost_price")), zero_dec)
             )["t"]
@@ -6072,21 +6108,21 @@ class DashboardOverviewAPIView(APIView):
                     "supplier_payables": float(supplier_payables),
                 },
                 "payment_channels": {
-                    "mpesa": float(mpesa_total),
-                    "cash": float(cash_total),
-                    "paybill": float(paybill_total),
+                    "send_money": float(channel_totals["SEND_MONEY"]),
+                    "mpesa": float(channel_totals["SEND_MONEY"]), # Backward compatibility fallback
+                    "cash": float(channel_totals["CASH"]),
+                    "paybill": float(channel_totals["PAYBILL"]),
                     "credit_outstanding": float(outstanding_debt),
                 },
                 "pending_approvals": approvals_qs.count(),
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
-            # Fallback response to guarantee no 500 crashes
             return Response({
                 "inventory": {"total_cost_valuation": 0.0, "total_retail_valuation": 0.0, "cataloged_skus": 0, "estimated_cogs": 0.0},
                 "credit_summary": {"total_credit_issued": 0.0, "total_recovered": 0.0, "outstanding_credit": 0.0},
                 "restocks": {"total_purchases_cost": 0.0, "supplier_payables": 0.0},
-                "payment_channels": {"mpesa": 0.0, "cash": 0.0, "paybill": 0.0, "credit_outstanding": 0.0},
+                "payment_channels": {"send_money": 0.0, "mpesa": 0.0, "cash": 0.0, "paybill": 0.0, "credit_outstanding": 0.0},
                 "pending_approvals": 0,
                 "error": str(e)
             }, status=status.HTTP_200_OK)
