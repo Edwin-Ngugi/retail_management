@@ -804,14 +804,16 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
 
         month_param = self.request.query_params.get("month")
         year_param = self.request.query_params.get("year")
-        date_param = self.request.query_params.get("date") or self.request.query_params.get("selectedDate")
-        period_type = (
-            self.request.query_params.get("period_type")
-            or self.request.query_params.get("periodType")
-            or "day"
-        ).lower().strip()
+        date_param = (
+            self.request.query_params.get("date") 
+            or self.request.query_params.get("selectedDate")
+        )
+        start_date_param = self.request.query_params.get("startDate") or self.request.query_params.get("start_date")
+        end_date_param = self.request.query_params.get("endDate") or self.request.query_params.get("end_date")
 
-        # 1. Branch Filter (Global Unfiltered by User)
+        period_type = self.request.query_params.get("period_type") or self.request.query_params.get("periodType")
+
+        # 1. Branch Filter
         if branch_id and str(branch_id).lower() != "all":
             if str(branch_id).isdigit():
                 queryset = queryset.filter(
@@ -826,35 +828,72 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         if customer_id:
             queryset = queryset.filter(customer_id=customer_id)
 
-        # 2. Date Range Filter
-        today = timezone.localdate()
-        if period_type == "month" or (month_param and year_param):
-            yr = int(year_param) if year_param else today.year
-            mth = int(month_param) if month_param else today.month
-            _, last_day = calendar.monthrange(yr, mth)
-            start_date = date(yr, mth, 1)
-            end_date = date(yr, mth, last_day)
+        # 2. Dynamic Date Range Filtering
+        if period_type:
+            period_type = str(period_type).lower().strip()
 
-            tz = timezone.get_current_timezone()
-            start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-            end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
+        tz = timezone.get_current_timezone()
 
-            queryset = queryset.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
+        # A. Custom Range (startDate & endDate)
+        if start_date_param and end_date_param:
+            try:
+                s_date = datetime.strptime(start_date_param, "%Y-%m-%d").date()
+                e_date = datetime.strptime(end_date_param, "%Y-%m-%d").date()
+                s_dt = timezone.make_aware(datetime.combine(s_date, datetime.min.time()), tz)
+                e_dt = timezone.make_aware(datetime.combine(e_date, datetime.max.time()), tz)
+                queryset = queryset.filter(
+                    Q(date__range=(s_date, e_date)) | Q(created_at__range=(s_dt, e_dt))
+                )
+            except ValueError:
+                pass
 
+        # B. Specific Day Filter
+        elif date_param or period_type == "day":
+            if date_param:
+                try:
+                    target_date = datetime.strptime(date_param, "%Y-%m-%d").date()
+                    s_dt = timezone.make_aware(datetime.combine(target_date, datetime.min.time()), tz)
+                    e_dt = timezone.make_aware(datetime.combine(target_date, datetime.max.time()), tz)
+                    queryset = queryset.filter(
+                        Q(date=target_date) | Q(created_at__range=(s_dt, e_dt))
+                    )
+                except ValueError:
+                    pass
+
+        # C. Month Filter
+        elif period_type == "month" or (month_param and year_param):
+            try:
+                today = timezone.localdate()
+                yr = int(year_param) if year_param else today.year
+                mth = int(month_param) if month_param else today.month
+                _, last_day = calendar.monthrange(yr, mth)
+                start_date = date(yr, mth, 1)
+                end_date = date(yr, mth, last_day)
+
+                s_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
+                e_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
+
+                queryset = queryset.filter(
+                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(s_dt, e_dt))
+                )
+            except (ValueError, TypeError):
+                pass
+
+        # D. Year Filter
         elif period_type == "year" and year_param:
-            yr = int(year_param)
-            start_date = date(yr, 1, 1)
-            end_date = date(yr, 12, 31)
+            try:
+                yr = int(year_param)
+                start_date = date(yr, 1, 1)
+                end_date = date(yr, 12, 31)
 
-            tz = timezone.get_current_timezone()
-            start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-            end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
+                s_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
+                e_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
 
-            queryset = queryset.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
+                queryset = queryset.filter(
+                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(s_dt, e_dt))
+                )
+            except (ValueError, TypeError):
+                pass
 
         return queryset
 
