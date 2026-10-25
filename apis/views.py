@@ -5948,7 +5948,7 @@ class DashboardOverviewAPIView(APIView):
         start_date = today
         end_date = today
 
-        # Parse Date Boundaries
+        # 1. Parse Date Boundaries
         if start_date_str and end_date_str:
             try:
                 start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
@@ -5966,93 +5966,111 @@ class DashboardOverviewAPIView(APIView):
         start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
         end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
 
-        # 1. Base Querysets
+        # 2. Base Querysets
         sales_qs = SaleTransaction.objects.all()
         repayments_qs = CreditRepayment.objects.all()
         purchases_qs = Purchase.objects.all()
         items_qs = Item.objects.all()
         approvals_qs = ApprovalRequest.objects.filter(status="PENDING")
 
-        if branch_id and str(branch_id).lower() != "all" and str(branch_id).isdigit():
-            b_id = int(branch_id)
-            sales_qs = sales_qs.filter(branch_id=b_id)
-            repayments_qs = repayments_qs.filter(branch_id=b_id)
-            purchases_qs = purchases_qs.filter(branch_id=b_id)
-            items_qs = items_qs.filter(branch_id=b_id)
-            approvals_qs = approvals_qs.filter(branch_id=b_id)
+        # Apply Branch Filter
+        if branch_id and str(branch_id).lower() != "all" and str(branch_id).strip():
+            try:
+                b_id = int(branch_id)
+                sales_qs = sales_qs.filter(branch_id=b_id)
+                repayments_qs = repayments_qs.filter(branch_id=b_id)
+                purchases_qs = purchases_qs.filter(branch_id=b_id)
+                items_qs = items_qs.filter(branch_id=b_id)
+                approvals_qs = approvals_qs.filter(branch_id=b_id)
+            except (ValueError, TypeError):
+                pass
 
-        # 2. Apply Date Filters
-        period_sales = sales_qs.filter(
-            Q(sale_date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-        )
-        period_repayments = repayments_qs.filter(
-            Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-        )
-        period_purchases = purchases_qs.filter(
-            Q(purchase_date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-        )
+        # 3. Apply Timezone-Aware DateTime Filtering
+        period_sales = sales_qs.filter(created_at__range=(start_dt, end_dt))
+        period_repayments = repayments_qs.filter(created_at__range=(start_dt, end_dt))
+        period_purchases = purchases_qs.filter(created_at__range=(start_dt, end_dt))
 
-        # 3. Channel Breakdown Aggregations
-        zero = Value(0, output_field=DecimalField())
+        # Output Field Definition
+        zero_dec = Value(0, output_field=DecimalField(max_digits=15, decimal_places=2))
 
+        # 4. Payment Channel Aggregations
         mpesa_total = period_sales.filter(
             payment_method__icontains="MPESA"
-        ).aggregate(total=Coalesce(Sum("total_amount"), zero))["total"]
+        ).aggregate(total=Coalesce(Sum("total_amount"), zero_dec))["total"]
 
         cash_total = period_sales.filter(
             payment_method__icontains="CASH"
-        ).aggregate(total=Coalesce(Sum("total_amount"), zero))["total"]
+        ).aggregate(total=Coalesce(Sum("total_amount"), zero_dec))["total"]
 
         paybill_total = period_sales.filter(
             Q(payment_method__icontains="PAYBILL") | Q(payment_method__icontains="TILL")
-        ).aggregate(total=Coalesce(Sum("total_amount"), zero))["total"]
+        ).aggregate(total=Coalesce(Sum("total_amount"), zero_dec))["total"]
 
         credit_issued = period_sales.filter(
             Q(payment_method__icontains="CREDIT") | Q(is_credit=True)
-        ).aggregate(total=Coalesce(Sum("total_amount"), zero))["total"]
+        ).aggregate(total=Coalesce(Sum("total_amount"), zero_dec))["total"]
 
         recovered_repayments = period_repayments.aggregate(
-            total=Coalesce(Sum("amount"), zero)
+            total=Coalesce(Sum("amount"), zero_dec)
         )["total"]
 
+        # 5. Live Debt & COGS Calculations
         outstanding_debt = sales_qs.filter(
             Q(payment_method__icontains="CREDIT") | Q(is_credit=True)
         ).aggregate(
-            total=Coalesce(Sum(F("total_amount") - F("amount_paid")), zero)
+            total=Coalesce(Sum(F("total_amount") - F("amount_paid")), zero_dec)
         )["total"]
 
-        # 4. Inventory Metrics
+        # Estimated COGS from sold stock in period
+        estimated_cogs = period_sales.aggregate(
+            total_cogs=Coalesce(Sum(F("quantity") * F("item__unit_cost_price")), zero_dec)
+        )["total_cogs"]
+
+        # 6. Inventory Valuation
         inventory_stats = items_qs.aggregate(
-            cost_val=Coalesce(Sum(F("stock") * F("unit_cost_price")), zero),
-            retail_val=Coalesce(Sum(F("stock") * F("unit_retail_price")), zero),
-            total_skus=Coalesce(Sum(Value(1)), 0),
+            cost_val=Coalesce(Sum(F("stock") * F("unit_cost_price")), zero_dec),
+            retail_val=Coalesce(Sum(F("stock") * F("unit_retail_price")), zero_dec),
+            total_skus=Count("id"),
         )
 
-        return Response({
-          "inventory": {
-              "total_cost_valuation": float(inventory_stats["cost_val"]),
-              "total_retail_valuation": float(inventory_stats["retail_val"]),
-              "cataloged_skus": inventory_stats["total_skus"],
-          },
-          "credit_summary": {
-              "total_credit_issued": float(credit_issued),
-              "total_recovered": float(recovered_repayments),
-              "outstanding_credit": float(outstanding_debt),
-          },
-          "restocks": {
-              "total_purchases_cost": float(
-                  period_purchases.aggregate(t=Coalesce(Sum("total_cost"), zero))["t"]
-              ),
-              "supplier_payables": 0.00,
-          },
-          "payment_channels": {
-              "mpesa": float(mpesa_total),
-              "cash": float(cash_total),
-              "paybill": float(paybill_total),
-              "credit_outstanding": float(outstanding_debt),
-          },
-          "pending_approvals": approvals_qs.count(),
-        }, status=status.HTTP_200_OK)
+        purchases_cost = period_purchases.aggregate(
+            t=Coalesce(Sum("total_cost"), zero_dec)
+        )["t"]
+
+        supplier_payables = purchases_qs.filter(
+            is_paid=False
+        ).aggregate(
+            t=Coalesce(Sum(F("total_cost") - F("amount_paid")), zero_dec)
+        )["t"]
+
+        # 7. Response Output
+        return Response(
+            {
+                "inventory": {
+                    "total_cost_valuation": float(inventory_stats["cost_val"]),
+                    "total_retail_valuation": float(inventory_stats["retail_val"]),
+                    "cataloged_skus": inventory_stats["total_skus"],
+                    "estimated_cogs": float(estimated_cogs),
+                },
+                "credit_summary": {
+                    "total_credit_issued": float(credit_issued),
+                    "total_recovered": float(recovered_repayments),
+                    "outstanding_credit": float(outstanding_debt),
+                },
+                "restocks": {
+                    "total_purchases_cost": float(purchases_cost),
+                    "supplier_payables": float(supplier_payables),
+                },
+                "payment_channels": {
+                    "mpesa": float(mpesa_total),
+                    "cash": float(cash_total),
+                    "paybill": float(paybill_total),
+                    "credit_outstanding": float(outstanding_debt),
+                },
+                "pending_approvals": approvals_qs.count(),
+            },
+            status=status.HTTP_200_OK,
+        )
             
 logger = logging.getLogger(__name__)
 
