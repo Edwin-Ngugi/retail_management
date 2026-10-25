@@ -26,6 +26,7 @@ from .views import (
     BalanceSheetViewSet,
     FinancialReportViewSet,
     ManagementAnalyticsViewSet,
+    DashboardOverviewAPIView,
     ManagementReportsViewSet,
     RequestOTPView, 
     VerifyOTPAndResetPassword,
@@ -65,6 +66,7 @@ urlpatterns = [
     path('management/login/', ManagementLoginView.as_view(), name='management-login'),
     path('auth/request-otp/', RequestOTPView.as_view(), name='request_otp'),
     path('auth/verify-otp-reset/', VerifyOTPAndResetPassword.as_view(), name='verify_otp_reset'),
+    path('dashboard/overview/', DashboardOverviewAPIView.as_view(), name='dashboard-overview'),
 
     # Custom endpoints
     path('branches/copy-items/', CopyBranchItemsView.as_view(), name='branch-copy-items'),
