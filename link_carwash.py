@@ -1,76 +1,79 @@
 import os
 import django
-import uuid
-from datetime import datetime
-from django.utils import timezone
+from decimal import Decimal
 from django.db import transaction
 
-# Setup Django environment using django settings
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'myproject.settings')  # Adjust 'core.settings' if your settings file differs
+# Initialize Django environment
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'my.settings')  # Adjust if settings module differs
 django.setup()
 
-from stocks.models import Purchase, StockBatch, StockMovement
+from stocks.models import Purchase, PurchaseOrder, PurchaseOrderItem
 
 @transaction.atomic
-def reorganize_purchase_orders():
+def create_parent_purchase_orders():
     # -------------------------------------------------------------------------
-    # GROUP 1: The 13 selected purchases (PO-93 to PO-105)
-    # Action: Group into one order & Change date from Oct 26th to Oct 2nd
+    # 1. Migrate Group 1 (PO-93 to PO-105) -> PO-20261002-BATCH01
     # -------------------------------------------------------------------------
-    selected_ids = list(range(93, 106))  # IDs 93 through 105
-    group1_po = "PO-20261002-BATCH01"
+    group1_po_num = "PO-20261002-BATCH01"
+    purchases_g1 = Purchase.objects.filter(id__in=range(93, 106))
 
-    group1_purchases = Purchase.objects.filter(id__in=selected_ids)
-    
-    print(f"Processing Group 1: {group1_purchases.count()} items...")
-
-    for p in group1_purchases:
-        # Update purchase_date and created_at to Oct 2nd, 2026 keeping exact time
-        original_dt = p.purchase_date or timezone.now()
-        new_dt = original_dt.replace(year=2026, month=10, day=2)
-
-        # 1. Update Purchase model
-        p.purchase_date = new_dt
-        p.created_at = new_dt
-        p.save(update_fields=['purchase_date', 'created_at'])
-
-        # 2. Update StockBatch
-        StockBatch.objects.filter(reference=f"PURCHASE-{p.id}").update(
-            batch_number=group1_po,
-            received_at=new_dt,
+    if purchases_g1.exists():
+        first_p = purchases_g1.first()
+        po1, created = PurchaseOrder.objects.get_or_create(
+            po_number=group1_po_num,
+            defaults={
+                'branch': first_p.branch,
+                'supplier': first_p.supplier,
+                'supplier_name': first_p.supplier_name or (first_p.supplier.name if first_p.supplier else "Direct Supplier"),
+                'payment_method': first_p.payment_method,
+                'purchase_date': first_p.purchase_date,
+                'created_by': first_p.created_by,
+            }
         )
 
-        # 3. Update StockMovement
-        StockMovement.objects.filter(reference=f"PURCHASE-{p.id}").update(
-            date=new_dt.date(),
-            created_at=new_dt,
-            notes=f"Purchase Order ({group1_po}) - {p.item.name}"
-        )
-
-    print(f"✅ Group 1 updated! {len(selected_ids)} items grouped under '{group1_po}' and date shifted to Oct 2, 2026.")
+        for p in purchases_g1:
+            PurchaseOrderItem.objects.get_or_create(
+                purchase_order=po1,
+                item=p.item,
+                defaults={
+                    'quantity': p.quantity,
+                    'unit_cost_price': p.unit_cost_price,
+                }
+            )
+        po1.recalculate_totals()
+        print(f"✅ Group 1 created in PurchaseOrder table: '{group1_po_num}' (Total: KSh {po1.total_amount}).")
 
     # -------------------------------------------------------------------------
-    # GROUP 2: The remaining 9 purchases (PO-84 to PO-92)
-    # Action: Group into another order WITHOUT changing the dates
+    # 2. Migrate Group 2 (PO-84 to PO-92) -> PO-20261001-BATCH02
     # -------------------------------------------------------------------------
-    remaining_ids = list(range(84, 93))  # IDs 84 through 92
-    group2_po = "PO-20261001-BATCH02"
+    group2_po_num = "PO-20261001-BATCH02"
+    purchases_g2 = Purchase.objects.filter(id__in=range(84, 93))
 
-    group2_purchases = Purchase.objects.filter(id__in=remaining_ids)
-
-    print(f"\nProcessing Group 2: {group2_purchases.count()} items...")
-
-    for p in group2_purchases:
-        # Keep original date intact, only update batch grouping references
-        StockBatch.objects.filter(reference=f"PURCHASE-{p.id}").update(
-            batch_number=group2_po
+    if purchases_g2.exists():
+        first_p = purchases_g2.first()
+        po2, created = PurchaseOrder.objects.get_or_create(
+            po_number=group2_po_num,
+            defaults={
+                'branch': first_p.branch,
+                'supplier': first_p.supplier,
+                'supplier_name': first_p.supplier_name or (first_p.supplier.name if first_p.supplier else "Direct Supplier"),
+                'payment_method': first_p.payment_method,
+                'purchase_date': first_p.purchase_date,
+                'created_by': first_p.created_by,
+            }
         )
 
-        StockMovement.objects.filter(reference=f"PURCHASE-{p.id}").update(
-            notes=f"Purchase Order ({group2_po}) - {p.item.name}"
-        )
-
-    print(f"✅ Group 2 updated! {len(remaining_ids)} items grouped under '{group2_po}' (dates kept intact).")
+        for p in purchases_g2:
+            PurchaseOrderItem.objects.get_or_create(
+                purchase_order=po2,
+                item=p.item,
+                defaults={
+                    'quantity': p.quantity,
+                    'unit_cost_price': p.unit_cost_price,
+                }
+            )
+        po2.recalculate_totals()
+        print(f"✅ Group 2 created in PurchaseOrder table: '{group2_po_num}' (Total: KSh {po2.total_amount}).")
 
 if __name__ == "__main__":
-    reorganize_purchase_orders()
+    create_parent_purchase_orders()
