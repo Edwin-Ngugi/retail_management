@@ -2695,7 +2695,7 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         """
-        Create a new pending approval request (e.g., NEW_REGISTERED_ITEMS, SALE_ENTRY, BRANCH_CREATION, RESTOCK_PURCHASE, STOCK_OPERATION).
+        Create a new pending approval request.
         """
         request_type = request.data.get(
             "request_type", 
@@ -2703,14 +2703,20 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
         )
         payload = request.data.get("payload", request.data)
 
+        # Attach user if authenticated, otherwise allow creation
+        submitted_user = request.user if request.user.is_authenticated else None
+
         approval = PendingApproval.objects.create(
             request_type=request_type,
             payload=payload,
-            submitted_by=request.user,
+            submitted_by=submitted_user,
             status=PendingApproval.Status.PENDING,
         )
 
-        send_management_review_email(approval)
+        try:
+            send_management_review_email(approval)
+        except Exception as e:
+            print(f"Warning: Failed to send review email: {e}")
 
         serializer = self.get_serializer(approval)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -2799,20 +2805,16 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """
-        Custom query filtering:
-        - Admins / Superusers / Management see ALL approval requests.
-        - Regular non-staff users only see requests submitted by non-staff/regular users.
+        Return all approval requests ordered by creation date for both management and standard portal views.
         """
-        user = self.request.user
         queryset = PendingApproval.objects.all().order_by("-created_at")
+        
+        # Optional: Filter by status if query parameter is supplied
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            queryset = queryset.filter(status__iexact=status_param)
 
-        if user.is_staff or user.is_superuser:
-            return queryset
-
-        return queryset.filter(
-            submitted_by__is_staff=False,
-            submitted_by__is_superuser=False
-        )
+        return queryset
 
     # ------------------------------------------------------------------
     # ONE-CLICK EMAIL ACTIONS (NO LOGIN REQUIRED)
