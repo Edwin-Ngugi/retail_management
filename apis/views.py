@@ -6261,7 +6261,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
             
-            # Pure Operating Expenses (Exclude Supplier Repayments)
             expenses_qs = Expense.objects.filter(
                 Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
             ).exclude(description__icontains='Supplier Repayment')
@@ -6286,7 +6285,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 customer_repayments_qs = customer_repayments_qs.filter(branch=branch_obj)
 
             # -----------------------------------------------------------------
-            # 2. FINANCIAL PERFORMANCE & OPEX (Accrual basis for P&L)
+            # 2. FINANCIAL PERFORMANCE & OPEX
             # -----------------------------------------------------------------
             total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
             cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
@@ -6296,7 +6295,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             net_profit = gross_profit - operating_expenses
 
             # -----------------------------------------------------------------
-            # 3. CASH RECEIPTS (Exclude Uncollected Credit Sales, Include Repayments)
+            # 3. CASH RECEIPTS & DEBTORS (RECEIVABLES)
             # -----------------------------------------------------------------
             liquid_sales_cash = ZERO
             for s in sales_qs:
@@ -6308,6 +6307,15 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             )['total']
 
             actual_cash_receipts = liquid_sales_cash + customer_repayments
+
+            # Total Outstanding Customer Receivables / Debtors Balance
+            credit_sales_qs = SaleTransaction.objects.filter(
+                payment_method=SaleTransaction.PaymentMethod.CREDIT
+            )
+            if branch_obj:
+                credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
+
+            total_customer_debtors = sum((quantize_money(s.balance_due or ZERO) for s in credit_sales_qs), ZERO)
 
             # -----------------------------------------------------------------
             # 4. INVENTORY & SKUS METRICS
@@ -6348,9 +6356,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             purchases_total = direct_purchases + supplier_repayments
 
             # -----------------------------------------------------------------
-            # 6. CASH POSITION (REAL LIQUID FUNDS AVAILABLE)
+            # 6. CASH POSITION (LIQUID FUNDS ALLOWING NEGATIVE)
             # -----------------------------------------------------------------
-            available_funds = max(ZERO, actual_cash_receipts - operating_expenses - purchases_total)
+            available_funds = actual_cash_receipts - operating_expenses - purchases_total
 
             # -----------------------------------------------------------------
             # 7. TRAJECTORY GRAPH DATA
@@ -6388,6 +6396,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "gross_profit_formatted": self._format_currency(gross_profit),
                     "net_profit": float(net_profit),
                     "net_profit_formatted": self._format_currency(net_profit),
+                },
+                "debtors": {
+                    "total_customer_debts": float(total_customer_debtors),
+                    "total_customer_debts_formatted": self._format_currency(total_customer_debtors),
                 },
                 "inventory": {
                     "total_stock_value_formatted": self._format_currency(total_stock_value),
