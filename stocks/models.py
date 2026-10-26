@@ -1404,7 +1404,7 @@ class PurchaseOrderItem(models.Model):
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
 
-        # Create batch & stock movement per line item under parent PO reference
+        # 1. Reuse existing StockBatch or update quantities to prevent duplication
         batch, _ = StockBatch.objects.get_or_create(
             branch=self.purchase_order.branch,
             item=self.item,
@@ -1414,22 +1414,27 @@ class PurchaseOrderItem(models.Model):
                 "quantity_remaining": self.quantity,
                 "unit_cost_price": self.unit_cost_price,
                 "received_at": self.purchase_order.purchase_date,
-                "reference": f"PO-{self.purchase_order.pk}",
+                "reference": f"PO-{self.purchase_order.pk}-{self.pk}",
             }
         )
 
-        StockMovement.objects.create(
+        # 2. Use update_or_create to ensure only ONE StockMovement exists per line item
+        ref_code = f"PO-{self.purchase_order.pk}-{self.pk}"
+        StockMovement.objects.update_or_create(
             branch=self.purchase_order.branch,
             item=self.item,
-            batch=batch,
-            movement_type=StockMovement.MovementType.PURCHASE,
-            quantity=self.quantity,
-            unit_cost_price=self.unit_cost_price,
-            date=self.purchase_order.purchase_date.date(),
-            reference=f"PO-{self.purchase_order.pk}",
-            reference_id=self.purchase_order.pk,
-            notes=f"Purchase Order ({self.purchase_order.po_number})",
-            created_by=self.purchase_order.created_by,
+            reference=ref_code,
+            defaults={
+                "batch": batch,
+                "movement_type": StockMovement.MovementType.PURCHASE,
+                "quantity": self.quantity,
+                "unit_cost_price": self.unit_cost_price,
+                "date": self.purchase_order.purchase_date.date(),
+                "created_at": self.purchase_order.purchase_date,
+                "reference_id": self.purchase_order.pk,
+                "notes": f"Purchase Order ({self.purchase_order.po_number})",
+                "created_by": self.purchase_order.created_by,
+            }
         )
 
         recalculate_wac_sales_cost(self.purchase_order.branch, self.item)
