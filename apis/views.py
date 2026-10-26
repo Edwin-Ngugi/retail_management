@@ -345,7 +345,7 @@ def generate_30min_tokens_for_user(user, portal_type="user"):
 class UserLoginView(APIView):
     """
     1. Normal User Portal Login Endpoint.
-    Accessible by: Regular Users & Superadmins.
+    Accessible by: All authenticated users (Regular, Staff & Superadmins).
     """
     permission_classes = [permissions.AllowAny]
 
@@ -359,13 +359,6 @@ class UserLoginView(APIView):
             return Response(
                 {"error": "Invalid username or password."},
                 status=status.HTTP_401_UNAUTHORIZED,
-            )
-
-        # Allow regular users AND superadmin
-        if user.is_staff and not user.is_superuser:
-            return Response(
-                {"error": "Administrative staff should use the Management or Admin login page."},
-                status=status.HTTP_403_FORBIDDEN,
             )
 
         token_data = generate_30min_tokens_for_user(user, portal_type="user")
