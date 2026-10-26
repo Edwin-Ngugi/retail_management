@@ -2953,45 +2953,45 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
             return RetailBranch.objects.filter(name__iexact=str(branch_identifier).strip()).first()
 
     def _commit_restock_purchase(self, payload):
-    """
-    Commits approved restock purchase orders to Purchase, StockBatch, and StockMovement models.
-    """
-    purchases = payload.get("purchases", [])
-    if not purchases and "item" in payload:
-        purchases = [payload]
+        """
+        Commits approved restock purchase orders to Purchase, StockBatch, and StockMovement models.
+        """
+        purchases = payload.get("purchases", [])
+        if not purchases and "item" in payload:
+            purchases = [payload]
 
-    branch = self._get_target_branch(payload)
-    if not branch:
-        raise ValueError("No valid branch found to commit restock purchase order.")
+        branch = self._get_target_branch(payload)
+        if not branch:
+            raise ValueError("No valid branch found to commit restock purchase order.")
 
-    for p_data in purchases:
-        item_id = p_data.get("item") or p_data.get("item_id")
-        item_obj = Item.objects.filter(id=item_id).first()
-        if not item_obj:
-            continue
+        for p_data in purchases:
+            item_id = p_data.get("item") or p_data.get("item_id")
+            item_obj = Item.objects.filter(id=item_id).first()
+            if not item_obj:
+                continue
 
-        quantity = Decimal(str(p_data.get("quantity", 1)))
-        cost_price = Decimal(str(p_data.get("unit_cost_price") or "0.00"))
-        payment_method = p_data.get("payment_method", "CASH")
+            quantity = Decimal(str(p_data.get("quantity", 1)))
+            cost_price = Decimal(str(p_data.get("unit_cost_price") or "0.00"))
+            payment_method = p_data.get("payment_method", "CASH")
 
-        # Create official Purchase record (which handles batch & stock movement in its save method)
-        Purchase.objects.create(
-            branch=branch,
-            item=item_obj,
-            quantity=quantity,
-            unit_cost_price=cost_price,
-            payment_method=payment_method,
-            created_by=self.request.user if self.request and self.request.user.is_authenticated else None,
-        )
+            # Create official Purchase record (which handles batch & stock movement in its save method)
+            Purchase.objects.create(
+                branch=branch,
+                item=item_obj,
+                quantity=quantity,
+                unit_cost_price=cost_price,
+                payment_method=payment_method,
+                created_by=self.request.user if self.request and self.request.user.is_authenticated else None,
+            )
 
-        # Update BranchItemPricing
-        pricing, _ = BranchItemPricing.objects.get_or_create(
-            branch=branch,
-            item=item_obj,
-            defaults={"remaining_stock": 0, "unit_cost_price": cost_price}
-        )
-        pricing.unit_cost_price = cost_price
-        pricing.save()
+            # Update BranchItemPricing
+            pricing, _ = BranchItemPricing.objects.get_or_create(
+                branch=branch,
+                item=item_obj,
+                defaults={"remaining_stock": 0, "unit_cost_price": cost_price}
+            )
+            pricing.unit_cost_price = cost_price
+            pricing.save()
 
     def _commit_stock_operation(self, payload):
         """
