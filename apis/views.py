@@ -71,6 +71,7 @@ from stocks.models import (
     StockBatch,
     StockMovement,
     StockTransfer,
+    PurchaseOrder,
     Supplier,
     SupplierReturn,
     SupplierPayment,
