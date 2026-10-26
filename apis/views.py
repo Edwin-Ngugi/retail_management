@@ -6309,7 +6309,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             actual_cash_receipts = liquid_sales_cash + customer_repayments
 
-            # Total Outstanding Customer Receivables / Debtors Balance
             credit_sales_qs = SaleTransaction.objects.filter(
                 payment_method=SaleTransaction.PaymentMethod.CREDIT
             )
@@ -6319,30 +6318,32 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             total_customer_debtors = sum((quantize_money(s.balance_due or ZERO) for s in credit_sales_qs), ZERO)
 
             # -----------------------------------------------------------------
-            # 4. INVENTORY & SKUS METRICS
+            # 4. INVENTORY & SKUS METRICS (Fail-Safe Valuation & Stock Check)
             # -----------------------------------------------------------------
             pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
             if branch_obj:
                 pricings_qs = pricings_qs.filter(branch=branch_obj)
 
-            # Map current physical inventory balance directly from BranchStock snapshots
-            branch_stocks = BranchStock.objects.all()
+            # Build map from BranchStock table for fast access
+            stocks_qs = BranchStock.objects.all()
             if branch_obj:
-                branch_stocks = branch_stocks.filter(branch=branch_obj)
+                stocks_qs = stocks_qs.filter(branch=branch_obj)
             
-            stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in branch_stocks}
+            branch_stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in stocks_qs}
 
             total_stock_value = ZERO
             low_stock_count = 0
             out_of_stock_count = 0
 
             for p in pricings_qs:
-                # Retrieve live branch stock balance (defaults to 0.000 if not initialized)
-                rem_stock = stock_map.get(p.item_id, ZERO)
-                cost_price = quantize_money(p.unit_cost_price or ZERO)
-                
-                # Valuation based strictly on current remaining stock balance
-                stock_val = quantize_money(rem_stock * cost_price)
+                # Fall back to p.remaining_stock property if item is missing from BranchStock
+                if p.item_id in branch_stock_map:
+                    rem_stock = branch_stock_map[p.item_id]
+                    stock_val = quantize_money(rem_stock * (p.unit_cost_price or ZERO))
+                else:
+                    rem_stock = p.remaining_stock
+                    stock_val = p.remaining_stock_value
+
                 total_stock_value += stock_val
 
                 if rem_stock <= ZERO:
