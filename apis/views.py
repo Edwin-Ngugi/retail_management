@@ -6325,32 +6325,19 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             if branch_obj:
                 pricings_qs = pricings_qs.filter(branch=branch_obj)
 
-            # Map BranchStock quantities for fast, accurate stock levels
-            stocks_qs = BranchStock.objects.all()
-            if branch_obj:
-                stocks_qs = stocks_qs.filter(branch=branch_obj)
-            
-            stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in stocks_qs}
-
             total_stock_value = ZERO
             low_stock_count = 0
             out_of_stock_count = 0
 
             for p in pricings_qs:
-                # Fallback to p.remaining_stock if BranchStock isn't initialized for item
-                rem_stock = stock_map.get(p.item_id, p.remaining_stock)
-                cost_price = quantize_money(p.unit_cost_price or ZERO)
-                
-                # Exact stock valuation per item
-                stock_val = quantize_money(rem_stock * cost_price)
-                total_stock_value += stock_val
+                rem_stock = p.remaining_stock
+                total_stock_value += p.remaining_stock_value
 
                 if rem_stock <= ZERO:
                     out_of_stock_count += 1
                 elif rem_stock <= (p.min_stock_threshold or ZERO):
                     low_stock_count += 1
 
-            total_stock_value = quantize_money(total_stock_value)
             active_skus = pricings_qs.values('item_id').distinct().count()
 
             # -----------------------------------------------------------------
