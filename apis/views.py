@@ -6119,7 +6119,7 @@ class DashboardOverviewAPIView(APIView):
                 "pending_approvals": 0,
                 "error": str(e)
             }, status=status.HTTP_200_OK)
-            
+
 logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0.00")
@@ -7320,21 +7320,19 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='purchase-orders')
     def purchase_orders(self, request):
         try:
-            # Extract query parameters flexible to all frontend view wrappers
             branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
             start_date = request.query_params.get('start_date') or request.query_params.get('startDate')
             end_date = request.query_params.get('end_date') or request.query_params.get('endDate')
             month = request.query_params.get('month')
             year = request.query_params.get('year')
 
-            # Base QuerySet
             po_qs = PurchaseOrder.objects.all()
 
-            # Branch Filtering
+            # 1. Branch Filtering
             if branch_id and str(branch_id).lower() != 'all':
                 po_qs = po_qs.filter(Q(branch_id=branch_id) | Q(branch__name__iexact=branch_id))
 
-            # Date Filtering Logic
+            # 2. Date Range Filtering (Only filter if params are provided)
             if start_date and end_date:
                 try:
                     s_dt = datetime.strptime(start_date, '%Y-%m-%d')
@@ -7346,9 +7344,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     pass
             elif month and year:
                 try:
-                    m_int = int(month)
-                    y_int = int(year)
-                    po_qs = po_qs.filter(purchase_date__year=y_int, purchase_date__month=m_int)
+                    po_qs = po_qs.filter(purchase_date__year=int(year), purchase_date__month=int(month))
                 except (ValueError, TypeError):
                     pass
 
@@ -7356,7 +7352,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             results = []
             for po in po_qs:
-                items_list = list(po.items.all())
+                # Aggregate line items from PurchaseOrderItem relation
                 line_items = [
                     {
                         "item_id": line.item_id,
@@ -7365,12 +7361,17 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "unit_cost_price": float(line.unit_cost_price or 0),
                         "total_cost": float(line.quantity or 0) * float(line.unit_cost_price or 0),
                     }
-                    for line in items_list
+                    for line in po.items.all()
                 ]
 
                 total_qty = sum(item["quantity"] for item in line_items)
                 first_item = line_items[0]["item_name"] if line_items else "No Items"
                 item_display = first_item if len(line_items) <= 1 else f"{first_item} (+{len(line_items) - 1} more)"
+
+                # Payment values derived from PurchaseOrder header properties
+                total_cost = float(po.total_amount or 0)
+                amount_paid = float(po.amount_paid or 0)
+                balance_due = max(0.0, total_cost - amount_paid)
 
                 results.append({
                     "id": po.id,
@@ -7384,9 +7385,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "item_name": item_display,
                     "items": line_items,
                     "quantity": total_qty,
-                    "total_cost": float(po.total_amount or 0),
-                    "amount_paid": float(po.amount_paid or 0),
-                    "balance_due": max(0.0, float(po.total_amount or 0) - float(po.amount_paid or 0)),
+                    "total_cost": total_cost,
+                    "amount_paid": amount_paid,
+                    "balance_due": balance_due,
                     "payment_terms": po.get_payment_method_display() if hasattr(po, 'get_payment_method_display') else po.payment_method,
                     "payment_method": po.payment_method,
                 })
