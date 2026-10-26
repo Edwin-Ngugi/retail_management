@@ -6274,14 +6274,19 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 created_at__range=(start_dt, end_dt)
             )
 
+            customer_repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+                customer_repayments_qs = customer_repayments_qs.filter(branch=branch_obj)
 
             # -----------------------------------------------------------------
-            # 2. FINANCIAL PERFORMANCE & OPEX
+            # 2. FINANCIAL PERFORMANCE & OPEX (Accrual basis for P&L)
             # -----------------------------------------------------------------
             total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
             cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
@@ -6291,7 +6296,21 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             net_profit = gross_profit - operating_expenses
 
             # -----------------------------------------------------------------
-            # 3. INVENTORY & SKUS METRICS
+            # 3. CASH RECEIPTS (Exclude Uncollected Credit Sales, Include Repayments)
+            # -----------------------------------------------------------------
+            liquid_sales_cash = ZERO
+            for s in sales_qs:
+                breakdown = s.liquid_payments_breakdown
+                liquid_sales_cash += breakdown.get("CASH", ZERO) + breakdown.get("MPESA", ZERO) + breakdown.get("PAYBILL", ZERO)
+
+            customer_repayments = customer_repayments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO)
+            )['total']
+
+            actual_cash_receipts = liquid_sales_cash + customer_repayments
+
+            # -----------------------------------------------------------------
+            # 4. INVENTORY & SKUS METRICS
             # -----------------------------------------------------------------
             pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
             if branch_obj:
@@ -6314,30 +6333,27 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             active_skus = Item.objects.filter(branch_pricings__in=pricings_qs).distinct().count() if branch_obj else Item.objects.count()
 
             # -----------------------------------------------------------------
-            # 4. PURCHASES & SUPPLIER CASH OUTFLOW (NO DOUBLE COUNTING)
+            # 5. PURCHASES & SUPPLIER CASH OUTFLOW
             # -----------------------------------------------------------------
-            # Direct cash/mobile purchases that do NOT have a SupplierPayment entry
             direct_purchases = purchases_qs.exclude(
                 payment_method='CREDIT'
             ).filter(
                 supplier_payments__isnull=True
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
 
-            # Actual settlements made against supplier accounts
             supplier_repayments = supplier_payments_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO)
             )['total']
 
-            # True total supplier/inventory cash spent in this period
             purchases_total = direct_purchases + supplier_repayments
 
             # -----------------------------------------------------------------
-            # 5. CASH POSITION
+            # 6. CASH POSITION (REAL LIQUID FUNDS AVAILABLE)
             # -----------------------------------------------------------------
-            available_funds = max(ZERO, total_sales - operating_expenses - purchases_total)
+            available_funds = max(ZERO, actual_cash_receipts - operating_expenses - purchases_total)
 
             # -----------------------------------------------------------------
-            # 6. TRAJECTORY GRAPH DATA
+            # 7. TRAJECTORY GRAPH DATA
             # -----------------------------------------------------------------
             trajectory_data = []
             current_day = start_date
@@ -6358,14 +6374,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 })
                 current_day += timedelta(days=1)
 
-            formatted_receipts = self._format_currency(total_sales)
+            formatted_receipts = self._format_currency(actual_cash_receipts)
             formatted_payments = self._format_currency(operating_expenses)
             formatted_purchases = self._format_currency(purchases_total)
 
             return Response({
                 "profitability": {
                     "total_sales": float(total_sales),
-                    "total_sales_formatted": formatted_receipts,
+                    "total_sales_formatted": self._format_currency(total_sales),
                     "cogs": float(cogs),
                     "cogs_formatted": self._format_currency(cogs),
                     "gross_profit": float(gross_profit),
