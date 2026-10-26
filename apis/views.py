@@ -70,6 +70,7 @@ from stocks.models import (
     SaleTransaction,
     StockBatch,
     StockMovement,
+    BranchStock,
     StockTransfer,
     PurchaseOrder,
     Supplier,
