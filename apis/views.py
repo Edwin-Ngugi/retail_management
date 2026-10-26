@@ -7318,59 +7318,59 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='purchase-orders')
-def purchase_orders(self, request):
-    try:
-        branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-        
-        # Query parent PurchaseOrder records filtered by date range
-        po_qs = PurchaseOrder.objects.filter(
-            Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
-        )
-        if branch_obj:
-            po_qs = po_qs.filter(branch=branch_obj)
+    def purchase_orders(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            
+            # Query parent PurchaseOrder records filtered by date range
+            po_qs = PurchaseOrder.objects.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            if branch_obj:
+                po_qs = po_qs.filter(branch=branch_obj)
 
-        po_qs = po_qs.prefetch_related('items__item', 'supplier', 'branch').order_by('-purchase_date')[:100]
+            po_qs = po_qs.prefetch_related('items__item', 'supplier', 'branch').order_by('-purchase_date')[:100]
 
-        results = []
-        for po in po_qs:
-            items_data = [
-                {
-                    "item_id": line.item_id,
-                    "item_name": line.item.name if line.item else f"Item #{line.item_id}",
-                    "quantity": float(line.quantity or 0),
-                    "unit_cost_price": float(line.unit_cost_price or 0),
-                    "total_cost": float(line.quantity or 0) * float(line.unit_cost_price or 0),
-                }
-                for line in po.items.all()
-            ]
+            results = []
+            for po in po_qs:
+                items_data = [
+                    {
+                        "item_id": line.item_id,
+                        "item_name": line.item.name if line.item else f"Item #{line.item_id}",
+                        "quantity": float(line.quantity or 0),
+                        "unit_cost_price": float(line.unit_cost_price or 0),
+                        "total_cost": float(line.quantity or 0) * float(line.unit_cost_price or 0),
+                    }
+                    for line in po.items.all()
+                ]
 
-            # Primary display item (first line item or summary string)
-            first_item_name = items_data[0]["item_name"] if items_data else "No Items"
-            item_summary = first_item_name if len(items_data) <= 1 else f"{first_item_name} (+{len(items_data) - 1} more)"
+                # Primary display item (first line item or summary string)
+                first_item_name = items_data[0]["item_name"] if items_data else "No Items"
+                item_summary = first_item_name if len(items_data) <= 1 else f"{first_item_name} (+{len(items_data) - 1} more)"
 
-            # Total calculated balance due
-            total_cost = float(po.total_amount or 0)
-            amount_paid = float(po.amount_paid or 0)
-            balance_due = max(0.0, total_cost - amount_paid)
+                # Total calculated balance due
+                total_cost = float(po.total_amount or 0)
+                amount_paid = float(po.amount_paid or 0)
+                balance_due = max(0.0, total_cost - amount_paid)
 
-            results.append({
-                "id": po.id,
-                "po_number": po.po_number,
-                "purchase_date": po.purchase_date.strftime('%Y-%m-%d %H:%M') if hasattr(po.purchase_date, 'strftime') else str(po.purchase_date)[:16],
-                "supplier_name": po.supplier_name or (po.supplier.name if po.supplier else "Direct Supplier"),
-                "item_name": item_summary,
-                "items": items_data,
-                "item_count": len(items_data),
-                "total_cost": total_cost,
-                "amount_paid": amount_paid,
-                "balance_due": balance_due,
-                "payment_method": po.get_payment_method_display() if hasattr(po, 'get_payment_method_display') else po.payment_method
-            })
+                results.append({
+                    "id": po.id,
+                    "po_number": po.po_number,
+                    "purchase_date": po.purchase_date.strftime('%Y-%m-%d %H:%M') if hasattr(po.purchase_date, 'strftime') else str(po.purchase_date)[:16],
+                    "supplier_name": po.supplier_name or (po.supplier.name if po.supplier else "Direct Supplier"),
+                    "item_name": item_summary,
+                    "items": items_data,
+                    "item_count": len(items_data),
+                    "total_cost": total_cost,
+                    "amount_paid": amount_paid,
+                    "balance_due": balance_due,
+                    "payment_method": po.get_payment_method_display() if hasattr(po, 'get_payment_method_display') else po.payment_method
+                })
 
-        return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
-    except Exception as e:
-        logger.exception("Error loading purchase orders: %s", e)
-        return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
+            return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception("Error loading purchase orders: %s", e)
+            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='goods-received')
     def goods_received(self, request):
