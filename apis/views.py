@@ -7320,20 +7320,44 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='purchase-orders')
     def purchase_orders(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            
-            # Query parent PurchaseOrder records filtered by date range
-            po_qs = PurchaseOrder.objects.filter(
-                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            if branch_obj:
-                po_qs = po_qs.filter(branch=branch_obj)
+            # Extract query parameters flexible to all frontend view wrappers
+            branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+            start_date = request.query_params.get('start_date') or request.query_params.get('startDate')
+            end_date = request.query_params.get('end_date') or request.query_params.get('endDate')
+            month = request.query_params.get('month')
+            year = request.query_params.get('year')
 
-            po_qs = po_qs.prefetch_related('items__item', 'supplier', 'branch').order_by('-purchase_date')[:100]
+            # Base QuerySet
+            po_qs = PurchaseOrder.objects.all()
+
+            # Branch Filtering
+            if branch_id and str(branch_id).lower() != 'all':
+                po_qs = po_qs.filter(Q(branch_id=branch_id) | Q(branch__name__iexact=branch_id))
+
+            # Date Filtering Logic
+            if start_date and end_date:
+                try:
+                    s_dt = datetime.strptime(start_date, '%Y-%m-%d')
+                    e_dt = datetime.strptime(end_date, '%Y-%m-%d')
+                    s_aware = timezone.make_aware(datetime.combine(s_dt, time.min))
+                    e_aware = timezone.make_aware(datetime.combine(e_dt, time.max))
+                    po_qs = po_qs.filter(purchase_date__range=(s_aware, e_aware))
+                except ValueError:
+                    pass
+            elif month and year:
+                try:
+                    m_int = int(month)
+                    y_int = int(year)
+                    po_qs = po_qs.filter(purchase_date__year=y_int, purchase_date__month=m_int)
+                except (ValueError, TypeError):
+                    pass
+
+            po_qs = po_qs.prefetch_related('items__item', 'supplier', 'branch').order_by('-purchase_date')
 
             results = []
             for po in po_qs:
-                items_data = [
+                items_list = list(po.items.all())
+                line_items = [
                     {
                         "item_id": line.item_id,
                         "item_name": line.item.name if line.item else f"Item #{line.item_id}",
@@ -7341,33 +7365,34 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "unit_cost_price": float(line.unit_cost_price or 0),
                         "total_cost": float(line.quantity or 0) * float(line.unit_cost_price or 0),
                     }
-                    for line in po.items.all()
+                    for line in items_list
                 ]
 
-                # Primary display item (first line item or summary string)
-                first_item_name = items_data[0]["item_name"] if items_data else "No Items"
-                item_summary = first_item_name if len(items_data) <= 1 else f"{first_item_name} (+{len(items_data) - 1} more)"
-
-                # Total calculated balance due
-                total_cost = float(po.total_amount or 0)
-                amount_paid = float(po.amount_paid or 0)
-                balance_due = max(0.0, total_cost - amount_paid)
+                total_qty = sum(item["quantity"] for item in line_items)
+                first_item = line_items[0]["item_name"] if line_items else "No Items"
+                item_display = first_item if len(line_items) <= 1 else f"{first_item} (+{len(line_items) - 1} more)"
 
                 results.append({
                     "id": po.id,
+                    "po_ref": po.po_number,
                     "po_number": po.po_number,
+                    "date": po.purchase_date.strftime('%b %d, %Y') if hasattr(po.purchase_date, 'strftime') else str(po.purchase_date)[:10],
                     "purchase_date": po.purchase_date.strftime('%Y-%m-%d %H:%M') if hasattr(po.purchase_date, 'strftime') else str(po.purchase_date)[:16],
+                    "supplier": po.supplier_name or (po.supplier.name if po.supplier else "Direct Supplier"),
                     "supplier_name": po.supplier_name or (po.supplier.name if po.supplier else "Direct Supplier"),
-                    "item_name": item_summary,
-                    "items": items_data,
-                    "item_count": len(items_data),
-                    "total_cost": total_cost,
-                    "amount_paid": amount_paid,
-                    "balance_due": balance_due,
-                    "payment_method": po.get_payment_method_display() if hasattr(po, 'get_payment_method_display') else po.payment_method
+                    "item": item_display,
+                    "item_name": item_display,
+                    "items": line_items,
+                    "quantity": total_qty,
+                    "total_cost": float(po.total_amount or 0),
+                    "amount_paid": float(po.amount_paid or 0),
+                    "balance_due": max(0.0, float(po.total_amount or 0) - float(po.amount_paid or 0)),
+                    "payment_terms": po.get_payment_method_display() if hasattr(po, 'get_payment_method_display') else po.payment_method,
+                    "payment_method": po.payment_method,
                 })
 
             return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
+
         except Exception as e:
             logger.exception("Error loading purchase orders: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
