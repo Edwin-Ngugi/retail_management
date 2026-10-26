@@ -1,91 +1,76 @@
 import os
-import sys
 import django
-from decimal import Decimal, ROUND_HALF_UP
+import uuid
+from datetime import datetime
+from django.utils import timezone
+from django.db import transaction
 
-# Set up Django environment
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # Adjust settings module path if needed
+# Setup Django environment using django settings
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'myproject.settings')  # Adjust 'core.settings' if your settings file differs
 django.setup()
 
-from django.db import transaction
-from stocks.models import Purchase, StockMovement, SupplierPayment  # Adjust app name if needed
+from stocks.models import Purchase, StockBatch, StockMovement
 
+@transaction.atomic
+def reorganize_purchase_orders():
+    # -------------------------------------------------------------------------
+    # GROUP 1: The 13 selected purchases (PO-93 to PO-105)
+    # Action: Group into one order & Change date from Oct 26th to Oct 2nd
+    # -------------------------------------------------------------------------
+    selected_ids = list(range(93, 106))  # IDs 93 through 105
+    group1_po = "PO-20261002-BATCH01"
 
-def quantize_money(value):
-    """Ensure Decimal has 2 decimal places with proper rounding."""
-    if value is None:
-        return Decimal("0.00")
-    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    group1_purchases = Purchase.objects.filter(id__in=selected_ids)
+    
+    print(f"Processing Group 1: {group1_purchases.count()} items...")
 
+    for p in group1_purchases:
+        # Update purchase_date and created_at to Oct 2nd, 2026 keeping exact time
+        original_dt = p.purchase_date or timezone.now()
+        new_dt = original_dt.replace(year=2026, month=10, day=2)
 
-def create_purchases_and_payments_from_movements():
-    """
-    Converts standalone PURCHASE StockMovements into Purchase and SupplierPayment records.
-    """
-    print("Starting conversion of StockMovement restocks to Purchase & SupplierPayment records...")
+        # 1. Update Purchase model
+        p.purchase_date = new_dt
+        p.created_at = new_dt
+        p.save(update_fields=['purchase_date', 'created_at'])
 
-    purchase_movements = StockMovement.objects.filter(
-        movement_type=StockMovement.MovementType.PURCHASE
-    )
+        # 2. Update StockBatch
+        StockBatch.objects.filter(reference=f"PURCHASE-{p.id}").update(
+            batch_number=group1_po,
+            received_at=new_dt,
+        )
 
-    purchases_created = 0
-    payments_created = 0
+        # 3. Update StockMovement
+        StockMovement.objects.filter(reference=f"PURCHASE-{p.id}").update(
+            date=new_dt.date(),
+            created_at=new_dt,
+            notes=f"Purchase Order ({group1_po}) - {p.item.name}"
+        )
 
-    with transaction.atomic():
-        for mov in purchase_movements:
-            unit_cost = quantize_money(mov.unit_cost_price or 0)
-            qty = Decimal(str(mov.quantity or 0))
-            calc_total = quantize_money(qty * unit_cost)
+    print(f"✅ Group 1 updated! {len(selected_ids)} items grouped under '{group1_po}' and date shifted to Oct 2, 2026.")
 
-            if calc_total <= Decimal("0.00"):
-                continue
+    # -------------------------------------------------------------------------
+    # GROUP 2: The remaining 9 purchases (PO-84 to PO-92)
+    # Action: Group into another order WITHOUT changing the dates
+    # -------------------------------------------------------------------------
+    remaining_ids = list(range(84, 93))  # IDs 84 through 92
+    group2_po = "PO-20261001-BATCH02"
 
-            # 1. Find or create Purchase record
-            purchase_obj = Purchase.objects.filter(
-                branch=mov.branch,
-                item=mov.item,
-                quantity=mov.quantity,
-                purchase_date=mov.date
-            ).first()
+    group2_purchases = Purchase.objects.filter(id__in=remaining_ids)
 
-            if not purchase_obj:
-                # Set payment_method to CREDIT and amount_paid to 0 so balance_due == calc_total
-                purchase_obj = Purchase.objects.create(
-                    branch=mov.branch,
-                    item=mov.item,
-                    quantity=mov.quantity,
-                    unit_cost_price=unit_cost,
-                    payment_method=Purchase.PaymentMethod.CREDIT,
-                    amount_paid=Decimal("0.00"),
-                    purchase_date=mov.date,
-                    supplier_name="Direct Supplier",
-                    created_by=mov.created_by
-                )
-                purchases_created += 1
-            else:
-                # Reset amount_paid to 0 temporarily if SupplierPayment doesn't exist yet
-                if not SupplierPayment.objects.filter(purchase=purchase_obj).exists():
-                    purchase_obj.payment_method = Purchase.PaymentMethod.CREDIT
-                    purchase_obj.amount_paid = Decimal("0.00")
-                    purchase_obj.save(update_fields=["payment_method", "amount_paid"])
+    print(f"\nProcessing Group 2: {group2_purchases.count()} items...")
 
-            # 2. Create SupplierPayment record
-            if not SupplierPayment.objects.filter(purchase=purchase_obj).exists():
-                SupplierPayment.objects.create(
-                    purchase=purchase_obj,
-                    amount=purchase_obj.total_cost,
-                    payment_method=SupplierPayment.PaymentMethod.CASH,
-                    notes=f"Auto-backfilled historical restock payment for {mov.item.name}"
-                )
-                payments_created += 1
+    for p in group2_purchases:
+        # Keep original date intact, only update batch grouping references
+        StockBatch.objects.filter(reference=f"PURCHASE-{p.id}").update(
+            batch_number=group2_po
+        )
 
-                # Update payment_method to CASH once fully paid
-                purchase_obj.payment_method = Purchase.PaymentMethod.CASH
-                purchase_obj.save(update_fields=["payment_method"])
+        StockMovement.objects.filter(reference=f"PURCHASE-{p.id}").update(
+            notes=f"Purchase Order ({group2_po}) - {p.item.name}"
+        )
 
-    print(f"Successfully created {purchases_created} Purchase record(s).")
-    print(f"Successfully generated {payments_created} Supplier Payment(s).")
-
+    print(f"✅ Group 2 updated! {len(remaining_ids)} items grouped under '{group2_po}' (dates kept intact).")
 
 if __name__ == "__main__":
-    create_purchases_and_payments_from_movements()
+    reorganize_purchase_orders()
