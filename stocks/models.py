@@ -1359,6 +1359,81 @@ class Purchase(models.Model):
             f"Purchase ({self.quantity}) [{self.payment_method}]"
         )
 
+class PurchaseOrder(models.Model):
+    """Parent model representing the overall Purchase Order (Header)."""
+    class PaymentMethod(models.TextChoices):
+        CASH = "CASH", "Cash"
+        MPESA = "MPESA", "M-Pesa"
+        PAYBILL = "PAYBILL", "Paybill"
+        SEND_MONEY = "SEND_MONEY", "Send Money"
+        BANK_TRANSFER = "BANK_TRANSFER", "Bank Transfer"
+        CREDIT = "CREDIT", "Credit / On Account"
+
+    po_number = models.CharField(max_length=64, unique=True, db_index=True)
+    branch = models.ForeignKey(RetailBranch, on_delete=models.CASCADE, related_name="purchase_orders")
+    supplier = models.ForeignKey(Supplier, on_delete=models.SET_NULL, null=True, blank=True)
+    supplier_name = models.CharField(max_length=200, blank=True)
+    payment_method = models.CharField(max_length=30, choices=PaymentMethod.choices, default=PaymentMethod.CASH)
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=ZERO)
+    amount_paid = models.DecimalField(max_digits=12, decimal_places=2, default=ZERO)
+    purchase_date = models.DateTimeField(default=timezone.now)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="purchase_orders_created")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def recalculate_totals(self):
+        aggregated = self.items.aggregate(
+            total=Sum(F("quantity") * F("unit_cost_price"), output_field=models.DecimalField(max_digits=12, decimal_places=2))
+        )
+        self.total_amount = quantize_money(aggregated["total"] or ZERO)
+        if self.payment_method != self.PaymentMethod.CREDIT:
+            self.amount_paid = self.total_amount
+        self.save(update_fields=["total_amount", "amount_paid"])
+
+    def __str__(self):
+        return f"{self.po_number} ({self.branch.name}) - KSh {self.total_amount}"
+
+
+class PurchaseOrderItem(models.Model):
+    """Child model representing individual line items in a Purchase Order."""
+    purchase_order = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE, related_name="items")
+    item = models.ForeignKey(Item, on_delete=models.CASCADE, related_name="po_line_items")
+    quantity = models.DecimalField(max_digits=12, decimal_places=3, validators=[MinValueValidator(MIN_QTY)])
+    unit_cost_price = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(ZERO)])
+
+    @db_transaction.atomic
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+
+        # Create batch & stock movement per line item under parent PO reference
+        batch, _ = StockBatch.objects.get_or_create(
+            branch=self.purchase_order.branch,
+            item=self.item,
+            batch_number=self.purchase_order.po_number,
+            defaults={
+                "quantity_received": self.quantity,
+                "quantity_remaining": self.quantity,
+                "unit_cost_price": self.unit_cost_price,
+                "received_at": self.purchase_order.purchase_date,
+                "reference": f"PO-{self.purchase_order.pk}",
+            }
+        )
+
+        StockMovement.objects.create(
+            branch=self.purchase_order.branch,
+            item=self.item,
+            batch=batch,
+            movement_type=StockMovement.MovementType.PURCHASE,
+            quantity=self.quantity,
+            unit_cost_price=self.unit_cost_price,
+            date=self.purchase_order.purchase_date.date(),
+            reference=f"PO-{self.purchase_order.pk}",
+            reference_id=self.purchase_order.pk,
+            notes=f"Purchase Order ({self.purchase_order.po_number})",
+            created_by=self.purchase_order.created_by,
+        )
+
+        recalculate_wac_sales_cost(self.purchase_order.branch, self.item)
+        self.purchase_order.recalculate_totals()
 
 class SupplierPayment(models.Model):
     class PaymentMethod(models.TextChoices):

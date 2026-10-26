@@ -1004,7 +1004,16 @@ class SupplierPaymentAdmin(TenantAwareModelAdmin):
         "purchase__supplier_name",
     )
     ordering = ("-created_at",)
+from .models import PurchaseOrder, PurchaseOrderItem
 
+class PurchaseOrderItemInline(admin.TabularInline):
+    model = PurchaseOrderItem
+    extra = 1
+
+@admin.register(PurchaseOrder)
+class PurchaseOrderAdmin(admin.ModelAdmin):
+    list_display = ("po_number", "branch", "supplier_name", "total_amount", "amount_paid", "payment_method", "purchase_date")
+    inlines = [PurchaseOrderItemInline]
 
 @admin.register(MonthlyTransactionArchive)
 class MonthlyTransactionArchiveAdmin(TenantAwareModelAdmin):
