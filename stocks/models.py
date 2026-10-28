@@ -3188,8 +3188,12 @@ def default_module_permissions():
 
 class UserRolePermission(models.Model):
     class Role(models.TextChoices):
+        SUPERADMIN = "SUPERADMIN", "Super Administrator"
         ADMIN = "ADMIN", "Administrator"
         MANAGER = "MANAGER", "Manager"
+        CASHIER = "CASHIER", "Cashier"
+        STORE_KEEPER = "STORE_KEEPER", "Store Keeper"
+        ACCOUNTANT = "ACCOUNTANT", "Accountant"
         NORMAL_USER = "NORMAL_USER", "Normal User"
 
     user = models.OneToOneField(
@@ -3198,7 +3202,7 @@ class UserRolePermission(models.Model):
         related_name="role_permission",
     )
     role = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=Role.choices,
         default=Role.NORMAL_USER,
     )
@@ -3221,6 +3225,6 @@ class UserRolePermission(models.Model):
         ordering = ["user__username"]
 
     def __str__(self):
-        return f"{self.user} — {self.get_role_display()}"
+        return f"{self.user.username} — {self.get_role_display()}"
 
     

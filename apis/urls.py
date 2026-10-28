@@ -1,6 +1,8 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework import permissions
 
 from .views import (
     ItemViewSet,
@@ -14,11 +16,9 @@ from .views import (
     StockMovementViewSet,
     PendingApprovalViewSet,
     CopyBranchItemsView,
-    UserLoginView,
-    ManagementLoginView,
-    AdminLoginView,
-    ChangePasswordView,
     CustomTokenObtainPairView,
+    LogoutViewSet,
+    ChangePasswordView,
     RegisterView,
     UserProfileView,
     CustomerViewSet,
@@ -69,18 +69,16 @@ router.register(r'management-reports', ManagementReportsViewSet, basename='manag
 router.register(r'user-permissions', UserPermissionViewSet, basename='user-permissions')
 
 urlpatterns = [
-    # Authentication
+    # Unified Authentication & JWT (Handles both /login/ and /auth/login/)
+    path('login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair_alias'),
     path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('auth/user-login/', UserLoginView.as_view(), name='user_login'),
-    path('auth/management-login/', ManagementLoginView.as_view(), name='management_login'),
-    path('auth/admin-login/', AdminLoginView.as_view(), name='admin_login'),
-    path('management/login/', ManagementLoginView.as_view(), name='management-login'),
+    path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('auth/logout/', LogoutViewSet.as_view({'post': 'logout'}), name='auth_logout'),
 
     # Registration and account management
     path('auth/register/', RegisterView.as_view(), name='register'),
     path('auth/profile/', UserProfileView.as_view(), name='user_profile'),
     path('auth/change-password/', ChangePasswordView.as_view(), name='change_password'),
-    path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
 
     # Password reset
     path('auth/request-otp/', RequestOTPView.as_view(), name='request_otp'),

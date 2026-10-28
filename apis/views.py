@@ -18,6 +18,9 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from rest_framework import permissions, status, viewsets
 from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework import permissions
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
@@ -402,102 +405,59 @@ User = get_user_model()
 # apis/views.py
 
 def get_user_permissions_payload(user):
-    from apis.models import UserRolePermission, default_module_permissions
+    """
+    Safely resolves user permissions from stocks.models without circular/missing imports.
+    """
+    try:
+        from stocks.models import UserRolePermission, default_module_permissions
+        defaults = default_module_permissions() if callable(default_module_permissions) else {}
+    except Exception as e:
+        logger.warning(f"Could not load default_module_permissions: {e}")
+        defaults = {}
 
-    if user.is_superuser:
-        return {k: {"view": True, "change": True} for k in default_module_permissions().keys()}
+    if getattr(user, 'is_superuser', False):
+        return {k: {"view": True, "change": True} for k in defaults.keys()}
 
-    perm_record = UserRolePermission.objects.filter(user=user).first()
-    if perm_record and isinstance(perm_record.module_permissions, dict):
-        defaults = default_module_permissions()
-        defaults.update(perm_record.module_permissions)
-        return defaults
+    try:
+        from stocks.models import UserRolePermission
+        perm_record = UserRolePermission.objects.filter(user=user).first()
+        if perm_record and isinstance(perm_record.module_permissions, dict):
+            defaults.update(perm_record.module_permissions)
+            return defaults
+    except Exception as e:
+        logger.error(f"Error resolving UserRolePermission for {user}: {e}")
 
-    return default_module_permissions()
+    return defaults
 
 
 def serialize_user_with_permissions(user):
     """
     Formats complete user profile dictionary expected by frontend App.jsx & localStorage.
     """
-    perm_record = UserRolePermission.objects.filter(user=user).first()
+    role = "NORMAL_USER"
+    try:
+        from stocks.models import UserRolePermission
+        perm_record = UserRolePermission.objects.filter(user=user).first()
+        if perm_record and getattr(perm_record, 'role', None):
+            role = perm_record.role
+        elif getattr(user, 'is_superuser', False):
+            role = "SUPERADMIN"
+        elif getattr(user, 'is_staff', False):
+            role = "ADMIN"
+    except Exception as e:
+        logger.warning(f"Failed to fetch role record: {e}")
+
     return {
         "id": user.pk,
         "username": user.get_username(),
-        "full_name": user.get_full_name(),
-        "email": user.email,
+        "full_name": user.get_full_name() or user.get_username(),
+        "email": getattr(user, 'email', '') or '',
         "is_active": user.is_active,
         "is_staff": user.is_staff,
         "is_superuser": user.is_superuser,
-        "role": (
-            perm_record.role
-            if perm_record
-            else ("ADMIN" if user.is_superuser else "NORMAL_USER")
-        ),
+        "role": role,
         "permissions": get_user_permissions_payload(user),
     }
-
-
-class UserLoginView(APIView):
-    """
-    1. Normal User Portal Login Endpoint.
-    Accessible by: All authenticated users (Regular, Staff & Superadmins).
-    """
-    permission_classes = [permissions.AllowAny]
-
-    def post(self, request):
-        username = request.data.get("username")
-        password = request.data.get("password")
-
-        user = authenticate(request, username=username, password=password)
-
-        if not user:
-            return Response(
-                {"error": "Invalid username or password."},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-
-        token_data = generate_30min_tokens_for_user(user, portal_type="user")
-        
-        # FIX: Inject full user profile and permissions object into login response
-        token_data["user"] = serialize_user_with_permissions(user)
-
-        return Response(token_data, status=status.HTTP_200_OK)
-
-
-class AdminLoginView(APIView):
-    """
-    3. Dedicated Admin Portal Login Endpoint.
-    Accessible by: Staff/Admins & Superadmins.
-    """
-    permission_classes = [permissions.AllowAny]
-
-    def post(self, request):
-        username = request.data.get("username")
-        password = request.data.get("password")
-
-        user = authenticate(request, username=username, password=password)
-
-        if not user:
-            return Response(
-                {"error": "Invalid admin credentials."},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
-
-        # Enforce admin privilege (is_staff or is_superuser)
-        if not (user.is_staff or user.is_superuser):
-            return Response(
-                {"error": "Access denied. Superadmin or Admin privileges required."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        token_data = generate_30min_tokens_for_user(user, portal_type="admin")
-        
-        # FIX: Inject full user profile and permissions object into login response
-        token_data["user"] = serialize_user_with_permissions(user)
-
-        return Response(token_data, status=status.HTTP_200_OK)
-
 
 class UserProfileView(APIView):
     """
@@ -696,75 +656,130 @@ class VerifyOTPAndResetPassword(APIView):
             {"detail": "Password reset successfully! You can now log in."},
             status=status.HTTP_200_OK
         )
-class ManagementLoginView(APIView):
-    """
-    Management Portal Login Endpoint.
-    Accessible by: Management/Staff Users & Superadmins.
-    """
-    permission_classes = [permissions.AllowAny]
 
-    def post(self, request):
-        username = request.data.get("username", "").strip()
-        password = request.data.get("password")
-        branch_input = request.data.get("branch") or request.data.get("branch_id")
 
-        if not username or not password:
-            return Response(
-                {"error": "Please provide both username and password."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+import logging
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.views import TokenObtainPairView
 
-        user = authenticate(request, username=username, password=password)
+from stocks.models import UserRolePermission, default_module_permissions
 
-        if not user:
-            return Response(
-                {"error": "Invalid management credentials."},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
+logger = logging.getLogger(__name__)
 
-        # Enforce management / staff privilege (or superadmin)
-        if not (user.is_staff or user.is_superuser):
-            return Response(
-                {"error": "Access denied. Management authorization required."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        # Generate JWT tokens
-        refresh = RefreshToken.for_user(user)
-        access_token = str(refresh.access_token)
-        refresh_token = str(refresh)
-
-        # Get fully formatted user profile with permissions object
-        user_data = serialize_user_with_permissions(user)
-        
-        # Preserve branch context assignment
-        user_data["branch"] = branch_input or getattr(user, 'branch_id', None)
-
-        return Response({
-            "access": access_token,
-            "token": access_token,
-            "refresh": refresh_token,
-            "refresh_token": refresh_token,
-            "user": user_data
-        }, status=status.HTTP_200_OK)
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
-    """
-    Customizes JWT login response to return user profile info along with 30-minute tokens.
-    """
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+
+        # Basic JWT Claims
+        token["username"] = getattr(user, "username", "")
+        token["email"] = getattr(user, "email", "") or ""
+        token["is_superuser"] = bool(getattr(user, "is_superuser", False))
+        token["is_staff"] = bool(getattr(user, "is_staff", False))
+
+        return token
+
     def validate(self, attrs):
+        # 1. Authenticate user credentials via standard SimpleJWT
         data = super().validate(attrs)
-        refresh = self.get_token(self.user)
-        refresh.access_token.set_exp(lifetime=timedelta(minutes=30))
-        
-        data["access"] = str(refresh.access_token)
-        data["refresh"] = str(refresh)
-        data["user"] = serialize_user_with_permissions(self.user)
+        user = self.user
+
+        is_superuser = bool(getattr(user, "is_superuser", False))
+        is_staff = bool(getattr(user, "is_staff", False))
+
+        # 2. Get default permissions map safely
+        try:
+            if callable(default_module_permissions):
+                default_perms = default_module_permissions()
+            else:
+                default_perms = dict(default_module_permissions)
+        except Exception as e:
+            logger.warning(f"Error fetching default module permissions: {e}")
+            default_perms = {}
+
+        user_role = "NORMAL_USER"
+        permissions_payload = default_perms
+
+        # 3. Safe UserRolePermission lookup using .filter().first() to avoid DoesNotExist exceptions
+        try:
+            role_perm = UserRolePermission.objects.filter(user=user).first()
+            if role_perm:
+                user_role = str(role_perm.role)
+                if isinstance(role_perm.module_permissions, dict):
+                    # Merge stored permissions over default dictionary
+                    merged_perms = dict(default_perms)
+                    merged_perms.update(role_perm.module_permissions)
+                    permissions_payload = merged_perms
+            else:
+                if is_superuser:
+                    user_role = "SUPERADMIN"
+                elif is_staff:
+                    user_role = "ADMIN"
+        except Exception as e:
+            logger.warning(f"Error resolving user permissions for {user}: {e}")
+
+        # If user is Superadmin, grant full permissions across all modules
+        if is_superuser and permissions_payload:
+            permissions_payload = {
+                k: {"view": True, "change": True} for k in permissions_payload.keys()
+            }
+
+        # 4. Determine Portal Destination
+        if is_superuser or user_role in ["SUPERADMIN", "ADMIN"]:
+            portal_type = "admin"
+        elif user_role in ["MANAGER", "MANAGEMENT"]:
+            portal_type = "management"
+        else:
+            portal_type = "user"
+
+        # 5. Safe RetailBranch lookup (user.branches)
+        branch_id = None
+        branch_name = "All Branches"
+        try:
+            if hasattr(user, "branches"):
+                user_branch = user.branches.first()
+                if user_branch:
+                    branch_id = getattr(user_branch, "id", None)
+                    branch_name = getattr(user_branch, "name", "All Branches")
+        except Exception as e:
+            logger.warning(f"Error resolving branch for user {user}: {e}")
+
+        # 6. Assemble complete auth response payload
+        data["user"] = {
+            "id": user.id,
+            "username": getattr(user, "username", ""),
+            "email": getattr(user, "email", "") or "",
+            "role": user_role,
+            "is_staff": is_staff,
+            "is_superuser": is_superuser,
+            "branch": branch_id,
+            "branch_name": branch_name,
+            "permissions": permissions_payload,
+        }
+        data["portal_type"] = portal_type
+
         return data
 
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
+
+    def post(self, request, *args, **kwargs):
+        try:
+            return super().post(request, *args, **kwargs)
+        except Exception as e:
+            logger.exception(f"Unhandled login processing error: {e}")
+            return Response(
+                {
+                    "error": "Authentication processing failed.",
+                    "detail": str(e),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
 
 
 class RegisterView(generics.CreateAPIView):
@@ -788,6 +803,139 @@ class RegisterView(generics.CreateAPIView):
             },
             status=status.HTTP_201_CREATED,
         )
+from rest_framework_simplejwt.exceptions import TokenError
+
+class AuthViewSet(viewsets.GenericViewSet):
+    permission_classes = [AllowAny]
+
+    @action(detail=False, methods=["post"], url_path="login")
+    def login(self, request):
+        try:
+            username = request.data.get("username")
+            password = request.data.get("password")
+
+            if not username or not password:
+                return Response(
+                    {"error": "Username and password are required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Authenticate user credentials
+            user = authenticate(request, username=username, password=password)
+
+            if user is None:
+                return Response(
+                    {"error": "Invalid credentials."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+
+            if not getattr(user, "is_active", True):
+                return Response(
+                    {"error": "User account is disabled."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            # -------------------------------------------------------------
+            # DYNAMIC ROLE & GRANULAR PERMISSIONS RESOLUTION (SAFE LOOKUP)
+            # -------------------------------------------------------------
+            role_perm = UserRolePermission.objects.filter(user=user).first()
+
+            def get_fallback_permissions():
+                try:
+                    if callable(default_module_permissions):
+                        return default_module_permissions()
+                    return default_module_permissions
+                except Exception:
+                    return {}
+
+            if role_perm:
+                role = str(getattr(role_perm, "role", "NORMAL_USER"))
+                permissions_map = getattr(role_perm, "module_permissions", None) or get_fallback_permissions()
+            else:
+                if getattr(user, "is_superuser", False):
+                    role = "SUPERADMIN"
+                elif getattr(user, "is_staff", False):
+                    role = "ADMIN"
+                else:
+                    role = "NORMAL_USER"
+
+                permissions_map = get_fallback_permissions()
+
+            # Grant full admin portal access to superusers / staff / admins
+            if getattr(user, "is_superuser", False) or role in ["SUPERADMIN", "ADMIN"]:
+                portal_type = "admin"
+            else:
+                portal_type = "user"
+
+            # Safe branch lookup
+            user_branch = None
+            try:
+                if hasattr(user, "branches"):
+                    user_branch = user.branches.first()
+            except Exception:
+                user_branch = None
+
+            branch_id = getattr(user_branch, "id", None)
+            branch_name = getattr(user_branch, "name", "All Branches")
+
+            # Generate JWT tokens
+            refresh = RefreshToken.for_user(user)
+
+            return Response(
+                {
+                    "access": str(refresh.access_token),
+                    "refresh": str(refresh),
+                    "portal_type": portal_type,
+                    "user": {
+                        "id": user.id,
+                        "username": user.username,
+                        "email": getattr(user, "email", "") or "",
+                        "role": role,
+                        "permissions": permissions_map,
+                        "is_staff": bool(getattr(user, "is_staff", False)),
+                        "is_superuser": bool(getattr(user, "is_superuser", False)),
+                        "branch": branch_id,
+                        "branch_name": branch_name,
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            logger.error(f"Login processing error: {e}", exc_info=True)
+            return Response(
+                {"error": "Authentication processing failed.", "detail": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+class LogoutViewSet(viewsets.ViewSet):
+    """
+    ViewSet to handle user logout by blacklisting the provided JWT refresh token.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @action(detail=False, methods=["post"], url_path="logout")
+    def logout(self, request):
+        refresh_token = request.data.get("refresh") or request.data.get("refresh_token")
+
+        if not refresh_token:
+            return Response(
+                {"error": "Refresh token is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            return Response(
+                {"message": "Successfully logged out."},
+                status=status.HTTP_205_RESET_CONTENT,
+            )
+        except TokenError as e:
+            return Response(
+                {"error": "Invalid or expired refresh token.", "detail": str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
 # ============================================================
 # CUSTOMER
