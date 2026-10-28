@@ -3123,3 +3123,60 @@ class PasswordResetOTP(models.Model):
             expires_at=expiry
         )
         return otp_obj
+
+def default_module_permissions():
+    """Initial permissions for a newly configured user."""
+    return {
+        "dashboard": {"view": True, "change": False},
+        "sales": {"view": True, "change": False},
+        "inventory": {"view": True, "change": False},
+        "customers": {"view": True, "change": False},
+        "purchases": {"view": False, "change": False},
+        "expenses": {"view": False, "change": False},
+        "reports": {"view": False, "change": False},
+        "cashbook": {"view": False, "change": False},
+        "balance_sheet": {"view": False, "change": False},
+        "branches": {"view": False, "change": False},
+        "approvals": {"view": False, "change": False},
+        "user_permissions": {"view": False, "change": False},
+    }
+
+
+class UserRolePermission(models.Model):
+    class Role(models.TextChoices):
+        ADMIN = "ADMIN", "Administrator"
+        MANAGER = "MANAGER", "Manager"
+        NORMAL_USER = "NORMAL_USER", "Normal User"
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="role_permission",
+    )
+    role = models.CharField(
+        max_length=20,
+        choices=Role.choices,
+        default=Role.NORMAL_USER,
+    )
+    module_permissions = models.JSONField(
+        default=default_module_permissions,
+        blank=True,
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="user_permissions_updated",
+    )
+
+    class Meta:
+        verbose_name = "User Role and Permission"
+        verbose_name_plural = "User Roles and Permissions"
+        ordering = ["user__username"]
+
+    def __str__(self):
+        return f"{self.user} — {self.get_role_display()}"
+
+    

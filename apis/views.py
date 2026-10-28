@@ -16,6 +16,8 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+from rest_framework import permissions, status, viewsets
+from rest_framework.response import Response
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
@@ -70,6 +72,8 @@ from stocks.models import (
     SaleTransaction,
     StockBatch,
     StockMovement,
+    UserRolePermission, 
+    default_module_permissions,
     BranchStock,
     StockTransfer,
     PurchaseOrder,
@@ -732,6 +736,315 @@ class CopyBranchItemsView(APIView):
         serializer.is_valid(raise_exception=True)
         result = serializer.save()
         return Response(result, status=status.HTTP_201_CREATED)
+
+
+def default_module_permissions():
+    """
+    Returns default permission structure for user module access.
+    """
+    return {
+        "sales": {"view": True, "change": False},
+        "procurement": {"view": True, "change": False},
+        "inventory": {"view": True, "change": False},
+        "payments": {"view": True, "change": False},
+        "receipts": {"view": True, "change": False},
+        "customers": {"view": True, "change": False},
+        "suppliers": {"view": True, "change": False},
+        "reports": {"view": True, "change": False},
+    }
+
+
+def can_manage_user_permissions(user):
+    """
+    Only authenticated staff or superusers may manage user permissions.
+    """
+    return bool(
+        user
+        and user.is_authenticated
+        and (user.is_superuser or user.is_staff)
+    )
+
+
+class UserPermissionViewSet(viewsets.ViewSet):
+    """
+    Router-compatible API for managing user roles and permissions.
+
+    GET    /user-permissions/
+    GET    /user-permissions/{pk}/
+    PUT    /user-permissions/{pk}/
+    PATCH  /user-permissions/{pk}/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    ALLOWED_ROLES = {
+        UserRolePermission.Role.ADMIN,
+        UserRolePermission.Role.MANAGER,
+        UserRolePermission.Role.NORMAL_USER,
+    }
+
+    def _is_authorized(self, request):
+        return can_manage_user_permissions(request.user)
+
+    def _get_record(self, user):
+        if hasattr(user, "_prefetched_role_permission"):
+            return getattr(user, "_prefetched_role_permission")
+        return UserRolePermission.objects.filter(user=user).first()
+
+    def _serialize_user(self, user, include_updated_at=True):
+        record = self._get_record(user)
+
+        data = {
+            "id": user.pk,
+            "username": user.get_username(),
+            "full_name": user.get_full_name(),
+            "email": user.email,
+            "is_active": user.is_active,
+            "is_staff": user.is_staff,
+            "is_superuser": user.is_superuser,
+            "role": (
+                record.role
+                if record
+                else (
+                    UserRolePermission.Role.ADMIN
+                    if user.is_superuser
+                    else UserRolePermission.Role.NORMAL_USER
+                )
+            ),
+            "permissions": (
+                record.module_permissions
+                if record and isinstance(record.module_permissions, dict)
+                else default_module_permissions()
+            ),
+        }
+
+        if include_updated_at:
+            data["updated_at"] = (
+                record.updated_at.isoformat()
+                if record and record.updated_at
+                else None
+            )
+
+        return data
+
+    def list(self, request):
+        """GET /user-permissions/"""
+
+        if not self._is_authorized(request):
+            return Response(
+                {"detail": "You are not allowed to manage user permissions."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        users = User.objects.all().order_by("username")
+        user_ids = [u.pk for u in users]
+        
+        # Batch fetch UserRolePermission records to optimize performance
+        perm_map = {
+            perm.user_id: perm
+            for perm in UserRolePermission.objects.filter(user_id__in=user_ids)
+        }
+
+        serialized = []
+        for user in users:
+            user._prefetched_role_permission = perm_map.get(user.pk)
+            serialized.append(self._serialize_user(user))
+
+        return Response(serialized, status=status.HTTP_200_OK)
+
+    def retrieve(self, request, pk=None):
+        """GET /user-permissions/{pk}/"""
+
+        if not self._is_authorized(request):
+            return Response(
+                {"detail": "You are not allowed to view these permissions."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            target = User.objects.get(pk=pk)
+        except (User.DoesNotExist, ValueError, TypeError):
+            return Response(
+                {"detail": "User not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(
+            self._serialize_user(target),
+            status=status.HTTP_200_OK,
+        )
+
+    def update(self, request, pk=None):
+        """PUT /user-permissions/{pk}/"""
+
+        return self._save(request, pk)
+
+    def partial_update(self, request, pk=None):
+        """PATCH /user-permissions/{pk}/"""
+
+        return self._save(request, pk)
+
+    def _save(self, request, pk):
+        if not self._is_authorized(request):
+            return Response(
+                {"detail": "You are not allowed to change user permissions."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            target = User.objects.get(pk=pk)
+        except (User.DoesNotExist, ValueError, TypeError):
+            return Response(
+                {"detail": "User not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Superuser permissions must be changed through Django administration.
+        if target.is_superuser:
+            return Response(
+                {
+                    "detail": (
+                        "Superuser accounts are protected. "
+                        "Change their access through Django administration."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        role = request.data.get("role")
+        incoming_permissions = request.data.get("permissions")
+
+        if role is not None and role not in self.ALLOWED_ROLES:
+            return Response(
+                {"detail": "Invalid role supplied."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Do not permit an administrator to downgrade their own role here.
+        if target.pk == request.user.pk:
+            if role is not None and role != UserRolePermission.Role.ADMIN:
+                return Response(
+                    {"detail": "You cannot downgrade your own role here."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        existing = self._get_record(target)
+
+        # Validate and merge incoming module permissions.
+        merged_permissions = None
+
+        if incoming_permissions is not None:
+            if not isinstance(incoming_permissions, dict):
+                return Response(
+                    {"detail": "'permissions' must be an object."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            defaults = default_module_permissions()
+            valid_modules = set(defaults.keys())
+            unknown_modules = set(incoming_permissions.keys()) - valid_modules
+
+            if unknown_modules:
+                return Response(
+                    {
+                        "detail": "Unknown permission modules.",
+                        "modules": sorted(unknown_modules),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            merged_permissions = {
+                module: dict(flags)
+                for module, flags in defaults.items()
+            }
+
+            if (
+                existing
+                and isinstance(existing.module_permissions, dict)
+            ):
+                for module, flags in existing.module_permissions.items():
+                    if module in valid_modules and isinstance(flags, dict):
+                        merged_permissions[module].update(flags)
+
+            for module, flags in incoming_permissions.items():
+                if not isinstance(flags, dict):
+                    return Response(
+                        {
+                            "detail": (
+                                f"Invalid permissions for '{module}'."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                unknown_actions = set(flags.keys()) - {"view", "change"}
+                if unknown_actions:
+                    return Response(
+                        {
+                            "detail": (
+                                f"Unknown permission actions for '{module}'."
+                            ),
+                            "actions": sorted(unknown_actions),
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                for action, value in flags.items():
+                    if not isinstance(value, bool):
+                        return Response(
+                            {
+                                "detail": (
+                                    f"'{module}.{action}' must be "
+                                    "true or false."
+                                )
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                merged_permissions[module].update(flags)
+
+            # Changing a module requires permission to view it.
+            for module, flags in merged_permissions.items():
+                if flags.get("change", False):
+                    flags["view"] = True
+
+        with transaction.atomic():
+            record, created = (
+                UserRolePermission.objects.select_for_update()
+                .get_or_create(
+                    user=target,
+                    defaults={
+                        "role": (
+                            role
+                            or UserRolePermission.Role.NORMAL_USER
+                        ),
+                        "module_permissions": (
+                            default_module_permissions()
+                        ),
+                    },
+                )
+            )
+
+            if role is not None:
+                record.role = role
+
+            if merged_permissions is not None:
+                record.module_permissions = merged_permissions
+
+            record.updated_by = request.user
+            record.save()
+
+        # Update cache on target
+        target._prefetched_role_permission = record
+        result = self._serialize_user(target)
+
+        return Response(
+            {
+                "detail": "User permissions updated successfully.",
+                **result,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 # ============================================================
 # CUSTOMER
@@ -6162,36 +6475,64 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     def _get_branch_and_dates(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
+        period_type = (request.query_params.get("period_type") or "month").lower().strip()
+
         start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
         end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
+        date_param = request.query_params.get("date") or request.query_params.get("selectedDate")
         month_param = request.query_params.get("month")
         year_param = request.query_params.get("year")
 
         today = timezone.localdate()
 
-        if start_param and end_param:
+        # 1. Custom Range
+        if period_type == "custom" and start_param and end_param:
             try:
                 start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
                 end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
             except ValueError:
-                start_date = today
-                end_date = today
-        elif month_param and year_param:
+                start_date, end_date = today, today
+
+        # 2. Daily or Weekly View
+        elif period_type in ["day", "weekly"]:
             try:
-                yr = int(year_param)
-                mth = int(month_param)
+                parsed_date = datetime.strptime(str(date_param).strip(), "%Y-%m-%d").date() if date_param else today
+            except ValueError:
+                parsed_date = today
+
+            if period_type == "day":
+                start_date, end_date = parsed_date, parsed_date
+            else:
+                start_date = parsed_date
+                end_date = parsed_date + timedelta(days=6)
+
+        # 3. Monthly View
+        elif period_type == "month":
+            try:
+                yr = int(year_param) if year_param else today.year
+                mth = int(month_param) if month_param else today.month
                 _, last_day = calendar.monthrange(yr, mth)
-                start_date = datetime(yr, mth, 1).date()
-                end_date = datetime(yr, mth, last_day).date()
+                start_date = date(yr, mth, 1)
+                end_date = date(yr, mth, last_day)
             except (ValueError, TypeError):
-                start_date = today
-                end_date = today
+                _, last_day = calendar.monthrange(today.year, today.month)
+                start_date = date(today.year, today.month, 1)
+                end_date = date(today.year, today.month, last_day)
+
+        # 4. Yearly View
+        elif period_type == "year":
+            try:
+                yr = int(year_param) if year_param else today.year
+                start_date = date(yr, 1, 1)
+                end_date = date(yr, 12, 31)
+            except (ValueError, TypeError):
+                start_date = date(today.year, 1, 1)
+                end_date = date(today.year, 12, 31)
+
         else:
             _, last_day = calendar.monthrange(today.year, today.month)
-            start_date = datetime(today.year, today.month, 1).date()
-            end_date = datetime(today.year, today.month, last_day).date()
-
-
+            start_date = date(today.year, today.month, 1)
+            end_date = date(today.year, today.month, last_day)
 
         tz = timezone.get_current_timezone()
         start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
@@ -6204,7 +6545,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             except (RetailBranch.DoesNotExist, ValueError):
                 branch_obj = None
 
-        return branch_obj, start_date, end_date, start_dt, end_dt
+        return branch_obj, start_date, end_date, start_dt, end_dt, period_type
 
     def _get_filter_params(self, request):
             branch_id = request.query_params.get('branch_id')
@@ -6253,195 +6594,306 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='dashboard-cards')
     def dashboard_cards(self, request):
-            try:
-                branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
 
-                # -----------------------------------------------------------------
-                # 1. BASE QUERYSETS
-                # -----------------------------------------------------------------
-                sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-                
-                expenses_qs = Expense.objects.filter(
-                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-                ).exclude(description__icontains='Supplier Repayment')
-                
-                purchases_qs = Purchase.objects.filter(
-                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            # -----------------------------------------------------------------
+            # 1. UNFILTERED BASE QUERYSETS BY BRANCH
+            # -----------------------------------------------------------------
+            base_sales_qs = SaleTransaction.objects.all()
+            base_expenses_qs = Expense.objects.exclude(description__icontains='Supplier Repayment')
+            base_purchases_qs = Purchase.objects.all()
+            base_supplier_pmts_qs = SupplierPayment.objects.all()
+            base_credit_repay_qs = CreditRepayment.objects.all()
+
+            if branch_obj:
+                base_sales_qs = base_sales_qs.filter(branch=branch_obj)
+                base_expenses_qs = base_expenses_qs.filter(branch=branch_obj)
+                base_purchases_qs = base_purchases_qs.filter(branch=branch_obj)
+                base_supplier_pmts_qs = base_supplier_pmts_qs.filter(purchase__branch=branch_obj)
+                base_credit_repay_qs = base_credit_repay_qs.filter(branch=branch_obj)
+
+            # Filtered Querysets for Top Metric Summary Cards
+            sales_qs = base_sales_qs.filter(sale_date__range=(start_dt, end_dt))
+            expenses_qs = base_expenses_qs.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            purchases_qs = base_purchases_qs.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            supplier_payments_qs = base_supplier_pmts_qs.filter(created_at__range=(start_dt, end_dt))
+            customer_repayments_qs = base_credit_repay_qs.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+
+            # -----------------------------------------------------------------
+            # 2. FINANCIAL PERFORMANCE METRICS
+            # -----------------------------------------------------------------
+            total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
+            cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
+            operating_expenses = sum((quantize_money(e.amount or ZERO) for e in expenses_qs), ZERO)
+
+            gross_profit = total_sales - cogs
+            net_profit = gross_profit - operating_expenses
+
+            # -----------------------------------------------------------------
+            # 3. CASH RECEIPTS & DEBTORS
+            # -----------------------------------------------------------------
+            liquid_sales_cash = ZERO
+            for s in sales_qs:
+                breakdown = s.liquid_payments_breakdown
+                liquid_sales_cash += breakdown.get("CASH", ZERO) + breakdown.get("MPESA", ZERO) + breakdown.get("PAYBILL", ZERO)
+
+            customer_repayments = customer_repayments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO)
+            )['total']
+
+            actual_cash_receipts = liquid_sales_cash + customer_repayments
+
+            credit_sales_qs = SaleTransaction.objects.filter(
+                payment_method=SaleTransaction.PaymentMethod.CREDIT
+            )
+            if branch_obj:
+                credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
+
+            total_customer_debtors = sum((quantize_money(s.balance_due or ZERO) for s in credit_sales_qs), ZERO)
+
+            # -----------------------------------------------------------------
+            # 4. INVENTORY & SKUS
+            # -----------------------------------------------------------------
+            pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
+            if branch_obj:
+                pricings_qs = pricings_qs.filter(branch=branch_obj)
+
+            stocks_qs = BranchStock.objects.all()
+            if branch_obj:
+                stocks_qs = stocks_qs.filter(branch=branch_obj)
+
+            branch_stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in stocks_qs}
+
+            total_stock_value = ZERO
+            low_stock_count = 0
+            out_of_stock_count = 0
+            active_skus_count = 0
+
+            for p in pricings_qs:
+                if p.item_id in branch_stock_map:
+                    rem_stock = branch_stock_map[p.item_id]
+                    stock_val = quantize_money(rem_stock * (p.unit_cost_price or ZERO))
+                else:
+                    rem_stock = p.remaining_stock
+                    stock_val = p.remaining_stock_value
+
+                total_stock_value += stock_val
+
+                if rem_stock <= ZERO:
+                    out_of_stock_count += 1
+                elif rem_stock <= (p.min_stock_threshold or ZERO):
+                    low_stock_count += 1
+                else:
+                    active_skus_count += 1
+
+            total_stock_value = quantize_money(total_stock_value)
+            total_cataloged_skus = pricings_qs.values('item_id').distinct().count()
+
+            # -----------------------------------------------------------------
+            # 5. PURCHASES & OUTFLOWS
+            # -----------------------------------------------------------------
+            direct_purchases = purchases_qs.exclude(
+                payment_method='CREDIT'
+            ).filter(
+                supplier_payments__isnull=True
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+
+            supplier_repayments = supplier_payments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO)
+            )['total']
+
+            purchases_total = direct_purchases + supplier_repayments
+            available_funds = actual_cash_receipts - operating_expenses - purchases_total
+
+            # -----------------------------------------------------------------
+            # 6. DYNAMIC TRAJECTORY GENERATION BY PERIOD TYPE
+            #    Monthly -> daily points (frontend can thin displayed tick labels)
+            #    Weekly  -> daily points labelled by weekday
+            #    Yearly  -> monthly points (Jan-Dec)
+            #    Daily / Custom -> daily points
+            # -----------------------------------------------------------------
+            trajectory_data = []
+            tz = timezone.get_current_timezone()
+
+            def append_trajectory_point(label, full_date, sales_qs_for_bucket,
+                                        expenses_qs_for_bucket, bucket_type):
+                bucket_sales = sum(
+                    (quantize_money(s.total_amount or ZERO) for s in sales_qs_for_bucket),
+                    ZERO,
                 )
-                
-                supplier_payments_qs = SupplierPayment.objects.filter(
-                    created_at__range=(start_dt, end_dt)
+                bucket_cogs = sum(
+                    (quantize_money(s.total_cost or ZERO) for s in sales_qs_for_bucket),
+                    ZERO,
+                )
+                bucket_expenses = sum(
+                    (quantize_money(e.amount or ZERO) for e in expenses_qs_for_bucket),
+                    ZERO,
                 )
 
-                customer_repayments_qs = CreditRepayment.objects.filter(
-                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-                )
+                trajectory_data.append({
+                    "date": label,
+                    "full_date": full_date.isoformat(),
+                    "bucket_type": bucket_type,
+                    "total_sales": float(bucket_sales),
+                    "cogs": float(bucket_cogs),
+                    "net_profit": float((bucket_sales - bucket_cogs) - bucket_expenses),
+                })
 
-                if branch_obj:
-                    sales_qs = sales_qs.filter(branch=branch_obj)
-                    expenses_qs = expenses_qs.filter(branch=branch_obj)
-                    purchases_qs = purchases_qs.filter(branch=branch_obj)
-                    supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
-                    customer_repayments_qs = customer_repayments_qs.filter(branch=branch_obj)
+            # YEARLY: one point per month, always Jan-Dec for the selected year.
+            if period_type == "year":
+                target_year = start_date.year
 
-                # -----------------------------------------------------------------
-                # 2. FINANCIAL PERFORMANCE & OPEX
-                # -----------------------------------------------------------------
-                total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
-                cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
-                operating_expenses = sum((quantize_money(e.amount or ZERO) for e in expenses_qs), ZERO)
-                
-                gross_profit = total_sales - cogs
-                net_profit = gross_profit - operating_expenses
+                for month_number in range(1, 13):
+                    month_start_date = date(target_year, month_number, 1)
+                    _, last_day = calendar.monthrange(target_year, month_number)
+                    month_end_date = date(target_year, month_number, last_day)
 
-                # -----------------------------------------------------------------
-                # 3. CASH RECEIPTS & DEBTORS (RECEIVABLES)
-                # -----------------------------------------------------------------
-                liquid_sales_cash = ZERO
-                for s in sales_qs:
-                    breakdown = s.liquid_payments_breakdown
-                    liquid_sales_cash += breakdown.get("CASH", ZERO) + breakdown.get("MPESA", ZERO) + breakdown.get("PAYBILL", ZERO)
+                    month_start_dt = timezone.make_aware(
+                        datetime.combine(month_start_date, time.min), tz
+                    )
+                    month_end_dt = timezone.make_aware(
+                        datetime.combine(month_end_date, time.max), tz
+                    )
 
-                customer_repayments = customer_repayments_qs.aggregate(
-                    total=Coalesce(Sum('amount'), ZERO)
-                )['total']
+                    month_sales = base_sales_qs.filter(
+                        sale_date__range=(month_start_dt, month_end_dt)
+                    )
+                    month_expenses = base_expenses_qs.filter(
+                        Q(date__range=(month_start_date, month_end_date))
+                        | Q(created_at__range=(month_start_dt, month_end_dt))
+                    )
 
-                actual_cash_receipts = liquid_sales_cash + customer_repayments
+                    append_trajectory_point(
+                        month_start_date.strftime("%b"),
+                        month_start_date,
+                        month_sales,
+                        month_expenses,
+                        "month",
+                    )
 
-                credit_sales_qs = SaleTransaction.objects.filter(
-                    payment_method=SaleTransaction.PaymentMethod.CREDIT
-                )
-                if branch_obj:
-                    credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
-
-                total_customer_debtors = sum((quantize_money(s.balance_due or ZERO) for s in credit_sales_qs), ZERO)
-
-                # -----------------------------------------------------------------
-                # 4. INVENTORY & SKUS METRICS
-                # -----------------------------------------------------------------
-                pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
-                if branch_obj:
-                    pricings_qs = pricings_qs.filter(branch=branch_obj)
-
-                stocks_qs = BranchStock.objects.all()
-                if branch_obj:
-                    stocks_qs = stocks_qs.filter(branch=branch_obj)
-                
-                branch_stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in stocks_qs}
-
-                total_stock_value = ZERO
-                low_stock_count = 0
-                out_of_stock_count = 0
-                active_skus_count = 0
-
-                for p in pricings_qs:
-                    if p.item_id in branch_stock_map:
-                        rem_stock = branch_stock_map[p.item_id]
-                        stock_val = quantize_money(rem_stock * (p.unit_cost_price or ZERO))
-                    else:
-                        rem_stock = p.remaining_stock
-                        stock_val = p.remaining_stock_value
-
-                    total_stock_value += stock_val
-
-                    if rem_stock <= ZERO:
-                        out_of_stock_count += 1
-                    elif rem_stock <= (p.min_stock_threshold or ZERO):
-                        low_stock_count += 1
-                    else:
-                        active_skus_count += 1
-
-                total_stock_value = quantize_money(total_stock_value)
-                total_cataloged_skus = pricings_qs.values('item_id').distinct().count()
-
-                # -----------------------------------------------------------------
-                # 5. PURCHASES & SUPPLIER CASH OUTFLOW
-                # -----------------------------------------------------------------
-                direct_purchases = purchases_qs.exclude(
-                    payment_method='CREDIT'
-                ).filter(
-                    supplier_payments__isnull=True
-                ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
-
-                supplier_repayments = supplier_payments_qs.aggregate(
-                    total=Coalesce(Sum('amount'), ZERO)
-                )['total']
-
-                purchases_total = direct_purchases + supplier_repayments
-
-                # -----------------------------------------------------------------
-                # 6. CASH POSITION (LIQUID FUNDS)
-                # -----------------------------------------------------------------
-                available_funds = actual_cash_receipts - operating_expenses - purchases_total
-
-                # -----------------------------------------------------------------
-                # 7. TRAJECTORY GRAPH DATA
-                # -----------------------------------------------------------------
-                trajectory_data = []
+            # MONTHLY: one point per calendar day, not four weekly blocks.
+            # The frontend should show only selected day labels (e.g. 1, 5, 10, 15...)
+            # to avoid crowding while retaining the daily bars.
+            elif period_type == "month":
                 current_day = start_date
+
                 while current_day <= end_date:
-                    day_sales = sales_qs.filter(sale_date__date=current_day)
-                    day_expenses = expenses_qs.filter(date=current_day)
+                    day_start_dt = timezone.make_aware(
+                        datetime.combine(current_day, time.min), tz
+                    )
+                    day_end_dt = timezone.make_aware(
+                        datetime.combine(current_day, time.max), tz
+                    )
 
-                    d_sales = sum((quantize_money(s.total_amount or ZERO) for s in day_sales), ZERO)
-                    d_cogs = sum((quantize_money(s.total_cost or ZERO) for s in day_sales), ZERO)
-                    d_exp = sum((quantize_money(e.amount or ZERO) for e in day_expenses), ZERO)
-                    d_net_profit = (d_sales - d_cogs) - d_exp
+                    day_sales = base_sales_qs.filter(
+                        sale_date__range=(day_start_dt, day_end_dt)
+                    )
+                    day_expenses = base_expenses_qs.filter(
+                        Q(date=current_day)
+                        | Q(created_at__range=(day_start_dt, day_end_dt))
+                    )
 
-                    trajectory_data.append({
-                        "date": current_day.strftime('%b %d'),
-                        "total_sales": float(d_sales),
-                        "cogs": float(d_cogs),
-                        "net_profit": float(d_net_profit)
-                    })
+                    append_trajectory_point(
+                        str(current_day.day),
+                        current_day,
+                        day_sales,
+                        day_expenses,
+                        "day",
+                    )
                     current_day += timedelta(days=1)
 
-                # Structure response payload to strictly match React App.jsx expects:
-                return Response({
-                    "profitability": {
-                        "total_sales": float(total_sales),
-                        "total_sales_formatted": self._format_currency(total_sales),
-                        "cogs": float(cogs),
-                        "cogs_formatted": self._format_currency(cogs),
-                        "gross_profit": float(gross_profit),
-                        "gross_profit_formatted": self._format_currency(gross_profit),
-                        "net_profit": float(net_profit),
-                        "net_profit_formatted": self._format_currency(net_profit),
-                    },
-                    "debtors": {
-                        "total_customer_debts": float(total_customer_debtors),
-                        "total_customer_debts_formatted": self._format_currency(total_customer_debtors),
-                    },
-                    "inventory": {
-                        "total_stock_value": float(total_stock_value),
-                        "total_stock_value_formatted": self._format_currency(total_stock_value),
-                        "product_skus": total_cataloged_skus,
-                        "active_skus": active_skus_count,
-                        "low_stock_items": low_stock_count,
-                        "out_of_stock_items": out_of_stock_count,
-                    },
-                    "cash_flow": {
-                        "receipts": float(actual_cash_receipts),
-                        "receipts_formatted": self._format_currency(actual_cash_receipts),
-                        "payments": float(operating_expenses),
-                        "payments_formatted": self._format_currency(operating_expenses),
-                        "purchases": float(purchases_total),
-                        "purchases_formatted": self._format_currency(purchases_total),
-                        "total_available_funds": float(available_funds),
-                        "total_available_funds_formatted": self._format_currency(available_funds),
-                    },
-                    "trajectory": trajectory_data
-                }, status=status.HTTP_200_OK)
+            # DAILY / WEEKLY / CUSTOM RANGE: one point per day.
+            else:
+                current_day = start_date
 
-            except Exception as e:
-                logger.exception("Dashboard Cards Error: %s", e)
-                return Response({
-                    "profitability": {"total_sales": 0.0, "total_sales_formatted": "KSh 0.00", "cogs": 0.0, "cogs_formatted": "0.00", "gross_profit": 0.0, "gross_profit_formatted": "0.00", "net_profit": 0.0, "net_profit_formatted": "0.00"},
-                    "debtors": {"total_customer_debts": 0.0, "total_customer_debts_formatted": "KSh 0.00"},
-                    "inventory": {"total_stock_value": 0.0, "total_stock_value_formatted": "KSh 0.00", "product_skus": 0, "low_stock_items": 0, "out_of_stock_items": 0},
-                    "cash_flow": {"receipts_formatted": "KSh 0.00", "payments_formatted": "KSh 0.00", "purchases_formatted": "KSh 0.00", "total_available_funds_formatted": "KSh 0.00"},
-                    "trajectory": []
-                }, status=status.HTTP_200_OK)
+                while current_day <= end_date:
+                    day_start_dt = timezone.make_aware(
+                        datetime.combine(current_day, time.min), tz
+                    )
+                    day_end_dt = timezone.make_aware(
+                        datetime.combine(current_day, time.max), tz
+                    )
+
+                    day_sales = base_sales_qs.filter(
+                        sale_date__range=(day_start_dt, day_end_dt)
+                    )
+                    day_expenses = base_expenses_qs.filter(
+                        Q(date=current_day)
+                        | Q(created_at__range=(day_start_dt, day_end_dt))
+                    )
+
+                    if period_type == "weekly":
+                        label = current_day.strftime("%a")
+                    elif period_type == "day":
+                        # This endpoint currently aggregates at day-level.
+                        # Do not imply hourly detail unless the API is changed
+                        # to return hourly buckets.
+                        label = current_day.strftime("%d %b")
+                    else:
+                        label = current_day.strftime("%d %b")
+
+                    append_trajectory_point(
+                        label,
+                        current_day,
+                        day_sales,
+                        day_expenses,
+                        "day",
+                    )
+                    current_day += timedelta(days=1)
+
+            return Response({
+                "profitability": {
+                    "total_sales": float(total_sales),
+                    "total_sales_formatted": self._format_currency(total_sales),
+                    "cogs": float(cogs),
+                    "cogs_formatted": self._format_currency(cogs),
+                    "gross_profit": float(gross_profit),
+                    "gross_profit_formatted": self._format_currency(gross_profit),
+                    "net_profit": float(net_profit),
+                    "net_profit_formatted": self._format_currency(net_profit),
+                },
+                "debtors": {
+                    "total_customer_debts": float(total_customer_debtors),
+                    "total_customer_debts_formatted": self._format_currency(total_customer_debtors),
+                },
+                "inventory": {
+                    "total_stock_value": float(total_stock_value),
+                    "total_stock_value_formatted": self._format_currency(total_stock_value),
+                    "product_skus": total_cataloged_skus,
+                    "active_skus": active_skus_count,
+                    "low_stock_items": low_stock_count,
+                    "out_of_stock_items": out_of_stock_count,
+                },
+                "cash_flow": {
+                    "receipts": float(actual_cash_receipts),
+                    "receipts_formatted": self._format_currency(actual_cash_receipts),
+                    "payments": float(operating_expenses),
+                    "payments_formatted": self._format_currency(operating_expenses),
+                    "purchases": float(purchases_total),
+                    "purchases_formatted": self._format_currency(purchases_total),
+                    "total_available_funds": float(available_funds),
+                    "total_available_funds_formatted": self._format_currency(available_funds),
+                },
+                "trajectory": trajectory_data
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Dashboard Cards Error: %s", e)
+            return Response({
+                "profitability": {"total_sales": 0.0, "total_sales_formatted": "KSh 0.00", "cogs": 0.0, "cogs_formatted": "0.00", "gross_profit": 0.0, "gross_profit_formatted": "0.00", "net_profit": 0.0, "net_profit_formatted": "0.00"},
+                "debtors": {"total_customer_debts": 0.0, "total_customer_debts_formatted": "KSh 0.00"},
+                "inventory": {"total_stock_value": 0.0, "total_stock_value_formatted": "KSh 0.00", "product_skus": 0, "low_stock_items": 0, "out_of_stock_items": 0},
+                "cash_flow": {"receipts_formatted": "KSh 0.00", "payments_formatted": "KSh 0.00", "purchases_formatted": "KSh 0.00", "total_available_funds_formatted": "KSh 0.00"},
+                "trajectory": []
+            }, status=status.HTTP_200_OK)
+
         
 
     # =========================================================================
