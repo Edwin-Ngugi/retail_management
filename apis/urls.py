@@ -66,7 +66,7 @@ router.register(r'management-analytics', ManagementAnalyticsViewSet, basename='m
 router.register(r'management-reports', ManagementReportsViewSet, basename='management-reports')
 
 # User roles and permissions
-router.register(r'user-permissions', UserPermissionViewSet, basename='user-permission')
+router.register(r'user-permissions', UserPermissionViewSet, basename='user-permissions')
 
 urlpatterns = [
     # Authentication

@@ -9481,143 +9481,165 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 class UserPermissionViewSet(viewsets.ModelViewSet):
     """
     ViewSet for fetching, creating, updating, and managing user role permissions.
-    Used by the Admin / Settings page to configure access for staff members.
+    Handles admin configurations safely with proper error fallbacks.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        from apis.models import UserRolePermission
-        return UserRolePermission.objects.select_related("user").all().order_by("-id")
+        try:
+            from apis.models import UserRolePermission
+            return UserRolePermission.objects.select_related("user").all().order_by("-id")
+        except Exception:
+            return []
+
+    def _get_defaults(self):
+        try:
+            from apis.models import default_module_permissions
+            defaults = default_module_permissions() if callable(default_module_permissions) else default_module_permissions
+            return defaults if isinstance(defaults, dict) else {}
+        except Exception as e:
+            logger.error(f"Error fetching default module permissions: {e}")
+            return {}
 
     def list(self, request, *args, **kwargs):
-        from django.contrib.auth import get_user_model
-        from apis.models import UserRolePermission, default_module_permissions
-
-        User = get_user_model()
-        all_users = User.objects.all().order_by("username")
-        
-        perm_map = {}
         try:
-            for perm in UserRolePermission.objects.select_related("user").all():
-                if perm.user_id:
-                    perm_map[perm.user_id] = perm
+            from django.contrib.auth import get_user_model
+            from apis.models import UserRolePermission
+
+            User = get_user_model()
+            all_users = User.objects.all().order_by("username")
+
+            perm_map = {}
+            try:
+                for perm in UserRolePermission.objects.select_related("user").all():
+                    if perm.user_id:
+                        perm_map[perm.user_id] = perm
+            except Exception as e:
+                logger.warning(f"Failed to load UserRolePermission map: {e}")
+
+            defaults = self._get_defaults()
+            data = []
+
+            for user in all_users:
+                perm_record = perm_map.get(user.id)
+
+                if user.is_superuser:
+                    module_perms = {k: {"view": True, "change": True} for k in defaults.keys()}
+                    role = "SUPERADMIN"
+                elif perm_record:
+                    module_perms = dict(defaults)
+                    if isinstance(perm_record.module_permissions, dict):
+                        module_perms.update(perm_record.module_permissions)
+                    role = perm_record.role or "NORMAL_USER"
+                else:
+                    module_perms = dict(defaults)
+                    role = "ADMIN" if user.is_staff else "NORMAL_USER"
+
+                data.append({
+                    "id": perm_record.id if perm_record else user.id,
+                    "user_id": user.id,
+                    "username": user.get_username(),
+                    "full_name": user.get_full_name() or user.get_username(),
+                    "email": getattr(user, "email", "") or "",
+                    "is_active": user.is_active,
+                    "is_staff": user.is_staff,
+                    "is_superuser": user.is_superuser,
+                    "role": role,
+                    "permissions": module_perms,
+                    "module_permissions": module_perms,
+                })
+
+            return Response(data, status=status.HTTP_200_OK)
+
         except Exception as e:
-            logger.warning(f"Failed to load UserRolePermission records: {e}")
+            logger.exception(f"Unhandled error in UserPermissionViewSet.list: {e}")
+            return Response({"error": "Internal server error fetching permissions.", "details": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        defaults = default_module_permissions() if callable(default_module_permissions) else {}
+    def retrieve(self, request, pk=None, *args, **kwargs):
+        try:
+            from django.contrib.auth import get_user_model
+            from apis.models import UserRolePermission
 
-        data = []
-        for user in all_users:
-            perm_record = perm_map.get(user.id)
-            
-            if user.is_superuser:
+            User = get_user_model()
+            defaults = self._get_defaults()
+
+            perm = UserRolePermission.objects.filter(pk=pk).select_related("user").first()
+            user = perm.user if perm else User.objects.filter(pk=pk).first()
+
+            if not user and not perm:
+                return Response({"error": "User or permission record not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            if user and user.is_superuser:
                 module_perms = {k: {"view": True, "change": True} for k in defaults.keys()}
                 role = "SUPERADMIN"
-            elif perm_record:
+            elif perm:
                 module_perms = dict(defaults)
-                if isinstance(perm_record.module_permissions, dict):
-                    module_perms.update(perm_record.module_permissions)
-                role = perm_record.role or "NORMAL_USER"
+                if isinstance(perm.module_permissions, dict):
+                    module_perms.update(perm.module_permissions)
+                role = perm.role or "NORMAL_USER"
             else:
                 module_perms = dict(defaults)
-                role = "ADMIN" if user.is_staff else "NORMAL_USER"
+                role = "NORMAL_USER"
 
-            data.append({
-                "id": perm_record.id if perm_record else user.id,
+            return Response({
+                "id": perm.id if perm else user.id,
                 "user_id": user.id,
                 "username": user.get_username(),
                 "full_name": user.get_full_name() or user.get_username(),
-                "email": user.email or "",
-                "is_active": user.is_active,
-                "is_staff": user.is_staff,
-                "is_superuser": user.is_superuser,
+                "email": getattr(user, "email", "") or "",
                 "role": role,
                 "permissions": module_perms,
                 "module_permissions": module_perms,
-            })
+            }, status=status.HTTP_200_OK)
 
-        return Response(data, status=status.HTTP_200_OK)
-
-    def retrieve(self, request, pk=None, *args, **kwargs):
-        from django.contrib.auth import get_user_model
-        from apis.models import UserRolePermission, default_module_permissions
-
-        User = get_user_model()
-        defaults = default_module_permissions() if callable(default_module_permissions) else {}
-        
-        perm = UserRolePermission.objects.filter(pk=pk).select_related("user").first()
-        user = perm.user if perm else User.objects.filter(pk=pk).first()
-
-        if not user and not perm:
-            return Response({"error": "User or permission record not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        if user and user.is_superuser:
-            module_perms = {k: {"view": True, "change": True} for k in defaults.keys()}
-            role = "SUPERADMIN"
-        elif perm:
-            module_perms = dict(defaults)
-            if isinstance(perm.module_permissions, dict):
-                module_perms.update(perm.module_permissions)
-            role = perm.role
-        else:
-            module_perms = dict(defaults)
-            role = "NORMAL_USER"
-
-        return Response({
-            "id": perm.id if perm else user.id,
-            "user_id": user.id,
-            "username": user.get_username(),
-            "full_name": user.get_full_name() or user.get_username(),
-            "email": user.email or "",
-            "role": role,
-            "permissions": module_perms,
-            "module_permissions": module_perms,
-        }, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.exception(f"Unhandled error in UserPermissionViewSet.retrieve: {e}")
+            return Response({"error": "Internal server error.", "details": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def update(self, request, pk=None, *args, **kwargs):
-        from django.contrib.auth import get_user_model
-        from apis.models import UserRolePermission, default_module_permissions
+        try:
+            from django.contrib.auth import get_user_model
+            from apis.models import UserRolePermission
 
-        User = get_user_model()
-        role = request.data.get("role", "NORMAL_USER")
-        permissions_payload = request.data.get("permissions") or request.data.get("module_permissions") or {}
+            User = get_user_model()
+            role = request.data.get("role", "NORMAL_USER")
+            permissions_payload = request.data.get("permissions") or request.data.get("module_permissions") or {}
 
-        # Resolve target record or user
-        perm_record = UserRolePermission.objects.filter(pk=pk).first()
-        user = perm_record.user if perm_record else User.objects.filter(pk=pk).first()
+            perm_record = UserRolePermission.objects.filter(pk=pk).first()
+            user = perm_record.user if perm_record else User.objects.filter(pk=pk).first()
 
-        if not user:
-            return Response({"error": "Target user not found."}, status=status.HTTP_404_NOT_FOUND)
+            if not user:
+                return Response({"error": "Target user not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        defaults = default_module_permissions() if callable(default_module_permissions) else {}
-        updated_perms = dict(defaults)
-        if isinstance(permissions_payload, dict):
-            updated_perms.update(permissions_payload)
+            defaults = self._get_defaults()
+            updated_perms = dict(defaults)
+            if isinstance(permissions_payload, dict):
+                updated_perms.update(permissions_payload)
 
-        with transaction.atomic():
-            if not perm_record:
-                perm_record, _ = UserRolePermission.objects.get_or_create(
-                    user=user,
-                    defaults={"role": role, "module_permissions": updated_perms}
-                )
-            else:
-                perm_record.role = role
-                perm_record.module_permissions = updated_perms
-                perm_record.save()
+            with transaction.atomic():
+                if not perm_record:
+                    perm_record, _ = UserRolePermission.objects.get_or_create(
+                        user=user,
+                        defaults={"role": role, "module_permissions": updated_perms}
+                    )
+                else:
+                    perm_record.role = role
+                    perm_record.module_permissions = updated_perms
+                    perm_record.save()
 
-            # Maintain staff status sync
-            if role in ["ADMIN", "SUPERADMIN"]:
-                user.is_staff = True
-            else:
-                user.is_staff = False
-            user.save(update_fields=["is_staff"])
+                user.is_staff = (role in ["ADMIN", "SUPERADMIN"])
+                user.save(update_fields=["is_staff"])
 
-        return Response({
-            "id": perm_record.id,
-            "user_id": user.id,
-            "username": user.get_username(),
-            "role": perm_record.role,
-            "permissions": perm_record.module_permissions,
-            "module_permissions": perm_record.module_permissions,
-        }, status=status.HTTP_200_OK)        
+            return Response({
+                "id": perm_record.id,
+                "user_id": user.id,
+                "username": user.get_username(),
+                "role": perm_record.role,
+                "permissions": perm_record.module_permissions,
+                "module_permissions": perm_record.module_permissions,
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception(f"Unhandled error in UserPermissionViewSet.update: {e}")
+            return Response({"error": "Failed to update user permission.", "details": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)        
     
