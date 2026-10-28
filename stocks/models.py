@@ -3125,20 +3125,64 @@ class PasswordResetOTP(models.Model):
         return otp_obj
 
 def default_module_permissions():
-    """Initial permissions for a newly configured user."""
+    """
+    Initial granular sub-menu permissions for newly created or reset user profiles.
+    Synchronized 1:1 with frontend sidebar keys in App.jsx.
+    """
     return {
+        # Dashboard Overview
         "dashboard": {"view": True, "change": False},
-        "sales": {"view": True, "change": False},
-        "inventory": {"view": True, "change": False},
-        "customers": {"view": True, "change": False},
-        "purchases": {"view": False, "change": False},
-        "expenses": {"view": False, "change": False},
-        "reports": {"view": False, "change": False},
-        "cashbook": {"view": False, "change": False},
-        "balance_sheet": {"view": False, "change": False},
-        "branches": {"view": False, "change": False},
-        "approvals": {"view": False, "change": False},
-        "user_permissions": {"view": False, "change": False},
+        
+        # Sales Sub-menus
+        "cash_sale": {"view": True, "change": False},
+        "credit_sale": {"view": True, "change": False},
+        "sales_invoices": {"view": True, "change": False},
+        "sales_returns": {"view": True, "change": False},
+        "quotations": {"view": True, "change": False},
+
+        # Procurement Sub-menus
+        "cash_purchase": {"view": True, "change": False},
+        "credit_purchase": {"view": True, "change": False},
+        "goods_received": {"view": True, "change": False},
+        "purchase_returns": {"view": True, "change": False},
+
+        # Inventory Sub-menus
+        "item_register": {"view": True, "change": False},
+        "stock_transfer": {"view": True, "change": False},
+        "stock_adjustment": {"view": True, "change": False},
+        "stock_count": {"view": True, "change": False},
+
+        # Payments Sub-menus
+        "supplier_payment": {"view": True, "change": False},
+        "expenses": {"view": True, "change": False},
+        "other_payments": {"view": True, "change": False},
+        "payment_vouchers": {"view": True, "change": False},
+
+        # Receipts Sub-menus
+        "customer_receipts": {"view": True, "change": False},
+        "other_receipts": {"view": True, "change": False},
+        "receipts_allocation": {"view": True, "change": False},
+
+        # Customers Sub-menus
+        "customer_register": {"view": True, "change": False},
+        "customer_statements": {"view": True, "change": False},
+        "outstanding_balances": {"view": True, "change": False},
+
+        # Suppliers Sub-menus
+        "supplier_register": {"view": True, "change": False},
+        "supplier_statements": {"view": True, "change": False},
+        "supplier_outstanding": {"view": True, "change": False},
+
+        # Executive Reports Sub-menus
+        "rep_sales": {"view": True, "change": False},
+        "rep_purchases": {"view": True, "change": False},
+        "rep_inventory": {"view": True, "change": False},
+        "rep_debtors": {"view": True, "change": False},
+        "rep_financial": {"view": True, "change": False},
+
+        # System Administration
+        "approvals": {"view": True, "change": False},
+        "user_permissions": {"view": True, "change": False},
     }
 
 
