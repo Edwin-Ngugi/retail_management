@@ -350,6 +350,30 @@ def generate_30min_tokens_for_user(user, portal_type="user"):
 
 
 
+class RetailBranchViewSet(viewsets.ModelViewSet):
+    serializer_class = RetailBranchSerializer
+    permission_classes = [permissions.AllowAny]
+
+    def get_queryset(self):
+        # Return all branches so every user sees the complete branch list
+        return RetailBranch.objects.all().order_by("name")
+
+    def perform_create(self, serializer):
+        user = _authenticated_user(self.request)
+
+        if not user and self.request.user.is_authenticated:
+            user = self.request.user
+
+        if not user:
+            user = User.objects.filter(is_superuser=True).first() or User.objects.first()
+
+        if not user:
+            raise ValidationError(
+                {"retailer": "A valid retailer user is required to create a branch."}
+            )
+
+        serializer.save(retailer=user)
+
 class CopyBranchItemsView(APIView):
     def post(self, request, *args, **kwargs):
         serializer = BranchItemCopySerializer(data=request.data, context={"request": request})
