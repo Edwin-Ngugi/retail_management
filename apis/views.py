@@ -53,6 +53,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 
 from analytics.services import AnalyticsService, InventoryService
 
+
 from stocks.models import (
     BranchItemPricing,
     CreditRepayment,
@@ -738,278 +739,411 @@ class CopyBranchItemsView(APIView):
         return Response(result, status=status.HTTP_201_CREATED)
 
 
-def can_manage_user_permissions(user):
+import logging
+from datetime import timedelta
+from django.contrib.auth import authenticate, get_user_model
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+from django.core.mail import send_mail
+from rest_framework import generics, permissions, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+
+logger = logging.getLogger(__name__)
+User = get_user_model()
+
+
+# apis/views.py
+
+def get_user_permissions_payload(user):
+    from apis.models import UserRolePermission, default_module_permissions
+
+    if user.is_superuser:
+        return {k: {"view": True, "change": True} for k in default_module_permissions().keys()}
+
+    perm_record = UserRolePermission.objects.filter(user=user).first()
+    if perm_record and isinstance(perm_record.module_permissions, dict):
+        defaults = default_module_permissions()
+        defaults.update(perm_record.module_permissions)
+        return defaults
+
+    return default_module_permissions()
+
+
+def serialize_user_with_permissions(user):
     """
-    Only authenticated staff or superusers may manage user permissions.
+    Formats complete user profile dictionary expected by frontend App.jsx & localStorage.
     """
-    return bool(
-        user
-        and user.is_authenticated
-        and (user.is_superuser or user.is_staff)
-    )
-
-
-class UserPermissionViewSet(viewsets.ViewSet):
-    """
-    Router-compatible API for managing user roles and permissions.
-
-    GET    /user-permissions/
-    GET    /user-permissions/{pk}/
-    PUT    /user-permissions/{pk}/
-    PATCH  /user-permissions/{pk}/
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    ALLOWED_ROLES = {
-        UserRolePermission.Role.ADMIN,
-        UserRolePermission.Role.MANAGER,
-        UserRolePermission.Role.NORMAL_USER,
+    perm_record = UserRolePermission.objects.filter(user=user).first()
+    return {
+        "id": user.pk,
+        "username": user.get_username(),
+        "full_name": user.get_full_name(),
+        "email": user.email,
+        "is_active": user.is_active,
+        "is_staff": user.is_staff,
+        "is_superuser": user.is_superuser,
+        "role": (
+            perm_record.role
+            if perm_record
+            else ("ADMIN" if user.is_superuser else "NORMAL_USER")
+        ),
+        "permissions": get_user_permissions_payload(user),
     }
 
-    def _is_authorized(self, request):
-        return can_manage_user_permissions(request.user)
 
-    def _get_record(self, user):
-        if hasattr(user, "_prefetched_role_permission"):
-            return getattr(user, "_prefetched_role_permission")
-        return UserRolePermission.objects.filter(user=user).first()
+class UserLoginView(APIView):
+    """
+    1. Normal User Portal Login Endpoint.
+    Accessible by: All authenticated users (Regular, Staff & Superadmins).
+    """
+    permission_classes = [permissions.AllowAny]
 
-    def _serialize_user(self, user, include_updated_at=True):
-        record = self._get_record(user)
+    def post(self, request):
+        username = request.data.get("username")
+        password = request.data.get("password")
 
-        data = {
-            "id": user.pk,
-            "username": user.get_username(),
-            "full_name": user.get_full_name(),
-            "email": user.email,
-            "is_active": user.is_active,
-            "is_staff": user.is_staff,
-            "is_superuser": user.is_superuser,
-            "role": (
-                record.role
-                if record
-                else (
-                    UserRolePermission.Role.ADMIN
-                    if user.is_superuser
-                    else UserRolePermission.Role.NORMAL_USER
-                )
-            ),
-            "permissions": (
-                record.module_permissions
-                if record and isinstance(record.module_permissions, dict)
-                else default_module_permissions()
-            ),
-        }
+        user = authenticate(request, username=username, password=password)
 
-        if include_updated_at:
-            data["updated_at"] = (
-                record.updated_at.isoformat()
-                if record and record.updated_at
-                else None
+        if not user:
+            return Response(
+                {"error": "Invalid username or password."},
+                status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        return data
+        token_data = generate_30min_tokens_for_user(user, portal_type="user")
+        
+        # FIX: Inject full user profile and permissions object into login response
+        token_data["user"] = serialize_user_with_permissions(user)
 
-    def list(self, request):
-        """GET /user-permissions/"""
+        return Response(token_data, status=status.HTTP_200_OK)
 
-        if not self._is_authorized(request):
+
+class AdminLoginView(APIView):
+    """
+    3. Dedicated Admin Portal Login Endpoint.
+    Accessible by: Staff/Admins & Superadmins.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get("username")
+        password = request.data.get("password")
+
+        user = authenticate(request, username=username, password=password)
+
+        if not user:
             return Response(
-                {"detail": "You are not allowed to manage user permissions."},
+                {"error": "Invalid admin credentials."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # Enforce admin privilege (is_staff or is_superuser)
+        if not (user.is_staff or user.is_superuser):
+            return Response(
+                {"error": "Access denied. Superadmin or Admin privileges required."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        users = User.objects.all().order_by("username")
-        user_ids = [u.pk for u in users]
+        token_data = generate_30min_tokens_for_user(user, portal_type="admin")
+        
+        # FIX: Inject full user profile and permissions object into login response
+        token_data["user"] = serialize_user_with_permissions(user)
 
-        # Batch fetch UserRolePermission records to optimize queries
-        perm_map = {
-            perm.user_id: perm
-            for perm in UserRolePermission.objects.filter(user_id__in=user_ids)
-        }
+        return Response(token_data, status=status.HTTP_200_OK)
 
-        serialized = []
-        for user in users:
-            user._prefetched_role_permission = perm_map.get(user.pk)
-            serialized.append(self._serialize_user(user))
 
-        return Response(serialized, status=status.HTTP_200_OK)
+class UserProfileView(APIView):
+    """
+    API view to retrieve the profile of the currently authenticated user.
+    Syncs live permissions on portal mount.
+    """
+    permission_classes = [permissions.IsAuthenticated]
 
-    def retrieve(self, request, pk=None):
-        """GET /user-permissions/{pk}/"""
+    def get(self, request):
+        user_data = serialize_user_with_permissions(request.user)
+        return Response(user_data, status=status.HTTP_200_OK)
 
-        if not self._is_authorized(request):
+
+class ChangePasswordView(APIView):
+    """
+    Endpoint for authenticated users to change their password.
+    Mounted at: auth/change-password/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        old_password = request.data.get("old_password")
+        new_password = request.data.get("new_password")
+
+        if not old_password or not new_password:
             return Response(
-                {"detail": "You are not allowed to view these permissions."},
-                status=status.HTTP_403_FORBIDDEN,
+                {"error": "Both old_password and new_password are required."},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
-        try:
-            target = User.objects.get(pk=pk)
-        except (User.DoesNotExist, ValueError, TypeError):
+        if not user.check_password(old_password):
             return Response(
-                {"detail": "User not found."},
-                status=status.HTTP_404_NOT_FOUND,
+                {"error": "Current password is incorrect."},
+                status=status.HTTP_400_BAD_REQUEST
             )
+
+        if len(new_password) < 6:
+            return Response(
+                {"error": "New password must be at least 6 characters long."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user.set_password(new_password)
+        user.save()
 
         return Response(
-            self._serialize_user(target),
-            status=status.HTTP_200_OK,
+            {"detail": "Password updated successfully."},
+            status=status.HTTP_200_OK
         )
 
-    def update(self, request, pk=None):
-        """PUT /user-permissions/{pk}/"""
 
-        return self._save(request, pk)
+class ResetForgotPasswordView(APIView):
+    """
+    Endpoint for resetting forgotten passwords without requiring old password.
+    Mounted at: auth/reset-forgot-password/
+    """
+    permission_classes = [permissions.AllowAny]
 
-    def partial_update(self, request, pk=None):
-        """PATCH /user-permissions/{pk}/"""
+    def post(self, request):
+        username = request.data.get("username", "").strip()
+        new_password = request.data.get("new_password")
 
-        return self._save(request, pk)
-
-    def _save(self, request, pk):
-        if not self._is_authorized(request):
+        if not username or not new_password:
             return Response(
-                {"detail": "You are not allowed to change user permissions."},
-                status=status.HTTP_403_FORBIDDEN,
+                {"error": "Both username and new password are required."},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
         try:
-            target = User.objects.get(pk=pk)
-        except (User.DoesNotExist, ValueError, TypeError):
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
             return Response(
-                {"detail": "User not found."},
-                status=status.HTTP_404_NOT_FOUND,
+                {"error": "Account not found or invalid reset request."},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
-        if target.is_superuser:
-            return Response(
-                {
-                    "detail": (
-                        "Superuser accounts are protected. "
-                        "Change their access through Django administration."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        try:
+            validate_password(new_password, user=user)
+        except ValidationError as e:
+            return Response({"error": e.messages[0]}, status=status.HTTP_400_BAD_REQUEST)
 
-        role = request.data.get("role")
-        incoming_permissions = request.data.get("permissions")
-
-        if role is not None and role not in self.ALLOWED_ROLES:
-            return Response(
-                {"detail": "Invalid role supplied."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if target.pk == request.user.pk:
-            if role is not None and role != UserRolePermission.Role.ADMIN:
-                return Response(
-                    {"detail": "You cannot downgrade your own role here."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        existing = self._get_record(target)
-        merged_permissions = None
-
-        if incoming_permissions is not None:
-            if not isinstance(incoming_permissions, dict):
-                return Response(
-                    {"detail": "'permissions' must be an object."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            system_defaults = default_module_permissions()
-            valid_modules = set(system_defaults.keys())
-            unknown_modules = set(incoming_permissions.keys()) - valid_modules
-
-            if unknown_modules:
-                return Response(
-                    {
-                        "detail": "Unknown permission modules.",
-                        "modules": sorted(unknown_modules),
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # Start with existing permissions if present, otherwise system default schema
-            base_perms = (
-                existing.module_permissions
-                if existing and isinstance(existing.module_permissions, dict)
-                else system_defaults
-            )
-
-            merged_permissions = {
-                module: dict(flags)
-                for module, flags in system_defaults.items()
-            }
-
-            for module, flags in base_perms.items():
-                if module in valid_modules and isinstance(flags, dict):
-                    merged_permissions[module].update(flags)
-
-            for module, flags in incoming_permissions.items():
-                if not isinstance(flags, dict):
-                    return Response(
-                        {"detail": f"Invalid permissions for '{module}'."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-                unknown_actions = set(flags.keys()) - {"view", "change"}
-                if unknown_actions:
-                    return Response(
-                        {
-                            "detail": f"Unknown permission actions for '{module}'.",
-                            "actions": sorted(unknown_actions),
-                        },
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-                for action, value in flags.items():
-                    if not isinstance(value, bool):
-                        return Response(
-                            {"detail": f"'{module}.{action}' must be true or false."},
-                            status=status.HTTP_400_BAD_REQUEST,
-                        )
-
-                merged_permissions[module].update(flags)
-
-            # Rule: Change grants View automatically
-            for module, flags in merged_permissions.items():
-                if flags.get("change", False):
-                    flags["view"] = True
-
-        with transaction.atomic():
-            record, created = (
-                UserRolePermission.objects.select_for_update()
-                .get_or_create(
-                    user=target,
-                    defaults={
-                        "role": role or UserRolePermission.Role.NORMAL_USER,
-                        "module_permissions": default_module_permissions(),
-                    },
-                )
-            )
-
-            if role is not None:
-                record.role = role
-
-            if merged_permissions is not None:
-                record.module_permissions = merged_permissions
-
-            record.updated_by = request.user
-            record.save()
-
-        target._prefetched_role_permission = record
-        result = self._serialize_user(target)
+        user.set_password(new_password)
+        user.save()
 
         return Response(
+            {"detail": "Password reset successfully. You can now log in with your new password."},
+            status=status.HTTP_200_OK
+        )
+
+
+class RequestOTPView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get("username", "").strip()
+        email = request.data.get("email", "").strip()
+
+        if not username and not email:
+            return Response(
+                {"error": "Please provide a valid username or email address."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user = None
+        if email:
+            user = User.objects.filter(email__iexact=email).first()
+        if not user and username:
+            user = User.objects.filter(username__iexact=username).first()
+
+        if not user:
+            return Response(
+                {"error": "No account found matching the provided details."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        target_email = user.email or email
+
+        try:
+            otp_obj = PasswordResetOTP.generate_otp(username=user.username)
+        except Exception as e:
+            logger.error(f"OTP Generation Error: {e}", exc_info=True)
+            return Response(
+                {"error": f"Database error generating OTP code: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        try:
+            send_mail(
+                subject="Melvex Management - Password Reset OTP",
+                message=(
+                    f"Hello {user.username},\n\n"
+                    f"Your 6-digit verification code is: {otp_obj.otp_code}\n\n"
+                    f"This code expires in 10 minutes."
+                ),
+                from_email=None,
+                recipient_list=[target_email],
+                fail_silently=False,
+            )
+        except Exception as e:
+            logger.error(f"SMTP Dispatch Error to {target_email}: {e}", exc_info=True)
+            return Response(
+                {"error": f"Failed to dispatch email: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        return Response(
+            {"detail": f"An OTP code has been sent to {target_email}."},
+            status=status.HTTP_200_OK
+        )
+
+
+class VerifyOTPAndResetPassword(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get("username", "").strip()
+        otp_code = request.data.get("otp_code", "").strip()
+        new_password = request.data.get("new_password", "")
+
+        if not username or not otp_code or not new_password:
+            return Response(
+                {"error": "Username, OTP code, and new password are all required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user = User.objects.filter(username__iexact=username).first()
+        if not user:
+            user = User.objects.filter(email__iexact=username).first()
+
+        if not user:
+            return Response(
+                {"error": "User account not found."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        otp_record = PasswordResetOTP.objects.filter(
+            username=user.username,
+            otp_code=otp_code,
+            is_verified=False
+        ).first()
+
+        if not otp_record or not otp_record.is_valid():
+            return Response(
+                {"error": "Invalid or expired OTP code. Please request a new one."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user.set_password(new_password)
+        user.save()
+
+        otp_record.is_verified = True
+        otp_record.save()
+
+        return Response(
+            {"detail": "Password reset successfully! You can now log in."},
+            status=status.HTTP_200_OK
+        )
+class ManagementLoginView(APIView):
+    """
+    Management Portal Login Endpoint.
+    Accessible by: Management/Staff Users & Superadmins.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get("username", "").strip()
+        password = request.data.get("password")
+        branch_input = request.data.get("branch") or request.data.get("branch_id")
+
+        if not username or not password:
+            return Response(
+                {"error": "Please provide both username and password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = authenticate(request, username=username, password=password)
+
+        if not user:
+            return Response(
+                {"error": "Invalid management credentials."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # Enforce management / staff privilege (or superadmin)
+        if not (user.is_staff or user.is_superuser):
+            return Response(
+                {"error": "Access denied. Management authorization required."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Generate JWT tokens
+        refresh = RefreshToken.for_user(user)
+        access_token = str(refresh.access_token)
+        refresh_token = str(refresh)
+
+        # Get fully formatted user profile with permissions object
+        user_data = serialize_user_with_permissions(user)
+        
+        # Preserve branch context assignment
+        user_data["branch"] = branch_input or getattr(user, 'branch_id', None)
+
+        return Response({
+            "access": access_token,
+            "token": access_token,
+            "refresh": refresh_token,
+            "refresh_token": refresh_token,
+            "user": user_data
+        }, status=status.HTTP_200_OK)
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """
+    Customizes JWT login response to return user profile info along with 30-minute tokens.
+    """
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        refresh = self.get_token(self.user)
+        refresh.access_token.set_exp(lifetime=timedelta(minutes=30))
+        
+        data["access"] = str(refresh.access_token)
+        data["refresh"] = str(refresh)
+        data["user"] = serialize_user_with_permissions(self.user)
+        return data
+
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
+
+
+class RegisterView(generics.CreateAPIView):
+    """
+    API view for registering a new user.
+    """
+    queryset = User.objects.all()
+    serializer_class = UserRegistrationSerializer
+    permission_classes = [permissions.AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        user_data = serialize_user_with_permissions(user)
+        return Response(
             {
-                "detail": "User permissions updated successfully.",
-                **result,
+                "message": "User registered successfully.",
+                "user": user_data,
             },
-            status=status.HTTP_200_OK,
+            status=status.HTTP_201_CREATED,
         )
 
 # ============================================================
@@ -9339,4 +9473,107 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         except Exception as e:
             logger.exception("Export Balance Sheet PDF Error")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class UserPermissionViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for fetching, creating, updating, and managing user role permissions.
+    Used by the Admin / Settings page to configure access for staff members.
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def get_queryset(self):
+        from apis.models import UserRolePermission
+        return UserRolePermission.objects.select_related("user").all().order_by("-updated_at")
+
+    def list(self, request, *args, **kwargs):
+        from apis.models import UserRolePermission, default_module_permissions
+
+        queryset = self.get_queryset()
+        data = []
+
+        for perm in queryset:
+            # Merge stored permissions with system defaults to handle newly added sub-menus
+            merged_perms = default_module_permissions()
+            if isinstance(perm.module_permissions, dict):
+                merged_perms.update(perm.module_permissions)
+
+            data.append({
+                "id": perm.id,
+                "user_id": perm.user_id,
+                "username": perm.user.username if perm.user else "",
+                "email": perm.user.email if perm.user else "",
+                "role": perm.role,
+                "module_permissions": merged_perms,
+                "created_at": perm.created_at,
+                "updated_at": perm.updated_at,
+            })
+
+        return Response(data, status=status.HTTP_200_OK)
+
+    def retrieve(self, request, pk=None, *args, **kwargs):
+        from apis.models import UserRolePermission, default_module_permissions
+
+        perm = UserRolePermission.objects.filter(pk=pk).select_related("user").first()
+        if not perm:
+            return Response({"error": "Permission record not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        merged_perms = default_module_permissions()
+        if isinstance(perm.module_permissions, dict):
+            merged_perms.update(perm.module_permissions)
+
+        return Response({
+            "id": perm.id,
+            "user_id": perm.user_id,
+            "username": perm.user.username if perm.user else "",
+            "role": perm.role,
+            "module_permissions": merged_perms,
+        }, status=status.HTTP_200_OK)
+
+    def create(self, request, *args, **kwargs):
+        from apis.models import UserRolePermission, default_module_permissions
+
+        user_id = request.data.get("user") or request.data.get("user_id")
+        role = request.data.get("role", "NORMAL_USER")
+        module_permissions = request.data.get("module_permissions", default_module_permissions())
+
+        if not user_id:
+            return Response({"error": "User ID is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        perm, created = UserRolePermission.objects.update_or_create(
+            user_id=user_id,
+            defaults={
+                "role": role,
+                "module_permissions": module_permissions,
+            }
+        )
+
+        return Response({
+            "id": perm.id,
+            "user_id": perm.user_id,
+            "role": perm.role,
+            "module_permissions": perm.module_permissions,
+            "message": "User permissions saved successfully.",
+        }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+    def update(self, request, pk=None, *args, **kwargs):
+        from apis.models import UserRolePermission
+
+        perm = UserRolePermission.objects.filter(pk=pk).first()
+        if not perm:
+            return Response({"error": "Permission record not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        role = request.data.get("role", perm.role)
+        module_permissions = request.data.get("module_permissions", perm.module_permissions)
+
+        perm.role = role
+        perm.module_permissions = module_permissions
+        perm.save()
+
+        return Response({
+            "id": perm.id,
+            "user_id": perm.user_id,
+            "role": perm.role,
+            "module_permissions": perm.module_permissions,
+            "message": "User permissions updated successfully.",
+        }, status=status.HTTP_200_OK)        
     
