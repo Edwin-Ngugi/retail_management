@@ -9474,59 +9474,99 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             logger.exception("Export Balance Sheet PDF Error")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# ============================================================
+# USER PERMISSION VIEWSET
+# ============================================================
+
 class UserPermissionViewSet(viewsets.ModelViewSet):
     """
     ViewSet for fetching, creating, updating, and managing user role permissions.
     Used by the Admin / Settings page to configure access for staff members.
     """
-    permission_classes = [permissions.IsAdminUser]
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
         from apis.models import UserRolePermission
         return UserRolePermission.objects.select_related("user").all().order_by("-updated_at")
 
     def list(self, request, *args, **kwargs):
+        from django.contrib.auth import get_user_model
         from apis.models import UserRolePermission, default_module_permissions
 
-        queryset = self.get_queryset()
-        data = []
+        User = get_user_model()
+        all_users = User.objects.all().order_by("username")
+        perm_map = {
+            perm.user_id: perm 
+            for perm in UserRolePermission.objects.all()
+        }
 
-        for perm in queryset:
-            # Merge stored permissions with system defaults to handle newly added sub-menus
-            merged_perms = default_module_permissions()
-            if isinstance(perm.module_permissions, dict):
-                merged_perms.update(perm.module_permissions)
+        data = []
+        for user in all_users:
+            perm_record = perm_map.get(user.id)
+            
+            # Formulate merged permissions payload safely
+            if user.is_superuser:
+                module_perms = {k: {"view": True, "change": True} for k in default_module_permissions().keys()}
+                role = "SUPERADMIN"
+            elif perm_record:
+                module_perms = default_module_permissions()
+                if isinstance(perm_record.module_permissions, dict):
+                    module_perms.update(perm_record.module_permissions)
+                role = perm_record.role or "NORMAL_USER"
+            else:
+                module_perms = default_module_permissions()
+                role = "ADMIN" if user.is_staff else "NORMAL_USER"
 
             data.append({
-                "id": perm.id,
-                "user_id": perm.user_id,
-                "username": perm.user.username if perm.user else "",
-                "email": perm.user.email if perm.user else "",
-                "role": perm.role,
-                "module_permissions": merged_perms,
-                "created_at": perm.created_at,
-                "updated_at": perm.updated_at,
+                "id": perm_record.id if perm_record else user.id,
+                "user_id": user.id,
+                "username": user.get_username(),
+                "full_name": user.get_full_name() or user.get_username(),
+                "email": user.email,
+                "is_active": user.is_active,
+                "is_staff": user.is_staff,
+                "is_superuser": user.is_superuser,
+                "role": role,
+                "module_permissions": module_perms,
+                "created_at": perm_record.created_at if perm_record else user.date_joined,
+                "updated_at": perm_record.updated_at if perm_record else user.date_joined,
             })
 
         return Response(data, status=status.HTTP_200_OK)
 
     def retrieve(self, request, pk=None, *args, **kwargs):
+        from django.contrib.auth import get_user_model
         from apis.models import UserRolePermission, default_module_permissions
 
+        User = get_user_model()
+        
+        # Try fetching by UserRolePermission ID first, fallback to User ID
         perm = UserRolePermission.objects.filter(pk=pk).select_related("user").first()
-        if not perm:
-            return Response({"error": "Permission record not found."}, status=status.HTTP_404_NOT_FOUND)
+        user = perm.user if perm else User.objects.filter(pk=pk).first()
 
-        merged_perms = default_module_permissions()
-        if isinstance(perm.module_permissions, dict):
-            merged_perms.update(perm.module_permissions)
+        if not user and not perm:
+            return Response({"error": "User or permission record not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if user and user.is_superuser:
+            module_perms = {k: {"view": True, "change": True} for k in default_module_permissions().keys()}
+            role = "SUPERADMIN"
+        elif perm:
+            module_perms = default_module_permissions()
+            if isinstance(perm.module_permissions, dict):
+                module_perms.update(perm.module_permissions)
+            role = perm.role
+        else:
+            module_perms = default_module_permissions()
+            role = "NORMAL_USER"
 
         return Response({
-            "id": perm.id,
-            "user_id": perm.user_id,
-            "username": perm.user.username if perm.user else "",
-            "role": perm.role,
-            "module_permissions": merged_perms,
+            "id": perm.id if perm else user.id,
+            "user_id": user.id,
+            "username": user.get_username(),
+            "full_name": user.get_full_name() or user.get_username(),
+            "email": user.email,
+            "role": role,
+            "module_permissions": module_perms,
         }, status=status.HTTP_200_OK)
 
     def create(self, request, *args, **kwargs):
@@ -9560,7 +9600,9 @@ class UserPermissionViewSet(viewsets.ModelViewSet):
 
         perm = UserRolePermission.objects.filter(pk=pk).first()
         if not perm:
-            return Response({"error": "Permission record not found."}, status=status.HTTP_404_NOT_FOUND)
+            # Check if pk refers to user_id directly
+            user_id = request.data.get("user_id") or pk
+            perm, _ = UserRolePermission.objects.get_or_create(user_id=user_id)
 
         role = request.data.get("role", perm.role)
         module_permissions = request.data.get("module_permissions", perm.module_permissions)
