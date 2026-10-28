@@ -740,21 +740,60 @@ class CopyBranchItemsView(APIView):
 
 def default_module_permissions():
     """
-    Returns full default permission structure matching all frontend business modules.
+    Returns default sub-menu permission structure matching all sidebar navigation items.
     """
     return {
+        # Dashboard
         "dashboard": {"view": True, "change": False},
-        "sales": {"view": True, "change": False},
-        "procurement": {"view": True, "change": False},
-        "inventory": {"view": True, "change": False},
-        "payments": {"view": True, "change": False},
-        "receipts": {"view": True, "change": False},
-        "customers": {"view": True, "change": False},
-        "suppliers": {"view": True, "change": False},
-        "reports": {"view": True, "change": False},
-        "cashbook": {"view": True, "change": False},
-        "balance_sheet": {"view": True, "change": False},
-        "branches": {"view": True, "change": False},
+        
+        # Sales Sub-menus
+        "cash_sale": {"view": True, "change": False},
+        "credit_sale": {"view": True, "change": False},
+        "sales_invoices": {"view": True, "change": False},
+        "sales_returns": {"view": True, "change": False},
+        "quotations": {"view": True, "change": False},
+
+        # Procurement Sub-menus
+        "cash_purchase": {"view": True, "change": False},
+        "credit_purchase": {"view": True, "change": False},
+        "goods_received": {"view": True, "change": False},
+        "purchase_returns": {"view": True, "change": False},
+
+        # Inventory Sub-menus
+        "item_register": {"view": True, "change": False},
+        "stock_transfer": {"view": True, "change": False},
+        "stock_adjustment": {"view": True, "change": False},
+        "stock_count": {"view": True, "change": False},
+
+        # Payments Sub-menus
+        "supplier_payment": {"view": True, "change": False},
+        "expenses": {"view": True, "change": False},
+        "other_payments": {"view": True, "change": False},
+        "payment_vouchers": {"view": True, "change": False},
+
+        # Receipts Sub-menus
+        "customer_receipts": {"view": True, "change": False},
+        "other_receipts": {"view": True, "change": False},
+        "receipts_allocation": {"view": True, "change": False},
+
+        # Customers Sub-menus
+        "customer_register": {"view": True, "change": False},
+        "customer_statements": {"view": True, "change": False},
+        "outstanding_balances": {"view": True, "change": False},
+
+        # Suppliers Sub-menus
+        "supplier_register": {"view": True, "change": False},
+        "supplier_statements": {"view": True, "change": False},
+        "supplier_outstanding": {"view": True, "change": False},
+
+        # Reports Sub-menus
+        "rep_sales": {"view": True, "change": False},
+        "rep_purchases": {"view": True, "change": False},
+        "rep_inventory": {"view": True, "change": False},
+        "rep_debtors": {"view": True, "change": False},
+        "rep_financial": {"view": True, "change": False},
+
+        # System & Admin
         "approvals": {"view": True, "change": False},
         "user_permissions": {"view": True, "change": False},
     }
