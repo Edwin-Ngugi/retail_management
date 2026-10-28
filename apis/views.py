@@ -740,9 +740,10 @@ class CopyBranchItemsView(APIView):
 
 def default_module_permissions():
     """
-    Returns default permission structure for user module access.
+    Returns full default permission structure matching all frontend business modules.
     """
     return {
+        "dashboard": {"view": True, "change": False},
         "sales": {"view": True, "change": False},
         "procurement": {"view": True, "change": False},
         "inventory": {"view": True, "change": False},
@@ -751,6 +752,11 @@ def default_module_permissions():
         "customers": {"view": True, "change": False},
         "suppliers": {"view": True, "change": False},
         "reports": {"view": True, "change": False},
+        "cashbook": {"view": True, "change": False},
+        "balance_sheet": {"view": True, "change": False},
+        "branches": {"view": True, "change": False},
+        "approvals": {"view": True, "change": False},
+        "user_permissions": {"view": True, "change": False},
     }
 
 
@@ -838,8 +844,8 @@ class UserPermissionViewSet(viewsets.ViewSet):
 
         users = User.objects.all().order_by("username")
         user_ids = [u.pk for u in users]
-        
-        # Batch fetch UserRolePermission records to optimize performance
+
+        # Batch fetch UserRolePermission records to optimize queries
         perm_map = {
             perm.user_id: perm
             for perm in UserRolePermission.objects.filter(user_id__in=user_ids)
@@ -899,7 +905,6 @@ class UserPermissionViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Superuser permissions must be changed through Django administration.
         if target.is_superuser:
             return Response(
                 {
@@ -920,7 +925,6 @@ class UserPermissionViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Do not permit an administrator to downgrade their own role here.
         if target.pk == request.user.pk:
             if role is not None and role != UserRolePermission.Role.ADMIN:
                 return Response(
@@ -929,8 +933,6 @@ class UserPermissionViewSet(viewsets.ViewSet):
                 )
 
         existing = self._get_record(target)
-
-        # Validate and merge incoming module permissions.
         merged_permissions = None
 
         if incoming_permissions is not None:
@@ -958,10 +960,7 @@ class UserPermissionViewSet(viewsets.ViewSet):
                 for module, flags in defaults.items()
             }
 
-            if (
-                existing
-                and isinstance(existing.module_permissions, dict)
-            ):
+            if existing and isinstance(existing.module_permissions, dict):
                 for module, flags in existing.module_permissions.items():
                     if module in valid_modules and isinstance(flags, dict):
                         merged_permissions[module].update(flags)
@@ -969,11 +968,7 @@ class UserPermissionViewSet(viewsets.ViewSet):
             for module, flags in incoming_permissions.items():
                 if not isinstance(flags, dict):
                     return Response(
-                        {
-                            "detail": (
-                                f"Invalid permissions for '{module}'."
-                            )
-                        },
+                        {"detail": f"Invalid permissions for '{module}'."},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
@@ -981,9 +976,7 @@ class UserPermissionViewSet(viewsets.ViewSet):
                 if unknown_actions:
                     return Response(
                         {
-                            "detail": (
-                                f"Unknown permission actions for '{module}'."
-                            ),
+                            "detail": f"Unknown permission actions for '{module}'.",
                             "actions": sorted(unknown_actions),
                         },
                         status=status.HTTP_400_BAD_REQUEST,
@@ -992,18 +985,12 @@ class UserPermissionViewSet(viewsets.ViewSet):
                 for action, value in flags.items():
                     if not isinstance(value, bool):
                         return Response(
-                            {
-                                "detail": (
-                                    f"'{module}.{action}' must be "
-                                    "true or false."
-                                )
-                            },
+                            {"detail": f"'{module}.{action}' must be true or false."},
                             status=status.HTTP_400_BAD_REQUEST,
                         )
 
                 merged_permissions[module].update(flags)
 
-            # Changing a module requires permission to view it.
             for module, flags in merged_permissions.items():
                 if flags.get("change", False):
                     flags["view"] = True
@@ -1014,13 +1001,8 @@ class UserPermissionViewSet(viewsets.ViewSet):
                 .get_or_create(
                     user=target,
                     defaults={
-                        "role": (
-                            role
-                            or UserRolePermission.Role.NORMAL_USER
-                        ),
-                        "module_permissions": (
-                            default_module_permissions()
-                        ),
+                        "role": role or UserRolePermission.Role.NORMAL_USER,
+                        "module_permissions": default_module_permissions(),
                     },
                 )
             )
@@ -1034,7 +1016,6 @@ class UserPermissionViewSet(viewsets.ViewSet):
             record.updated_by = request.user
             record.save()
 
-        # Update cache on target
         target._prefetched_role_permission = record
         result = self._serialize_user(target)
 

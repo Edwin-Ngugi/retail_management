@@ -34,7 +34,6 @@ from .views import (
     UserPermissionViewSet,
 )
 
-# Use standard DefaultRouter initialization
 router = DefaultRouter()
 
 # Inventory and stock
