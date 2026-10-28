@@ -738,67 +738,6 @@ class CopyBranchItemsView(APIView):
         return Response(result, status=status.HTTP_201_CREATED)
 
 
-def default_module_permissions():
-    """
-    Returns default sub-menu permission structure matching all sidebar navigation items.
-    """
-    return {
-        # Dashboard
-        "dashboard": {"view": True, "change": False},
-        
-        # Sales Sub-menus
-        "cash_sale": {"view": True, "change": False},
-        "credit_sale": {"view": True, "change": False},
-        "sales_invoices": {"view": True, "change": False},
-        "sales_returns": {"view": True, "change": False},
-        "quotations": {"view": True, "change": False},
-
-        # Procurement Sub-menus
-        "cash_purchase": {"view": True, "change": False},
-        "credit_purchase": {"view": True, "change": False},
-        "goods_received": {"view": True, "change": False},
-        "purchase_returns": {"view": True, "change": False},
-
-        # Inventory Sub-menus
-        "item_register": {"view": True, "change": False},
-        "stock_transfer": {"view": True, "change": False},
-        "stock_adjustment": {"view": True, "change": False},
-        "stock_count": {"view": True, "change": False},
-
-        # Payments Sub-menus
-        "supplier_payment": {"view": True, "change": False},
-        "expenses": {"view": True, "change": False},
-        "other_payments": {"view": True, "change": False},
-        "payment_vouchers": {"view": True, "change": False},
-
-        # Receipts Sub-menus
-        "customer_receipts": {"view": True, "change": False},
-        "other_receipts": {"view": True, "change": False},
-        "receipts_allocation": {"view": True, "change": False},
-
-        # Customers Sub-menus
-        "customer_register": {"view": True, "change": False},
-        "customer_statements": {"view": True, "change": False},
-        "outstanding_balances": {"view": True, "change": False},
-
-        # Suppliers Sub-menus
-        "supplier_register": {"view": True, "change": False},
-        "supplier_statements": {"view": True, "change": False},
-        "supplier_outstanding": {"view": True, "change": False},
-
-        # Reports Sub-menus
-        "rep_sales": {"view": True, "change": False},
-        "rep_purchases": {"view": True, "change": False},
-        "rep_inventory": {"view": True, "change": False},
-        "rep_debtors": {"view": True, "change": False},
-        "rep_financial": {"view": True, "change": False},
-
-        # System & Admin
-        "approvals": {"view": True, "change": False},
-        "user_permissions": {"view": True, "change": False},
-    }
-
-
 def can_manage_user_permissions(user):
     """
     Only authenticated staff or superusers may manage user permissions.
@@ -981,8 +920,8 @@ class UserPermissionViewSet(viewsets.ViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            defaults = default_module_permissions()
-            valid_modules = set(defaults.keys())
+            system_defaults = default_module_permissions()
+            valid_modules = set(system_defaults.keys())
             unknown_modules = set(incoming_permissions.keys()) - valid_modules
 
             if unknown_modules:
@@ -994,15 +933,21 @@ class UserPermissionViewSet(viewsets.ViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            # Start with existing permissions if present, otherwise system default schema
+            base_perms = (
+                existing.module_permissions
+                if existing and isinstance(existing.module_permissions, dict)
+                else system_defaults
+            )
+
             merged_permissions = {
                 module: dict(flags)
-                for module, flags in defaults.items()
+                for module, flags in system_defaults.items()
             }
 
-            if existing and isinstance(existing.module_permissions, dict):
-                for module, flags in existing.module_permissions.items():
-                    if module in valid_modules and isinstance(flags, dict):
-                        merged_permissions[module].update(flags)
+            for module, flags in base_perms.items():
+                if module in valid_modules and isinstance(flags, dict):
+                    merged_permissions[module].update(flags)
 
             for module, flags in incoming_permissions.items():
                 if not isinstance(flags, dict):
@@ -1030,6 +975,7 @@ class UserPermissionViewSet(viewsets.ViewSet):
 
                 merged_permissions[module].update(flags)
 
+            # Rule: Change grants View automatically
             for module, flags in merged_permissions.items():
                 if flags.get("change", False):
                     flags["view"] = True
