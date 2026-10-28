@@ -82,7 +82,6 @@ from stocks.models import (
 )
 
 from .serializers import (
-    BranchItemCopySerializer,
     CreditRepaymentSerializer,
     CustomerSerializer,
     ExpenseSerializer,
@@ -6254,188 +6253,196 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='dashboard-cards')
     def dashboard_cards(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            try:
+                branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # -----------------------------------------------------------------
-            # 1. BASE QUERYSETS
-            # -----------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-            
-            expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            ).exclude(description__icontains='Supplier Repayment')
-            
-            purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            
-            supplier_payments_qs = SupplierPayment.objects.filter(
-                created_at__range=(start_dt, end_dt)
-            )
+                # -----------------------------------------------------------------
+                # 1. BASE QUERYSETS
+                # -----------------------------------------------------------------
+                sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
+                
+                expenses_qs = Expense.objects.filter(
+                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                ).exclude(description__icontains='Supplier Repayment')
+                
+                purchases_qs = Purchase.objects.filter(
+                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                )
+                
+                supplier_payments_qs = SupplierPayment.objects.filter(
+                    created_at__range=(start_dt, end_dt)
+                )
 
-            customer_repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
+                customer_repayments_qs = CreditRepayment.objects.filter(
+                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                )
 
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
-                customer_repayments_qs = customer_repayments_qs.filter(branch=branch_obj)
+                if branch_obj:
+                    sales_qs = sales_qs.filter(branch=branch_obj)
+                    expenses_qs = expenses_qs.filter(branch=branch_obj)
+                    purchases_qs = purchases_qs.filter(branch=branch_obj)
+                    supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+                    customer_repayments_qs = customer_repayments_qs.filter(branch=branch_obj)
 
-            # -----------------------------------------------------------------
-            # 2. FINANCIAL PERFORMANCE & OPEX
-            # -----------------------------------------------------------------
-            total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
-            cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
-            operating_expenses = sum((quantize_money(e.amount or ZERO) for e in expenses_qs), ZERO)
-            
-            gross_profit = total_sales - cogs
-            net_profit = gross_profit - operating_expenses
+                # -----------------------------------------------------------------
+                # 2. FINANCIAL PERFORMANCE & OPEX
+                # -----------------------------------------------------------------
+                total_sales = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
+                cogs = sum((quantize_money(s.total_cost or ZERO) for s in sales_qs), ZERO)
+                operating_expenses = sum((quantize_money(e.amount or ZERO) for e in expenses_qs), ZERO)
+                
+                gross_profit = total_sales - cogs
+                net_profit = gross_profit - operating_expenses
 
-            # -----------------------------------------------------------------
-            # 3. CASH RECEIPTS & DEBTORS (RECEIVABLES)
-            # -----------------------------------------------------------------
-            liquid_sales_cash = ZERO
-            for s in sales_qs:
-                breakdown = s.liquid_payments_breakdown
-                liquid_sales_cash += breakdown.get("CASH", ZERO) + breakdown.get("MPESA", ZERO) + breakdown.get("PAYBILL", ZERO)
+                # -----------------------------------------------------------------
+                # 3. CASH RECEIPTS & DEBTORS (RECEIVABLES)
+                # -----------------------------------------------------------------
+                liquid_sales_cash = ZERO
+                for s in sales_qs:
+                    breakdown = s.liquid_payments_breakdown
+                    liquid_sales_cash += breakdown.get("CASH", ZERO) + breakdown.get("MPESA", ZERO) + breakdown.get("PAYBILL", ZERO)
 
-            customer_repayments = customer_repayments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO)
-            )['total']
+                customer_repayments = customer_repayments_qs.aggregate(
+                    total=Coalesce(Sum('amount'), ZERO)
+                )['total']
 
-            actual_cash_receipts = liquid_sales_cash + customer_repayments
+                actual_cash_receipts = liquid_sales_cash + customer_repayments
 
-            credit_sales_qs = SaleTransaction.objects.filter(
-                payment_method=SaleTransaction.PaymentMethod.CREDIT
-            )
-            if branch_obj:
-                credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
+                credit_sales_qs = SaleTransaction.objects.filter(
+                    payment_method=SaleTransaction.PaymentMethod.CREDIT
+                )
+                if branch_obj:
+                    credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
 
-            total_customer_debtors = sum((quantize_money(s.balance_due or ZERO) for s in credit_sales_qs), ZERO)
+                total_customer_debtors = sum((quantize_money(s.balance_due or ZERO) for s in credit_sales_qs), ZERO)
 
-            # -----------------------------------------------------------------
-            # 4. INVENTORY & SKUS METRICS (Fail-Safe Valuation & Stock Check)
-            # -----------------------------------------------------------------
-            pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
-            if branch_obj:
-                pricings_qs = pricings_qs.filter(branch=branch_obj)
+                # -----------------------------------------------------------------
+                # 4. INVENTORY & SKUS METRICS
+                # -----------------------------------------------------------------
+                pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
+                if branch_obj:
+                    pricings_qs = pricings_qs.filter(branch=branch_obj)
 
-            # Build map from BranchStock table for fast access
-            stocks_qs = BranchStock.objects.all()
-            if branch_obj:
-                stocks_qs = stocks_qs.filter(branch=branch_obj)
-            
-            branch_stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in stocks_qs}
+                stocks_qs = BranchStock.objects.all()
+                if branch_obj:
+                    stocks_qs = stocks_qs.filter(branch=branch_obj)
+                
+                branch_stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in stocks_qs}
 
-            total_stock_value = ZERO
-            low_stock_count = 0
-            out_of_stock_count = 0
+                total_stock_value = ZERO
+                low_stock_count = 0
+                out_of_stock_count = 0
+                active_skus_count = 0
 
-            for p in pricings_qs:
-                # Fall back to p.remaining_stock property if item is missing from BranchStock
-                if p.item_id in branch_stock_map:
-                    rem_stock = branch_stock_map[p.item_id]
-                    stock_val = quantize_money(rem_stock * (p.unit_cost_price or ZERO))
-                else:
-                    rem_stock = p.remaining_stock
-                    stock_val = p.remaining_stock_value
+                for p in pricings_qs:
+                    if p.item_id in branch_stock_map:
+                        rem_stock = branch_stock_map[p.item_id]
+                        stock_val = quantize_money(rem_stock * (p.unit_cost_price or ZERO))
+                    else:
+                        rem_stock = p.remaining_stock
+                        stock_val = p.remaining_stock_value
 
-                total_stock_value += stock_val
+                    total_stock_value += stock_val
 
-                if rem_stock <= ZERO:
-                    out_of_stock_count += 1
-                elif rem_stock <= (p.min_stock_threshold or ZERO):
-                    low_stock_count += 1
+                    if rem_stock <= ZERO:
+                        out_of_stock_count += 1
+                    elif rem_stock <= (p.min_stock_threshold or ZERO):
+                        low_stock_count += 1
+                    else:
+                        active_skus_count += 1
 
-            total_stock_value = quantize_money(total_stock_value)
-            active_skus = pricings_qs.values('item_id').distinct().count()
+                total_stock_value = quantize_money(total_stock_value)
+                total_cataloged_skus = pricings_qs.values('item_id').distinct().count()
 
-            # -----------------------------------------------------------------
-            # 5. PURCHASES & SUPPLIER CASH OUTFLOW
-            # -----------------------------------------------------------------
-            direct_purchases = purchases_qs.exclude(
-                payment_method='CREDIT'
-            ).filter(
-                supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+                # -----------------------------------------------------------------
+                # 5. PURCHASES & SUPPLIER CASH OUTFLOW
+                # -----------------------------------------------------------------
+                direct_purchases = purchases_qs.exclude(
+                    payment_method='CREDIT'
+                ).filter(
+                    supplier_payments__isnull=True
+                ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
 
-            supplier_repayments = supplier_payments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO)
-            )['total']
+                supplier_repayments = supplier_payments_qs.aggregate(
+                    total=Coalesce(Sum('amount'), ZERO)
+                )['total']
 
-            purchases_total = direct_purchases + supplier_repayments
+                purchases_total = direct_purchases + supplier_repayments
 
-            # -----------------------------------------------------------------
-            # 6. CASH POSITION (LIQUID FUNDS ALLOWING NEGATIVE)
-            # -----------------------------------------------------------------
-            available_funds = actual_cash_receipts - operating_expenses - purchases_total
+                # -----------------------------------------------------------------
+                # 6. CASH POSITION (LIQUID FUNDS)
+                # -----------------------------------------------------------------
+                available_funds = actual_cash_receipts - operating_expenses - purchases_total
 
-            # -----------------------------------------------------------------
-            # 7. TRAJECTORY GRAPH DATA
-            # -----------------------------------------------------------------
-            trajectory_data = []
-            current_day = start_date
-            while current_day <= end_date:
-                day_sales = sales_qs.filter(sale_date__date=current_day)
-                day_expenses = expenses_qs.filter(date=current_day)
+                # -----------------------------------------------------------------
+                # 7. TRAJECTORY GRAPH DATA
+                # -----------------------------------------------------------------
+                trajectory_data = []
+                current_day = start_date
+                while current_day <= end_date:
+                    day_sales = sales_qs.filter(sale_date__date=current_day)
+                    day_expenses = expenses_qs.filter(date=current_day)
 
-                d_sales = sum((quantize_money(s.total_amount or ZERO) for s in day_sales), ZERO)
-                d_cogs = sum((quantize_money(s.total_cost or ZERO) for s in day_sales), ZERO)
-                d_exp = sum((quantize_money(e.amount or ZERO) for e in day_expenses), ZERO)
-                d_net_profit = (d_sales - d_cogs) - d_exp
+                    d_sales = sum((quantize_money(s.total_amount or ZERO) for s in day_sales), ZERO)
+                    d_cogs = sum((quantize_money(s.total_cost or ZERO) for s in day_sales), ZERO)
+                    d_exp = sum((quantize_money(e.amount or ZERO) for e in day_expenses), ZERO)
+                    d_net_profit = (d_sales - d_cogs) - d_exp
 
-                trajectory_data.append({
-                    "date": current_day.strftime('%b %d'),
-                    "total_sales": float(d_sales),
-                    "cogs": float(d_cogs),
-                    "net_profit": float(d_net_profit)
-                })
-                current_day += timedelta(days=1)
+                    trajectory_data.append({
+                        "date": current_day.strftime('%b %d'),
+                        "total_sales": float(d_sales),
+                        "cogs": float(d_cogs),
+                        "net_profit": float(d_net_profit)
+                    })
+                    current_day += timedelta(days=1)
 
-            formatted_receipts = self._format_currency(actual_cash_receipts)
-            formatted_payments = self._format_currency(operating_expenses)
-            formatted_purchases = self._format_currency(purchases_total)
+                # Structure response payload to strictly match React App.jsx expects:
+                return Response({
+                    "profitability": {
+                        "total_sales": float(total_sales),
+                        "total_sales_formatted": self._format_currency(total_sales),
+                        "cogs": float(cogs),
+                        "cogs_formatted": self._format_currency(cogs),
+                        "gross_profit": float(gross_profit),
+                        "gross_profit_formatted": self._format_currency(gross_profit),
+                        "net_profit": float(net_profit),
+                        "net_profit_formatted": self._format_currency(net_profit),
+                    },
+                    "debtors": {
+                        "total_customer_debts": float(total_customer_debtors),
+                        "total_customer_debts_formatted": self._format_currency(total_customer_debtors),
+                    },
+                    "inventory": {
+                        "total_stock_value": float(total_stock_value),
+                        "total_stock_value_formatted": self._format_currency(total_stock_value),
+                        "product_skus": total_cataloged_skus,
+                        "active_skus": active_skus_count,
+                        "low_stock_items": low_stock_count,
+                        "out_of_stock_items": out_of_stock_count,
+                    },
+                    "cash_flow": {
+                        "receipts": float(actual_cash_receipts),
+                        "receipts_formatted": self._format_currency(actual_cash_receipts),
+                        "payments": float(operating_expenses),
+                        "payments_formatted": self._format_currency(operating_expenses),
+                        "purchases": float(purchases_total),
+                        "purchases_formatted": self._format_currency(purchases_total),
+                        "total_available_funds": float(available_funds),
+                        "total_available_funds_formatted": self._format_currency(available_funds),
+                    },
+                    "trajectory": trajectory_data
+                }, status=status.HTTP_200_OK)
 
-            return Response({
-                "profitability": {
-                    "total_sales": float(total_sales),
-                    "total_sales_formatted": self._format_currency(total_sales),
-                    "cogs": float(cogs),
-                    "cogs_formatted": self._format_currency(cogs),
-                    "gross_profit": float(gross_profit),
-                    "gross_profit_formatted": self._format_currency(gross_profit),
-                    "net_profit": float(net_profit),
-                    "net_profit_formatted": self._format_currency(net_profit),
-                },
-                "debtors": {
-                    "total_customer_debts": float(total_customer_debtors),
-                    "total_customer_debts_formatted": self._format_currency(total_customer_debtors),
-                },
-                "inventory": {
-                    "total_stock_value_formatted": self._format_currency(total_stock_value),
-                    "product_skus": active_skus,
-                    "low_stock_items": low_stock_count,
-                    "out_of_stock_items": out_of_stock_count,
-                },
-                "cash_flow": {
-                    "receipts_formatted": formatted_receipts,
-                    "payments_formatted": formatted_payments,
-                    "purchases_formatted": formatted_purchases,
-                    "todays_receipts_formatted": formatted_receipts,
-                    "todays_payments_formatted": formatted_payments,
-                    "todays_purchases_formatted": formatted_purchases,
-                    "total_available_funds_formatted": self._format_currency(available_funds),
-                },
-                "trajectory": trajectory_data
-            }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            logger.exception("Dashboard Cards Error: %s", e)
-            return Response({}, status=status.HTTP_200_OK)
+            except Exception as e:
+                logger.exception("Dashboard Cards Error: %s", e)
+                return Response({
+                    "profitability": {"total_sales": 0.0, "total_sales_formatted": "KSh 0.00", "cogs": 0.0, "cogs_formatted": "0.00", "gross_profit": 0.0, "gross_profit_formatted": "0.00", "net_profit": 0.0, "net_profit_formatted": "0.00"},
+                    "debtors": {"total_customer_debts": 0.0, "total_customer_debts_formatted": "KSh 0.00"},
+                    "inventory": {"total_stock_value": 0.0, "total_stock_value_formatted": "KSh 0.00", "product_skus": 0, "low_stock_items": 0, "out_of_stock_items": 0},
+                    "cash_flow": {"receipts_formatted": "KSh 0.00", "payments_formatted": "KSh 0.00", "purchases_formatted": "KSh 0.00", "total_available_funds_formatted": "KSh 0.00"},
+                    "trajectory": []
+                }, status=status.HTTP_200_OK)
+        
 
     # =========================================================================
     # SALESVIEW ENDPOINTS

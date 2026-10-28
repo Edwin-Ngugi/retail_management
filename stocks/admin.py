@@ -22,6 +22,9 @@ from .models import (
     MonthlyStockMovementArchive,
     PendingApproval,
     Purchase,
+    PurchaseReturn,
+    PurchaseOrder,
+    PurchaseOrderItem,
     RetailBranch,
     Sale,
     SaleItem,
@@ -1014,6 +1017,61 @@ class PurchaseOrderItemInline(admin.TabularInline):
 class PurchaseOrderAdmin(admin.ModelAdmin):
     list_display = ("po_number", "branch", "supplier_name", "total_amount", "amount_paid", "payment_method", "purchase_date")
     inlines = [PurchaseOrderItemInline]
+
+
+@admin.register(PurchaseReturn)
+class PurchaseReturnAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "branch",
+        "item",
+        "supplier_name",
+        "quantity",
+        "unit_cost_price",
+        "total_refund_amount",
+        "date",
+        "created_by",
+    )
+    list_filter = ("branch", "date", "created_at")
+    search_fields = (
+        "item__name",
+        "supplier_name",
+        "reason",
+        "purchase__id",
+    )
+    readonly_fields = ("total_refund_amount", "created_at")
+    ordering = ("-date", "-created_at")
+    
+    fieldsets = (
+        ("Return Information", {
+            "fields": (
+                "branch",
+                "purchase",
+                "item",
+                "supplier",
+                "supplier_name",
+                "reason",
+                "date",
+            )
+        }),
+        ("Financials & Stock Details", {
+            "fields": (
+                "quantity",
+                "unit_cost_price",
+                "total_refund_amount",
+            )
+        }),
+        ("Audit Metadata", {
+            "fields": (
+                "created_by",
+                "created_at",
+            )
+        }),
+    )
+
+    def total_refund_amount(self, obj):
+        return f"KSh {obj.total_refund_amount}"
+    total_refund_amount.short_description = "Total Refund"
 
 @admin.register(MonthlyTransactionArchive)
 class MonthlyTransactionArchiveAdmin(TenantAwareModelAdmin):

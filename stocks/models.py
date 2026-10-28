@@ -1522,7 +1522,143 @@ class SupplierPayment(models.Model):
     def __str__(self):
         return f"Supplier Payment: KSh {self.amount} for PO #{self.purchase_id}"
 
+# -----------------------------------------------------------------------------
+# Purchase Return
+# -----------------------------------------------------------------------------
+class PurchaseReturn(models.Model):
+    branch = models.ForeignKey(
+        RetailBranch,
+        on_delete=models.CASCADE,
+        related_name="purchase_returns",
+    )
 
+    purchase = models.ForeignKey(
+        Purchase,
+        on_delete=models.CASCADE,
+        related_name="returns",
+        null=True,
+        blank=True,
+        help_text="The specific purchase transaction being returned.",
+    )
+
+    item = models.ForeignKey(
+        Item,
+        on_delete=models.CASCADE,
+        related_name="purchase_returns",
+    )
+
+    supplier = models.ForeignKey(
+        Supplier,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="purchase_returns",
+    )
+
+    supplier_name = models.CharField(max_length=200, blank=True)
+
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        validators=[MinValueValidator(MIN_QTY)],
+    )
+
+    unit_cost_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(ZERO)],
+        help_text="Cost per unit at which stock is returned.",
+    )
+
+    reason = models.CharField(max_length=255)
+    date = models.DateField(default=date.today)
+
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="purchase_returns_created",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date", "-created_at"]
+
+    @property
+    def total_refund_amount(self):
+        return quantize_money(Decimal(str(self.quantity)) * self.unit_cost_price)
+
+    def clean(self):
+        super().clean()
+
+        if hasattr(self, "branch") and self.branch and hasattr(self, "item") and self.item:
+            if self.item.retailer_id is None and self.branch.retailer_id is not None:
+                self.item.retailer = self.branch.retailer
+                self.item.save(update_fields=["retailer"])
+
+        # Validate return quantity against original purchase if linked
+        if self.purchase and self.quantity:
+            if self.quantity > self.purchase.quantity:
+                raise ValidationError(
+                    f"Return quantity ({self.quantity}) cannot exceed original purchase quantity ({self.purchase.quantity})."
+                )
+
+    @db_transaction.atomic
+    def save(self, *args, **kwargs):
+        if isinstance(self.date, datetime):
+            self.date = self.date.date()
+
+        self.full_clean()
+        is_new = self.pk is None
+
+        # Auto-fill unit cost from purchase if omitted
+        if (not self.unit_cost_price or self.unit_cost_price == ZERO) and self.purchase:
+            self.unit_cost_price = self.purchase.unit_cost_price
+
+        # Auto-fill supplier name if linked
+        if self.purchase and not self.supplier_name:
+            self.supplier_name = self.purchase.supplier_name or (self.purchase.supplier.name if self.purchase.supplier else "")
+
+        super().save(*args, **kwargs)
+
+        # 1. Post to Stock Movement Ledger (Outbound movement)
+        ref_code = f"PURCHASE-RETURN-{self.pk}"
+        StockMovement.objects.update_or_create(
+            branch=self.branch,
+            item=self.item,
+            reference=ref_code,
+            defaults={
+                "movement_type": StockMovement.MovementType.SUPPLIER_RETURN,
+                "quantity": self.quantity,
+                "unit_cost_price": self.unit_cost_price,
+                "date": self.date,
+                "reference_id": self.pk,
+                "notes": f"Purchase Return: {self.reason}".strip(),
+                "created_by": self.created_by,
+            },
+        )
+
+        # 2. Recalculate WAC & update stock
+        recalculate_wac_sales_cost(self.branch, self.item)
+
+    def delete(self, *args, **kwargs):
+        with db_transaction.atomic():
+            branch = self.branch
+            item = self.item
+
+            StockMovement.objects.filter(
+                reference=f"PURCHASE-RETURN-{self.pk}"
+            ).delete()
+
+            result = super().delete(*args, **kwargs)
+
+            recalculate_wac_sales_cost(branch, item)
+            return result
+
+    def __str__(self):
+        return f"Purchase Return #{self.pk}: {self.item.name} x {self.quantity} ({self.branch.name})"
 # -----------------------------------------------------------------------------
 # Single Receipt & Credit Sale Models (Parent-Child)
 # -----------------------------------------------------------------------------
