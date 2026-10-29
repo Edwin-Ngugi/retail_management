@@ -908,6 +908,93 @@ class AuthViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+class AdminAuthViewSet(viewsets.GenericViewSet):
+    """
+    Dedicated ViewSet for administrative authentication.
+    Strictly restricts access to Superusers and Staff accounts.
+    """
+    permission_classes = [AllowAny]
+
+    @action(detail=False, methods=["post"], url_path="login")
+    def login(self, request):
+        try:
+            username = request.data.get("username", "").trim() if isinstance(request.data.get("username"), str) else request.data.get("username")
+            password = request.data.get("password")
+
+            if not username or not password:
+                return Response(
+                    {"error": "Admin username and password are required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Authenticate credentials against Django Auth system
+            user = authenticate(request, username=username, password=password)
+
+            if user is None:
+                return Response(
+                    {"error": "Invalid administrative credentials."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+
+            if not getattr(user, "is_active", True):
+                return Response(
+                    {"error": "Admin account is currently disabled."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            # Strict privilege check for admin access
+            is_admin = bool(
+                getattr(user, "is_superuser", False) or 
+                getattr(user, "is_staff", False)
+            )
+
+            if not is_admin:
+                return Response(
+                    {"error": "Access denied. Administrative privileges required."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            # Safe branch lookup
+            user_branch = None
+            try:
+                if hasattr(user, "branches"):
+                    user_branch = user.branches.first()
+            except Exception:
+                user_branch = None
+
+            branch_id = getattr(user_branch, "id", None)
+            branch_name = getattr(user_branch, "name", "All Branches")
+
+            # Generate JWT tokens
+            refresh = RefreshToken.for_user(user)
+
+            return Response(
+                {
+                    "access": str(refresh.access_token),
+                    "refresh": str(refresh),
+                    "portal_type": "admin",
+                    "user": {
+                        "id": user.id,
+                        "username": user.username,
+                        "email": getattr(user, "email", "") or "",
+                        "role": "SUPERADMIN" if getattr(user, "is_superuser", False) else "ADMIN",
+                        "is_staff": bool(getattr(user, "is_staff", False)),
+                        "is_superuser": bool(getattr(user, "is_superuser", False)),
+                        "can_access_admin": True,
+                        "branch": branch_id,
+                        "branch_name": branch_name,
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            logger.error(f"Admin login processing error: {e}", exc_info=True)
+            return Response(
+                {"error": "Admin authentication processing failed.", "detail": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )            
+
 class LogoutViewSet(viewsets.ViewSet):
     """
     ViewSet to handle user logout by blacklisting the provided JWT refresh token.

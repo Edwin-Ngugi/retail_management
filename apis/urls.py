@@ -29,6 +29,7 @@ from .views import (
     ManagementReportsViewSet,
     RequestOTPView,
     VerifyOTPAndResetPassword,
+    AdminAuthViewSet,
 
     # User roles and permissions
     UserPermissionViewSet,
@@ -68,12 +69,15 @@ router.register(r'management-reports', ManagementReportsViewSet, basename='manag
 # User roles and permissions
 router.register(r'user-permissions', UserPermissionViewSet, basename='user-permissions')
 
+router.register(r'admin-auth', AdminAuthViewSet, basename='admin-auth')
+
 urlpatterns = [
     # Unified Authentication & JWT (Handles both /login/ and /auth/login/)
     path('login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair_alias'),
     path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('auth/logout/', LogoutViewSet.as_view({'post': 'logout'}), name='auth_logout'),
+
 
     # Registration and account management
     path('auth/register/', RegisterView.as_view(), name='register'),
