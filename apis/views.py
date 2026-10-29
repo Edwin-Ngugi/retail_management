@@ -9457,30 +9457,39 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_filters(request)
 
             po_qs = PurchaseOrder.objects.all()
-            payment_qs = SupplierPayment.objects.all()
             return_qs = SupplierReturn.objects.all()
 
             if branch_obj:
                 po_qs = po_qs.filter(branch=branch_obj)
-                payment_qs = payment_qs.filter(purchase__branch=branch_obj)
                 return_qs = return_qs.filter(branch=branch_obj)
 
             if start_dt and end_dt:
                 po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
-                payment_qs = payment_qs.filter(created_at__range=(start_dt, end_dt))
             if start_date and end_date:
                 return_qs = return_qs.filter(date__range=(start_date, end_date))
 
             po_count = po_qs.count()
 
-            # Primary: Sum Purchase Orders
+            # Primary: Aggregate directly from PurchaseOrder header records
             if po_count > 0:
-                total_procurement_spend = to_decimal(po_qs.aggregate(total=Sum('total_amount'))['total'])
+                total_procurement_spend = ZERO
+                total_paid_suppliers = ZERO
+
+                for po in po_qs:
+                    po_total = to_decimal(po.total_amount)
+                    total_procurement_spend += po_total
+
+                    # Check if non-credit purchase method or amount_paid recorded
+                    if getattr(po, 'payment_method', 'CASH') != 'CREDIT':
+                        total_paid_suppliers += po_total
+                    else:
+                        total_paid_suppliers += to_decimal(po.amount_paid)
+
                 po_items = PurchaseOrderItem.objects.filter(purchase_order__in=po_qs)
                 total_units_purchased = to_decimal(po_items.aggregate(total=Sum('quantity'))['total'])
                 orders_count = po_count
             else:
-                # Fallback to direct standalone Purchase model if no PO headers exist
+                # Fallback to direct Purchase entries
                 purchases_qs = Purchase.objects.all()
                 if branch_obj:
                     purchases_qs = purchases_qs.filter(branch=branch_obj)
@@ -9488,15 +9497,24 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                     purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
 
                 total_procurement_spend = ZERO
+                total_paid_suppliers = ZERO
                 total_units_purchased = ZERO
+
                 for p in purchases_qs:
                     p_qty = to_decimal(p.quantity)
                     p_cost = to_decimal(p.unit_cost_price)
-                    total_procurement_spend += (p_qty * p_cost)
+                    p_total = p_qty * p_cost
+
+                    total_procurement_spend += p_total
                     total_units_purchased += p_qty
+
+                    if getattr(p, 'payment_method', 'CASH') != 'CREDIT':
+                        total_paid_suppliers += p_total
+                    else:
+                        total_paid_suppliers += to_decimal(p.amount_paid)
+
                 orders_count = purchases_qs.count()
 
-            total_paid_suppliers = to_decimal(payment_qs.aggregate(total=Sum('amount'))['total'])
             outstanding_payables = max(ZERO, total_procurement_spend - total_paid_suppliers)
 
             return Response({
@@ -9532,7 +9550,6 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             results = []
 
             if po_qs.exists():
-                # Aggregate at header level (1 row per order)
                 for po in po_qs.order_by('-created_at'):
                     supplier_name = po.supplier_name or (po.supplier.name if po.supplier else "N/A")
                     items_list = list(po.items.all())
@@ -9550,10 +9567,9 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                         "item_name": item_names,
                         "quantity": float(total_qty),
                         "total_cost": float(quantize_money(to_decimal(po.total_amount))),
-                        "payment_method": getattr(po, 'payment_method', 'CREDIT') or 'CREDIT',
+                        "payment_method": getattr(po, 'payment_method', 'CASH'),
                     })
             else:
-                # Fallback to Purchase model
                 purchases_qs = Purchase.objects.select_related('supplier', 'item', 'branch')
                 if branch_obj:
                     purchases_qs = purchases_qs.filter(branch=branch_obj)
@@ -9632,6 +9648,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
 
             results = []
             for po in po_qs.order_by('-created_at'):
+                is_paid = (getattr(po, 'payment_method', 'CASH') != 'CREDIT') or (to_decimal(po.amount_paid) >= to_decimal(po.total_amount))
                 results.append({
                     "id": po.id,
                     "invoice_number": f"INV-{po.id}",
@@ -9639,7 +9656,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                     "total_cost": float(quantize_money(to_decimal(po.total_amount))),
                     "invoice_date": po.created_at.strftime('%Y-%m-%d') if po.created_at else "",
                     "due_date": "",
-                    "is_paid": (to_decimal(po.amount_paid) >= to_decimal(po.total_amount)) if po.total_amount else True
+                    "is_paid": is_paid
                 })
 
             return Response(results, status=status.HTTP_200_OK)
@@ -9694,19 +9711,25 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             results = []
             for sup in suppliers:
                 po_qs = PurchaseOrder.objects.filter(Q(supplier=sup) | Q(supplier_name__iexact=sup.name))
-                pay_qs = SupplierPayment.objects.filter(Q(purchase__supplier=sup) | Q(purchase__supplier_name__iexact=sup.name))
 
                 if branch_obj:
                     po_qs = po_qs.filter(branch=branch_obj)
-                    pay_qs = pay_qs.filter(purchase__branch=branch_obj)
 
                 if start_dt and end_dt:
                     po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
-                    pay_qs = pay_qs.filter(created_at__range=(start_dt, end_dt))
 
                 po_count = po_qs.count()
+                total_spend = ZERO
+                total_paid = ZERO
+
                 if po_count > 0:
-                    total_spend = to_decimal(po_qs.aggregate(total=Sum('total_amount'))['total'])
+                    for po in po_qs:
+                        po_total = to_decimal(po.total_amount)
+                        total_spend += po_total
+                        if getattr(po, 'payment_method', 'CASH') != 'CREDIT':
+                            total_paid += po_total
+                        else:
+                            total_paid += to_decimal(po.amount_paid)
                 else:
                     purchases_qs = Purchase.objects.filter(Q(supplier=sup) | Q(supplier_name__iexact=sup.name))
                     if branch_obj:
@@ -9714,14 +9737,16 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                     if start_dt and end_dt:
                         purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
                     
-                    total_spend = ZERO
                     for p in purchases_qs:
-                        p_qty = to_decimal(p.quantity)
-                        p_cost = to_decimal(p.unit_cost_price)
-                        total_spend += (p_qty * p_cost)
+                        p_total = to_decimal(p.quantity) * to_decimal(p.unit_cost_price)
+                        total_spend += p_total
+                        if getattr(p, 'payment_method', 'CASH') != 'CREDIT':
+                            total_paid += p_total
+                        else:
+                            total_paid += to_decimal(p.amount_paid)
+
                     po_count = purchases_qs.count()
 
-                total_paid = to_decimal(pay_qs.aggregate(total=Sum('amount'))['total'])
                 outstanding_balance = max(ZERO, total_spend - total_paid)
 
                 results.append({
