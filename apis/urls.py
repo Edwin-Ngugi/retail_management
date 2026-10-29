@@ -30,6 +30,8 @@ from .views import (
     RequestOTPView,
     VerifyOTPAndResetPassword,
     AdminAuthViewSet,
+    DetailedSalesAnalysisViewSet,
+    PurchaseAnalyticsViewSet,
 
     # User roles and permissions
     UserPermissionViewSet,
@@ -44,11 +46,13 @@ router.register(r'stock-movements', StockMovementViewSet, basename='stock-moveme
 # Purchasing
 router.register(r'purchases', PurchaseViewSet, basename='purchase')
 router.register(r'supplier-payments', SupplierPaymentViewSet, basename='supplier-payment')
+router.register(r'purchases-analytics', PurchaseAnalyticsViewSet, basename='purchases-analytics')
 
 # Sales and credit
 router.register(r'sales', SaleTransactionViewSet, basename='sale')
 router.register(r'credit-sales', CreditRepaymentViewSet, basename='credit-sale')
 router.register(r'credit-repayments', CreditRepaymentViewSet, basename='credit-repayment')
+router.register(r'sales-analysis-detailed', DetailedSalesAnalysisViewSet, basename='sales-analysis-detailed')
 
 # Business operations
 router.register(r'expenses', ExpenseViewSet, basename='expense')
