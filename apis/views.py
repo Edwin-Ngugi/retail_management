@@ -9370,7 +9370,7 @@ class UserPermissionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         try:
-            from apis.models import UserRolePermission
+            from stocks.models import UserRolePermission
             return UserRolePermission.objects.select_related("user").all().order_by("-id")
         except Exception:
             return []
@@ -9441,7 +9441,7 @@ class UserPermissionViewSet(viewsets.ModelViewSet):
     def retrieve(self, request, pk=None, *args, **kwargs):
         try:
             from django.contrib.auth import get_user_model
-            from apis.models import UserRolePermission
+            from stocks.models import UserRolePermission
 
             User = get_user_model()
             defaults = self._get_defaults()
@@ -9482,7 +9482,7 @@ class UserPermissionViewSet(viewsets.ModelViewSet):
     def update(self, request, pk=None, *args, **kwargs):
         try:
             from django.contrib.auth import get_user_model
-            from apis.models import UserRolePermission
+            from stocks.models import UserRolePermission
 
             User = get_user_model()
             role = request.data.get("role", "NORMAL_USER")
