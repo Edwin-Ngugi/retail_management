@@ -9399,7 +9399,16 @@ class UserPermissionViewSet(viewsets.ModelViewSet):
 
         except Exception as e:
             logger.exception(f"Unhandled error in UserPermissionViewSet.update: {e}")
-            return Response({"error": "Failed to update user permission.", "details": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)        
+            return Response({"error": "Failed to update user permission.", "details": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+def to_decimal(val):
+    if val is None:
+        return ZERO
+    try:
+        return Decimal(str(val))
+    except Exception:
+        return ZERO
+                    
 class PurchaseAnalyticsViewSet(viewsets.ViewSet):
     """
     Dedicated ViewSet for Procurement, Purchase Orders, Goods Received Notes (GRN),
