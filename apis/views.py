@@ -7680,83 +7680,63 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='purchase-orders')
     def purchase_orders(self, request):
         try:
-            branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
-            start_date = request.query_params.get('start_date') or request.query_params.get('startDate')
-            end_date = request.query_params.get('end_date') or request.query_params.get('endDate')
-            month = request.query_params.get('month')
-            year = request.query_params.get('year')
+            branch_obj, _, _, start_dt, end_dt = self._get_filters(request)
+            
+            purchases_qs = Purchase.objects.select_related('supplier', 'item', 'branch')
+            po_items_qs = PurchaseOrderItem.objects.select_related('purchase_order', 'purchase_order__supplier', 'item')
 
-            po_qs = PurchaseOrder.objects.all()
-
-            # 1. Branch Filtering
-            if branch_id and str(branch_id).lower() != 'all':
-                po_qs = po_qs.filter(Q(branch_id=branch_id) | Q(branch__name__iexact=branch_id))
-
-            # 2. Date Range Filtering (Only filter if params are provided)
-            if start_date and end_date:
-                try:
-                    s_dt = datetime.strptime(start_date, '%Y-%m-%d')
-                    e_dt = datetime.strptime(end_date, '%Y-%m-%d')
-                    s_aware = timezone.make_aware(datetime.combine(s_dt, time.min))
-                    e_aware = timezone.make_aware(datetime.combine(e_dt, time.max))
-                    po_qs = po_qs.filter(purchase_date__range=(s_aware, e_aware))
-                except ValueError:
-                    pass
-            elif month and year:
-                try:
-                    po_qs = po_qs.filter(purchase_date__year=int(year), purchase_date__month=int(month))
-                except (ValueError, TypeError):
-                    pass
-
-            po_qs = po_qs.prefetch_related('items__item', 'supplier', 'branch').order_by('-purchase_date')
+            if branch_obj:
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                po_items_qs = po_items_qs.filter(purchase_order__branch=branch_obj)
+            if start_dt and end_dt:
+                purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
+                po_items_qs = po_items_qs.filter(purchase_order__created_at__range=(start_dt, end_dt))
 
             results = []
-            for po in po_qs:
-                # Aggregate line items from PurchaseOrderItem relation
-                line_items = [
-                    {
-                        "item_id": line.item_id,
-                        "item_name": line.item.name if line.item else f"Item #{line.item_id}",
-                        "quantity": float(line.quantity or 0),
-                        "unit_cost_price": float(line.unit_cost_price or 0),
-                        "total_cost": float(line.quantity or 0) * float(line.unit_cost_price or 0),
-                    }
-                    for line in po.items.all()
-                ]
 
-                total_qty = sum(item["quantity"] for item in line_items)
-                first_item = line_items[0]["item_name"] if line_items else "No Items"
-                item_display = first_item if len(line_items) <= 1 else f"{first_item} (+{len(line_items) - 1} more)"
-
-                # Payment values derived from PurchaseOrder header properties
-                total_cost = float(po.total_amount or 0)
-                amount_paid = float(po.amount_paid or 0)
-                balance_due = max(0.0, total_cost - amount_paid)
-
+            # Process direct purchases
+            for p in purchases_qs.order_by('-purchase_date'):
+                supplier_name = p.supplier_name or (p.supplier.name if p.supplier else "N/A")
+                item_name = p.item.name if p.item else f"Item #{p.item_id}"
+                
                 results.append({
-                    "id": po.id,
-                    "po_ref": po.po_number,
-                    "po_number": po.po_number,
-                    "date": po.purchase_date.strftime('%b %d, %Y') if hasattr(po.purchase_date, 'strftime') else str(po.purchase_date)[:10],
-                    "purchase_date": po.purchase_date.strftime('%Y-%m-%d %H:%M') if hasattr(po.purchase_date, 'strftime') else str(po.purchase_date)[:16],
-                    "supplier": po.supplier_name or (po.supplier.name if po.supplier else "Direct Supplier"),
-                    "supplier_name": po.supplier_name or (po.supplier.name if po.supplier else "Direct Supplier"),
-                    "item": item_display,
-                    "item_name": item_display,
-                    "items": line_items,
-                    "quantity": total_qty,
-                    "total_cost": total_cost,
-                    "amount_paid": amount_paid,
-                    "balance_due": balance_due,
-                    "payment_terms": po.get_payment_method_display() if hasattr(po, 'get_payment_method_display') else po.payment_method,
-                    "payment_method": po.payment_method,
+                    "id": f"P-{p.id}",
+                    "po_number": f"PUR-{p.id}",
+                    "purchase_date": p.purchase_date.strftime('%Y-%m-%d') if p.purchase_date else "",
+                    "supplier_name": supplier_name,
+                    "item_name": item_name,
+                    "quantity": float(p.quantity or 0),
+                    "total_cost": float(quantize_money(p.total_cost)),
+                    "payment_method": getattr(p, 'payment_method', 'CASH'),
                 })
 
-            return Response({"count": len(results), "results": results}, status=status.HTTP_200_OK)
+            # Process line items from Purchase Orders
+            for line in po_items_qs.order_by('-purchase_order__created_at'):
+                po = line.purchase_order
+                supplier_name = po.supplier_name or (po.supplier.name if po and po.supplier else "N/A")
+                item_name = line.item.name if line.item else f"Item #{line.item_id}"
+                
+                # FIXED: Keep qty as Decimal for arithmetic multiplication
+                qty_dec = Decimal(str(line.quantity or 0))
+                unit_price = Decimal(str(line.unit_cost_price or 0))
+                total_cost = quantize_money(qty_dec * unit_price)
+
+                results.append({
+                    "id": f"PO-{line.id}",
+                    "po_number": getattr(po, 'po_number', f"PO-{po.id}"),
+                    "purchase_date": po.created_at.strftime('%Y-%m-%d') if po.created_at else "",
+                    "supplier_name": supplier_name,
+                    "item_name": item_name,
+                    "quantity": float(qty_dec),
+                    "total_cost": float(total_cost),
+                    "payment_method": getattr(po, 'payment_terms', getattr(po, 'payment_method', 'CREDIT')) or 'CREDIT',
+                })
+
+            return Response(results, status=status.HTTP_200_OK)
 
         except Exception as e:
-            logger.exception("Error loading purchase orders: %s", e)
-            return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
+            logger.exception("Error generating purchase orders list")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path='goods-received')
     def goods_received(self, request):
