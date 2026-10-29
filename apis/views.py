@@ -9387,7 +9387,7 @@ class UserPermissionViewSet(viewsets.ModelViewSet):
     def list(self, request, *args, **kwargs):
         try:
             from django.contrib.auth import get_user_model
-            from apis.models import UserRolePermission
+            from stocks.models import UserRolePermission
 
             User = get_user_model()
             all_users = User.objects.all().order_by("username")
