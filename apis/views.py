@@ -7677,6 +7677,111 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             logger.exception("Error loading purchase requisitions: %s", e)
             return Response({"count": 0, "results": []}, status=status.HTTP_200_OK)
 
+    class PurchaseAnalyticsViewSet(viewsets.ViewSet):
+    """
+    Dedicated ViewSet for Procurement, Purchase Orders, Goods Received Notes (GRN),
+    Supplier Invoices, Payments, and Accounts Payable Analytics.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def _get_filters(self, request):
+        branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
+        start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
+        end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
+
+        start_date, end_date = None, None
+        if start_param:
+            try:
+                start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        if end_param:
+            try:
+                end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        tz = timezone.get_current_timezone()
+        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
+        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz) if end_date else None
+
+        branch_obj = None
+        if branch_param and str(branch_param).strip().lower() not in ["all", "none", "", "null"]:
+            clean_param = str(branch_param).strip()
+            if clean_param.isdigit():
+                branch_obj = RetailBranch.objects.filter(pk=int(clean_param)).first()
+            if not branch_obj:
+                branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
+
+        return branch_obj, start_date, end_date, start_dt, end_dt
+
+    # --------------------------------------------------------------------------
+    # 1. /management-analytics/purchases-overview/
+    # --------------------------------------------------------------------------
+    @action(detail=False, methods=['get'], url_path='purchases-overview')
+    def purchases_overview(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_filters(request)
+
+            purchases_qs = Purchase.objects.all()
+            po_qs = PurchaseOrder.objects.all()
+            payment_qs = SupplierPayment.objects.all()
+            return_qs = SupplierReturn.objects.all()
+
+            if branch_obj:
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                po_qs = po_qs.filter(branch=branch_obj)
+                payment_qs = payment_qs.filter(purchase__branch=branch_obj)
+                return_qs = return_qs.filter(branch=branch_obj)
+
+            if start_dt and end_dt:
+                purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
+                po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
+                payment_qs = payment_qs.filter(created_at__range=(start_dt, end_dt))
+            if start_date and end_date:
+                return_qs = return_qs.filter(date__range=(start_date, end_date))
+
+            # Direct Purchases Spend Calculation
+            direct_purchase_spend = ZERO
+            for p in purchases_qs:
+                p_qty = to_decimal(p.quantity)
+                p_cost = to_decimal(p.unit_cost_price)
+                direct_purchase_spend += (p_qty * p_cost)
+
+            # Purchase Orders Spend Calculation
+            po_spend = to_decimal(po_qs.aggregate(total=Sum('total_amount'))['total'])
+
+            total_procurement_spend = direct_purchase_spend + po_spend
+            total_paid_suppliers = to_decimal(payment_qs.aggregate(total=Sum('amount'))['total'])
+
+            # Outstanding Payables
+            outstanding_payables = max(ZERO, total_procurement_spend - total_paid_suppliers)
+
+            # Units purchased count
+            purchase_units = to_decimal(purchases_qs.aggregate(total=Sum('quantity'))['total'])
+            po_items = PurchaseOrderItem.objects.filter(purchase_order__in=po_qs)
+            po_units = to_decimal(po_items.aggregate(total=Sum('quantity'))['total'])
+            total_units_purchased = purchase_units + po_units
+
+            return Response({
+                "summary": {
+                    "total_procurement_spend": float(quantize_money(total_procurement_spend)),
+                    "total_paid_suppliers": float(quantize_money(total_paid_suppliers)),
+                    "outstanding_payables": float(quantize_money(outstanding_payables)),
+                    "purchase_orders_count": po_qs.count() + purchases_qs.count(),
+                    "total_units_purchased": float(total_units_purchased),
+                    "supplier_returns_count": return_qs.count()
+                }
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Error generating purchases overview")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # --------------------------------------------------------------------------
+    # 2. /management-analytics/purchase-orders/
+    # --------------------------------------------------------------------------
     @action(detail=False, methods=['get'], url_path='purchase-orders')
     def purchase_orders(self, request):
         try:
@@ -7694,32 +7799,35 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             results = []
 
-            # Process direct purchases
+            # Process direct purchases safely
             for p in purchases_qs.order_by('-purchase_date'):
                 supplier_name = p.supplier_name or (p.supplier.name if p.supplier else "N/A")
                 item_name = p.item.name if p.item else f"Item #{p.item_id}"
                 
+                qty_dec = to_decimal(p.quantity)
+                cost_dec = to_decimal(p.unit_cost_price)
+                total_cost = quantize_money(qty_dec * cost_dec)
+
                 results.append({
                     "id": f"P-{p.id}",
                     "po_number": f"PUR-{p.id}",
                     "purchase_date": p.purchase_date.strftime('%Y-%m-%d') if p.purchase_date else "",
                     "supplier_name": supplier_name,
                     "item_name": item_name,
-                    "quantity": float(p.quantity or 0),
-                    "total_cost": float(quantize_money(p.total_cost)),
+                    "quantity": float(qty_dec),
+                    "total_cost": float(total_cost),
                     "payment_method": getattr(p, 'payment_method', 'CASH'),
                 })
 
-            # Process line items from Purchase Orders
+            # Process line items from Purchase Orders safely
             for line in po_items_qs.order_by('-purchase_order__created_at'):
                 po = line.purchase_order
                 supplier_name = po.supplier_name or (po.supplier.name if po and po.supplier else "N/A")
                 item_name = line.item.name if line.item else f"Item #{line.item_id}"
                 
-                # FIXED: Keep qty as Decimal for arithmetic multiplication
-                qty_dec = Decimal(str(line.quantity or 0))
-                unit_price = Decimal(str(line.unit_cost_price or 0))
-                total_cost = quantize_money(qty_dec * unit_price)
+                qty_dec = to_decimal(line.quantity)
+                cost_dec = to_decimal(line.unit_cost_price)
+                total_cost = quantize_money(qty_dec * cost_dec)
 
                 results.append({
                     "id": f"PO-{line.id}",
@@ -7729,13 +7837,167 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "item_name": item_name,
                     "quantity": float(qty_dec),
                     "total_cost": float(total_cost),
-                    "payment_method": getattr(po, 'payment_terms', getattr(po, 'payment_method', 'CREDIT')) or 'CREDIT',
+                    "payment_method": getattr(po, 'payment_method', 'CREDIT') or 'CREDIT',
                 })
 
             return Response(results, status=status.HTTP_200_OK)
 
         except Exception as e:
             logger.exception("Error generating purchase orders list")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # --------------------------------------------------------------------------
+    # 3. /management-analytics/goods-received/
+    # --------------------------------------------------------------------------
+    @action(detail=False, methods=['get'], url_path='goods-received')
+    def goods_received(self, request):
+        try:
+            branch_obj, _, _, start_dt, end_dt = self._get_filters(request)
+            purchases_qs = Purchase.objects.select_related('supplier', 'item')
+
+            if branch_obj:
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+            if start_dt and end_dt:
+                purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
+
+            results = []
+            for p in purchases_qs.order_by('-purchase_date'):
+                results.append({
+                    "id": p.id,
+                    "grn_number": f"GRN-{p.id}",
+                    "po_number": f"PO-{p.id}",
+                    "supplier_name": p.supplier_name or (p.supplier.name if p.supplier else "N/A"),
+                    "received_date": p.purchase_date.strftime('%Y-%m-%d') if p.purchase_date else "",
+                    "notes": f"Received {p.quantity} x {p.item.name if p.item else 'Item'}",
+                })
+
+            return Response(results, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Error fetching goods received notes")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # --------------------------------------------------------------------------
+    # 4. /management-analytics/supplier-invoices/
+    # --------------------------------------------------------------------------
+    @action(detail=False, methods=['get'], url_path='supplier-invoices')
+    def supplier_invoices(self, request):
+        try:
+            branch_obj, _, _, start_dt, end_dt = self._get_filters(request)
+            purchases_qs = Purchase.objects.select_related('supplier', 'item')
+
+            if branch_obj:
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+            if start_dt and end_dt:
+                purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
+
+            results = []
+            for p in purchases_qs.order_by('-purchase_date'):
+                qty_dec = to_decimal(p.quantity)
+                cost_dec = to_decimal(p.unit_cost_price)
+                total_cost = quantize_money(qty_dec * cost_dec)
+
+                results.append({
+                    "id": p.id,
+                    "invoice_number": f"INV-{p.id}",
+                    "supplier_name": p.supplier_name or (p.supplier.name if p.supplier else "N/A"),
+                    "total_cost": float(total_cost),
+                    "invoice_date": p.purchase_date.strftime('%Y-%m-%d') if p.purchase_date else "",
+                    "due_date": "",
+                    "is_paid": p.is_fully_paid
+                })
+
+            return Response(results, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Error fetching supplier invoices")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # --------------------------------------------------------------------------
+    # 5. /management-analytics/supplier-payments/
+    # --------------------------------------------------------------------------
+    @action(detail=False, methods=['get'], url_path='supplier-payments')
+    def supplier_payments(self, request):
+        try:
+            branch_obj, _, _, start_dt, end_dt = self._get_filters(request)
+            pay_qs = SupplierPayment.objects.select_related('purchase', 'purchase__supplier', 'purchase__branch')
+
+            if branch_obj:
+                pay_qs = pay_qs.filter(purchase__branch=branch_obj)
+            if start_dt and end_dt:
+                pay_qs = pay_qs.filter(created_at__range=(start_dt, end_dt))
+
+            results = []
+            for pay in pay_qs.order_by('-created_at'):
+                p = pay.purchase
+                supplier_name = p.supplier_name or (p.supplier.name if p and p.supplier else "N/A")
+                
+                results.append({
+                    "id": pay.id,
+                    "payment_ref": f"PAY-{pay.id}",
+                    "supplier_name": supplier_name,
+                    "amount": float(quantize_money(to_decimal(pay.amount))),
+                    "payment_method": getattr(pay, 'payment_method', 'CASH'),
+                    "payment_date": pay.created_at.strftime('%Y-%m-%d') if pay.created_at else "",
+                })
+
+            return Response(results, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Error fetching supplier payments")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # --------------------------------------------------------------------------
+    # 6. /management-analytics/suppliers-list/
+    # --------------------------------------------------------------------------
+    @action(detail=False, methods=['get'], url_path='suppliers-list')
+    def suppliers_list(self, request):
+        try:
+            branch_obj, _, _, start_dt, end_dt = self._get_filters(request)
+            suppliers = Supplier.objects.all()
+
+            results = []
+            for sup in suppliers:
+                purchases_qs = Purchase.objects.filter(Q(supplier=sup) | Q(supplier_name__iexact=sup.name))
+                po_qs = PurchaseOrder.objects.filter(Q(supplier=sup) | Q(supplier_name__iexact=sup.name))
+                pay_qs = SupplierPayment.objects.filter(Q(purchase__supplier=sup) | Q(purchase__supplier_name__iexact=sup.name))
+
+                if branch_obj:
+                    purchases_qs = purchases_qs.filter(branch=branch_obj)
+                    po_qs = po_qs.filter(branch=branch_obj)
+                    pay_qs = pay_qs.filter(purchase__branch=branch_obj)
+
+                if start_dt and end_dt:
+                    purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
+                    po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
+                    pay_qs = pay_qs.filter(created_at__range=(start_dt, end_dt))
+
+                # Sum up spend from Purchases and Purchase Orders
+                purchase_spend = ZERO
+                for p in purchases_qs:
+                    p_qty = to_decimal(p.quantity)
+                    p_cost = to_decimal(p.unit_cost_price)
+                    purchase_spend += (p_qty * p_cost)
+                    
+                po_spend = to_decimal(po_qs.aggregate(total=Sum('total_amount'))['total'])
+                total_spend = purchase_spend + po_spend
+                
+                total_paid = to_decimal(pay_qs.aggregate(total=Sum('amount'))['total'])
+                outstanding_balance = max(ZERO, total_spend - total_paid)
+
+                results.append({
+                    "id": sup.id,
+                    "supplier_name": sup.name,
+                    "total_purchases_count": purchases_qs.count() + po_qs.count(),
+                    "total_spend": float(quantize_money(total_spend)),
+                    "outstanding_balance": float(quantize_money(outstanding_balance)),
+                })
+
+            results.sort(key=lambda x: x["total_spend"], reverse=True)
+            return Response(results, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Error fetching suppliers list")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path='goods-received')
