@@ -6960,7 +6960,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 price = Decimal(str(line.unit_selling_price or 0))
                 disc = Decimal(str(line.discount_per_item or 0))
                 
-                # COGS fallback to Item.cost_price if unit_cost_price is missing
                 unit_cost = line.unit_cost_price
                 if unit_cost is None and line.item:
                     unit_cost = getattr(line.item, 'cost_price', 0)
@@ -6987,10 +6986,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 products_map[i_id]["gross_revenue"] += line_rev
                 products_map[i_id]["cogs"] += line_cost
 
-                # Category Breakdown Aggregation
+                # Category Breakdown Aggregation (Aligned to return "category" key for Recharts)
                 cat_name = "Uncategorized"
                 if line.item and getattr(line.item, 'category', None):
-                    cat_name = line.item.category.name if hasattr(line.item.category, 'name') else str(line.item.category)
+                    cat_obj = line.item.category
+                    cat_name = cat_obj.name if hasattr(cat_obj, 'name') else str(cat_obj)
 
                 if cat_name not in categories_map:
                     categories_map[cat_name] = ZERO
@@ -7010,7 +7010,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             daily_trends = [{"date": k, "revenue": float(v["revenue"])} for k, v in sorted(daily_map.items())]
 
-            # Formatted Category Breakdown
+            # Formatted Category Breakdown (Matching key: "category")
             category_breakdown = [
                 {"category": cat_title, "revenue": float(quantize_money(cat_rev))}
                 for cat_title, cat_rev in sorted(categories_map.items(), key=lambda x: x[1], reverse=True)
