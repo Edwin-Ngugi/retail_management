@@ -8521,7 +8521,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             tot_sales_cash = ZERO
             for s in sales_qs:
-                # liquid_payments_breakdown handles CASH, MPESA, PAYBILL, and SPLIT breakdown
                 bd = s.liquid_payments_breakdown
                 tot_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
 
@@ -8529,7 +8528,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             tot_inflows = tot_sales_cash + tot_repayments
 
             # ------------------------------------------------------------------
-            # 2. Cash Outflows (OpEx + Non-Credit Purchases + Supplier Repayments)
+            # 2. Cash Outflows (OpEx + Direct Purchases + Supplier Repayments)
             # ------------------------------------------------------------------
             expenses_qs = Expense.objects.filter(
                 Q(date__lte=end_date) | Q(created_at__lte=end_dt)
@@ -8551,19 +8550,24 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
-            # Direct cash/mobile purchases paid upfront
             tot_purchases_direct = ZERO
             for p in purchases_qs.exclude(payment_method=Purchase.PaymentMethod.CREDIT):
                 tot_purchases_direct += Decimal(str(p.amount_paid or ZERO))
 
-            # Non-credit Purchase Orders paid upfront
             for po in po_qs.exclude(payment_method=PurchaseOrder.PaymentMethod.CREDIT):
                 tot_purchases_direct += Decimal(str(po.amount_paid or ZERO))
 
             tot_supplier_repay = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-
             tot_outflows = tot_expenses + tot_purchases_direct + tot_supplier_repay
-            cash_bank_mpesa = max(ZERO, tot_inflows - tot_outflows)
+
+            # Handle positive vs negative cash position
+            net_cash = tot_inflows - tot_outflows
+            if net_cash >= ZERO:
+                cash_bank_mpesa = net_cash
+                bank_overdraft = ZERO
+            else:
+                cash_bank_mpesa = ZERO
+                bank_overdraft = abs(net_cash)
 
             # ------------------------------------------------------------------
             # 3. Customer Debts (Accounts Receivable)
@@ -8578,7 +8582,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             customer_debts = sum((s.balance_due for s in credit_sales_qs), ZERO)
 
             # ------------------------------------------------------------------
-            # 4. Inventory Stock Value (Derived via BranchItemPricing.remaining_stock)
+            # 4. Inventory Stock Value
             # ------------------------------------------------------------------
             inventory_stock = ZERO
             pricing_qs = BranchItemPricing.objects.all().select_related('item', 'branch')
@@ -8592,24 +8596,21 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
 
             # ------------------------------------------------------------------
-            # 5. Accounts Payable (Supplier Debts)
+            # 5. Accounts Payable & Liabilities
             # ------------------------------------------------------------------
             supplier_debts = ZERO
-
-            # Outstanding balance on credit purchases
             for p in purchases_qs.filter(payment_method=Purchase.PaymentMethod.CREDIT):
                 supplier_debts += p.balance_due
 
-            # Outstanding balance on credit purchase orders
             for po in po_qs.filter(payment_method=PurchaseOrder.PaymentMethod.CREDIT):
                 po_bal = Decimal(str(po.total_amount or ZERO)) - Decimal(str(po.amount_paid or ZERO))
                 supplier_debts += max(ZERO, po_bal)
 
             bank_loan = ZERO
-            total_liabilities = supplier_debts + bank_loan
+            total_liabilities = supplier_debts + bank_loan + bank_overdraft
 
             # ------------------------------------------------------------------
-            # 6. Equity & Balance Equation
+            # 6. Equity & Balance Check
             # ------------------------------------------------------------------
             capital_and_retained_profits = total_assets - total_liabilities
             liabilities_plus_equity = total_liabilities + capital_and_retained_profits
@@ -8625,6 +8626,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 },
                 "liabilities": {
                     "supplier_debts": float(quantize_money(supplier_debts)),
+                    "bank_overdraft": float(quantize_money(bank_overdraft)),
                     "bank_loan": float(quantize_money(bank_loan)),
                     "total_liabilities": float(quantize_money(total_liabilities)),
                 },
@@ -8639,7 +8641,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             return Response({
                 "as_at_date": timezone.localdate().strftime('%d %b %Y'),
                 "assets": {"cash_bank_mpesa": 0.0, "customer_debts": 0.0, "inventory_stock": 0.0, "equipment": 0.0, "total_assets": 0.0},
-                "liabilities": {"supplier_debts": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
+                "liabilities": {"supplier_debts": 0.0, "bank_overdraft": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
                 "equity": {"capital_and_retained_profits": 0.0},
                 "liabilities_plus_equity": 0.0
             }, status=status.HTTP_200_OK)
