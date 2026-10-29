@@ -6458,7 +6458,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
     def _get_branch_and_dates(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
-        period_type = (request.query_params.get("period_type") or "month").lower().strip()
+        period_type = (request.query_params.get("period_type") or "").lower().strip()
 
         start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
         end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
@@ -6467,66 +6467,66 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         year_param = request.query_params.get("year")
 
         today = timezone.localdate()
+        start_date = None
+        end_date = None
 
-        # 1. Custom Range
-        if period_type == "custom" and start_param and end_param:
+        # 1. Custom or Explicit Date Range
+        if start_param and end_param:
             try:
                 start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
                 end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
+                period_type = period_type or "custom"
             except ValueError:
-                start_date, end_date = today, today
+                pass
 
         # 2. Daily or Weekly View
-        elif period_type in ["day", "weekly"]:
+        elif period_type in ["day", "weekly"] and date_param:
             try:
-                parsed_date = datetime.strptime(str(date_param).strip(), "%Y-%m-%d").date() if date_param else today
+                parsed_date = datetime.strptime(str(date_param).strip(), "%Y-%m-%d").date()
+                if period_type == "day":
+                    start_date, end_date = parsed_date, parsed_date
+                else:
+                    start_date = parsed_date
+                    end_date = parsed_date + timedelta(days=6)
             except ValueError:
-                parsed_date = today
-
-            if period_type == "day":
-                start_date, end_date = parsed_date, parsed_date
-            else:
-                start_date = parsed_date
-                end_date = parsed_date + timedelta(days=6)
+                pass
 
         # 3. Monthly View
-        elif period_type == "month":
+        elif period_type == "month" or (month_param and year_param):
             try:
                 yr = int(year_param) if year_param else today.year
                 mth = int(month_param) if month_param else today.month
                 _, last_day = calendar.monthrange(yr, mth)
                 start_date = date(yr, mth, 1)
                 end_date = date(yr, mth, last_day)
+                period_type = "month"
             except (ValueError, TypeError):
-                _, last_day = calendar.monthrange(today.year, today.month)
-                start_date = date(today.year, today.month, 1)
-                end_date = date(today.year, today.month, last_day)
+                pass
 
         # 4. Yearly View
-        elif period_type == "year":
+        elif period_type == "year" or (year_param and not month_param):
             try:
                 yr = int(year_param) if year_param else today.year
                 start_date = date(yr, 1, 1)
                 end_date = date(yr, 12, 31)
+                period_type = "year"
             except (ValueError, TypeError):
-                start_date = date(today.year, 1, 1)
-                end_date = date(today.year, 12, 31)
+                pass
 
-        else:
-            _, last_day = calendar.monthrange(today.year, today.month)
-            start_date = date(today.year, today.month, 1)
-            end_date = date(today.year, today.month, last_day)
+        # Note: If no date parameters are passed, start_date and end_date stay None (All-Time mode)
 
         tz = timezone.get_current_timezone()
-        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
-        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
+        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
+        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz) if end_date else None
 
+        # Flexible Branch Resolution (Numeric ID vs Name string)
         branch_obj = None
-        if branch_param and str(branch_param).lower() != "all":
-            try:
-                branch_obj = RetailBranch.objects.get(pk=branch_param)
-            except (RetailBranch.DoesNotExist, ValueError):
-                branch_obj = None
+        if branch_param and str(branch_param).strip().lower() not in ["all", "none", "", "null"]:
+            clean_param = str(branch_param).strip()
+            if clean_param.isdigit():
+                branch_obj = RetailBranch.objects.filter(pk=int(clean_param)).first()
+            if not branch_obj:
+                branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
 
         return branch_obj, start_date, end_date, start_dt, end_dt, period_type
 
