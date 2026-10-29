@@ -2772,10 +2772,15 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
+        # 1. Restrict view to today's date only
+        today = timezone.localdate()
+
+        # 2. Exclude supplier repayments / purchase entries
         queryset = (
             Expense.objects
             .select_related("branch")
-            .all()
+            .filter(date=today)
+            .exclude(description__icontains="Supplier Repayment")
             .order_by("-date", "-id")
         )
 
