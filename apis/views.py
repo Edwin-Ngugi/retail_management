@@ -909,17 +909,17 @@ class AuthViewSet(viewsets.GenericViewSet):
             )
 
 class AdminAuthViewSet(viewsets.GenericViewSet):
-    """
-    Dedicated ViewSet for administrative authentication.
-    Strictly restricts access to Superusers and Staff accounts.
-    """
     permission_classes = [AllowAny]
 
     @action(detail=False, methods=["post"], url_path="login")
     def login(self, request):
         try:
-            username = request.data.get("username", "").trim() if isinstance(request.data.get("username"), str) else request.data.get("username")
-            password = request.data.get("password")
+            raw_username = request.data.get("username", "")
+            raw_password = request.data.get("password", "")
+
+            # Fix: Use Python's .strip() instead of .trim()
+            username = raw_username.strip() if isinstance(raw_username, str) else raw_username
+            password = raw_password
 
             if not username or not password:
                 return Response(
@@ -927,7 +927,7 @@ class AdminAuthViewSet(viewsets.GenericViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # Authenticate credentials against Django Auth system
+            # Authenticate user credentials
             user = authenticate(request, username=username, password=password)
 
             if user is None:
@@ -942,7 +942,7 @@ class AdminAuthViewSet(viewsets.GenericViewSet):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
-            # Strict privilege check for admin access
+            # Check administrative permissions
             is_admin = bool(
                 getattr(user, "is_superuser", False) or 
                 getattr(user, "is_staff", False)
@@ -965,7 +965,7 @@ class AdminAuthViewSet(viewsets.GenericViewSet):
             branch_id = getattr(user_branch, "id", None)
             branch_name = getattr(user_branch, "name", "All Branches")
 
-            # Generate JWT tokens
+            # Generate JWT session tokens
             refresh = RefreshToken.for_user(user)
 
             return Response(
