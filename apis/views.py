@@ -861,11 +861,10 @@ class AuthViewSet(viewsets.GenericViewSet):
 
                 permissions_map = get_fallback_permissions()
 
-            # Grant full admin portal access to superusers / staff / admins
-            if getattr(user, "is_superuser", False) or role in ["SUPERADMIN", "ADMIN"]:
-                portal_type = "admin"
-            else:
-                portal_type = "user"
+            # Set portal_type to "user" so everyone lands on the POS frontend.
+            # Record admin privileges in can_access_django_admin instead.
+            portal_type = "user"
+            can_access_admin = bool(getattr(user, "is_superuser", False) or getattr(user, "is_staff", False))
 
             # Safe branch lookup
             user_branch = None
@@ -894,6 +893,7 @@ class AuthViewSet(viewsets.GenericViewSet):
                         "permissions": permissions_map,
                         "is_staff": bool(getattr(user, "is_staff", False)),
                         "is_superuser": bool(getattr(user, "is_superuser", False)),
+                        "can_access_admin": can_access_admin,
                         "branch": branch_id,
                         "branch_name": branch_name,
                     },
