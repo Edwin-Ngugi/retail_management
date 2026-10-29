@@ -9674,62 +9674,95 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
-    """
-    Dedicated ViewSet for comprehensive, granular sales reporting.
-    Provides detailed metrics for performance, basket size, discount ratios,
-    payment channels, category contributions, and item velocity trends.
-    """
     permission_classes = [permissions.AllowAny]
+
+    def _normalize_payment_method(self, method_name):
+        """Standardizes raw payment channel strings to clean upper-case keys."""
+        if not method_name:
+            return "UNKNOWN"
+
+        clean = (
+            str(method_name)
+            .strip()
+            .upper()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+
+        if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
+            return "PAYBILL"
+
+        if any(
+            k in clean
+            for k in [
+                "SEND_MONEY",
+                "SENDMONEY",
+                "TILL",
+                "BUY_GOODS",
+                "BUYGOODS",
+                "P2P",
+            ]
+        ):
+            return "SEND_MONEY"
+
+        if "CASH" in clean:
+            return "CASH"
+
+        if "CREDIT" in clean or "DEBT" in clean or "ON_ACCOUNT" in clean:
+            return "CREDIT"
+
+        if "BANK" in clean or "EFT" in clean or "TRANSFER" in clean:
+            return "BANK_TRANSFER"
+
+        if "MPESA" in clean or "M_PESA" in clean or "MOBILE" in clean:
+            return "MPESA"
+
+        if "SPLIT" in clean:
+            return "SPLIT"
+
+        return clean
+
+    def _extract_sp_method(self, sp):
+        """Safely inspects split payment instances across all possible field names."""
+        for attr in [
+            "method",
+            "payment_method",
+            "payment_mode",
+            "channel",
+            "mode",
+            "type",
+        ]:
+            val = getattr(sp, attr, None)
+            if val:
+                return val
+        return None
+
+    def _get_split_payments(self, sale):
+        """Safely fetches split payment objects regardless of related_name naming."""
+        for rel_attr in ["split_payments", "payments", "payment_breakdown", "splits", "sale_payments"]:
+            relation = getattr(sale, rel_attr, None)
+            if relation is not None:
+                try:
+                    records = list(relation.all())
+                    if records:
+                        return records
+                except Exception:
+                    pass
+        return []
 
     def _get_branch_and_dates(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
-        period_type = (request.query_params.get("period_type") or "").lower().strip()
-
         start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
         end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
-        date_param = request.query_params.get("date") or request.query_params.get("selectedDate")
-        month_param = request.query_params.get("month")
-        year_param = request.query_params.get("year")
 
-        today = timezone.localdate()
         start_date = None
         end_date = None
 
-        # 1. Custom/Explicit Range
         if start_param and end_param:
             try:
                 start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
                 end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
             except ValueError:
-                pass
-
-        # 2. Single Day / Week
-        elif period_type in ["day", "weekly"] and date_param:
-            try:
-                parsed_date = datetime.strptime(str(date_param).strip(), "%Y-%m-%d").date()
-                start_date = parsed_date
-                end_date = parsed_date if period_type == "day" else parsed_date + timedelta(days=6)
-            except ValueError:
-                pass
-
-        # 3. Month View
-        elif period_type == "month" or (month_param and year_param):
-            try:
-                yr = int(year_param) if year_param else today.year
-                mth = int(month_param) if month_param else today.month
-                _, last_day = calendar.monthrange(yr, mth)
-                start_date = date(yr, mth, 1)
-                end_date = date(yr, mth, last_day)
-            except (ValueError, TypeError):
-                pass
-
-        # 4. Year View
-        elif period_type == "year" or (year_param and not month_param):
-            try:
-                yr = int(year_param) if year_param else today.year
-                start_date = date(yr, 1, 1)
-                end_date = date(yr, 12, 31)
-            except (ValueError, TypeError):
                 pass
 
         tz = timezone.get_current_timezone()
@@ -9745,6 +9778,56 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
 
         return branch_obj, start_date, end_date, start_dt, end_dt
+
+    def _generate_executive_insights(self, summary, fast_movers, slow_movers):
+        notes = []
+        margin = summary.get("profit_margin_percent", 0)
+        gross_rev = summary.get("gross_revenue", 0)
+
+        if gross_rev > 0:
+            if margin >= 30:
+                notes.append({
+                    "type": "success",
+                    "title": "Healthy Profit Margin",
+                    "message": f"Gross profit margin is running strong at {margin}%. Direct costs are well controlled."
+                })
+            elif margin >= 15:
+                notes.append({
+                    "type": "warning",
+                    "title": "Moderate Margin Performance",
+                    "message": f"Gross margin stands at {margin}%. Evaluate unit procurement costs to increase profitability."
+                })
+            else:
+                notes.append({
+                    "type": "danger",
+                    "title": "Low Profit Margin Warning",
+                    "message": f"Gross profit margin is low at {margin}%. Direct COGS and discount limits require review."
+                })
+
+        credit_exp = summary.get("credit_sales_exposure", 0)
+        if gross_rev > 0 and (credit_exp / gross_rev) > 0.20:
+            notes.append({
+                "type": "warning",
+                "title": "High Credit Sales Exposure",
+                "message": f"KSh {credit_exp:,.2f} of total revenue was executed on credit terms."
+            })
+
+        if fast_movers:
+            top_item = fast_movers[0]
+            notes.append({
+                "type": "success",
+                "title": "Top Revenue Driver",
+                "message": f"'{top_item['item_name']}' leads overall velocity with KSh {top_item['gross_revenue']:,.2f} gross revenue."
+            })
+
+        if slow_movers:
+            notes.append({
+                "type": "info",
+                "title": "Inventory Velocity Action",
+                "message": f"{len(slow_movers)} items exhibit low turnover. Consider bundling stagnant stock."
+            })
+
+        return notes
 
     @action(detail=False, methods=['get'], url_path='detailed-report')
     def detailed_report(self, request):
@@ -9762,49 +9845,68 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 returns_qs = returns_qs.filter(branch=branch_obj)
 
-            # Updated select_related: Removed 'item__category' as Item model has no category relation
-            sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item')
+            sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
 
             total_gross_revenue = ZERO
             total_cogs = ZERO
             total_discounts = ZERO
             total_units_sold = ZERO
             products_map = {}
-            categories_map = {}
-            hourly_map = {f"{h:02d}:00": ZERO for h in range(24)}
-            payment_methods_map = {}
+            daily_map = {}
 
-            # Process Individual Transaction Metrics
+            # Channel Totals Tracking
+            channel_totals = {
+                "CASH": ZERO,
+                "MPESA": ZERO,
+                "PAYBILL": ZERO,
+                "SEND_MONEY": ZERO,
+                "BANK_TRANSFER": ZERO,
+                "CREDIT": ZERO,
+                "OTHER": ZERO,
+            }
+
             transaction_count = sales_qs.count()
             credit_sales_exposure = ZERO
 
-            for tx in sales_qs.prefetch_related('split_payments'):
-                # Track payment channel totals
-                method = tx.payment_method or "UNSPECIFIED"
-                tx_total = quantize_money(tx.total_amount or ZERO)
+            # 1. PROCESS SALES & SPLIT PAYMENTS (Direct logic match from FinancialReportViewSet)
+            for sale in sales_qs:
+                method = self._normalize_payment_method(getattr(sale, "payment_method", None))
+                split_records = self._get_split_payments(sale)
 
-                if method == SaleTransaction.PaymentMethod.CREDIT:
-                    credit_sales_exposure += tx_total
+                sale_amt = Decimal(str(getattr(sale, "total_amount", 0) or 0))
 
-                if method not in payment_methods_map:
-                    payment_methods_map[method] = ZERO
-                payment_methods_map[method] += tx_total
+                if method == "SPLIT" or split_records:
+                    for sp in split_records:
+                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
+                        sp_amount = quantize_money(getattr(sp, "amount", 0) or 0)
 
-                # Time distribution (Peak Hours Analysis)
-                if tx.sale_date:
-                    local_dt = timezone.localtime(tx.sale_date)
-                    hour_key = f"{local_dt.hour:02d}:00"
-                    hourly_map[hour_key] += tx_total
+                        if sp_method in channel_totals:
+                            channel_totals[sp_method] += sp_amount
+                        else:
+                            channel_totals["OTHER"] += sp_amount
 
-            # Process Line Items for COGS, Margins, Categories, and Item Performances
+                        if sp_method == "CREDIT":
+                            credit_sales_exposure += sp_amount
+                else:
+                    amt = quantize_money(getattr(sale, "amount_paid", None) or sale_amt)
+
+                    if method == "CREDIT":
+                        channel_totals["CREDIT"] += sale_amt
+                        credit_sales_exposure += sale_amt
+                    elif method in channel_totals:
+                        channel_totals[method] += amt
+                    else:
+                        channel_totals["OTHER"] += amt
+
+            # 2. PROCESS LINE ITEMS FOR REVENUE, COGS, PROFIT, AND DAILY TRENDS
             for line in sale_items_qs:
                 qty = Decimal(str(line.quantity_sold or 0))
                 price = Decimal(str(line.unit_selling_price or 0))
                 disc = Decimal(str(line.discount_per_item or 0))
-                
-                unit_cost = getattr(line, 'unit_cost_price', None)
-                if unit_cost is None and line.item:
-                    unit_cost = getattr(line.item, 'cost_price', 0)
+
+                unit_cost = line.unit_cost_price
+                if not unit_cost and line.item:
+                    unit_cost = getattr(line.item, 'cost_price', ZERO)
                 cost = Decimal(str(unit_cost or 0))
 
                 line_rev = qty * (price - disc)
@@ -9816,7 +9918,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 total_discounts += line_disc_total
                 total_units_sold += qty
 
-                # Product Breakdown
+                # Product Performance Map
                 i_id = line.item_id
                 name = line.item.name if line.item else f"Item #{i_id}"
                 if i_id not in products_map:
@@ -9833,18 +9935,28 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 products_map[i_id]["cogs"] += line_cost
                 products_map[i_id]["discounts"] += line_disc_total
 
-                # Category Breakdown (Safely resolution without assuming FK relation)
-                cat_name = "Uncategorized"
-                if line.item:
-                    cat_val = getattr(line.item, 'category', None)
-                    if cat_val:
-                        cat_name = str(getattr(cat_val, 'name', cat_val))
+                # Daily Financial Trends Aggregation
+                sale_dt = line.transaction.sale_date if line.transaction else None
+                day_str = sale_dt.strftime('%Y-%m-%d') if hasattr(sale_dt, 'strftime') else str(sale_dt)[:10] if sale_dt else "Unknown"
+                if day_str not in daily_map:
+                    daily_map[day_str] = {"date": day_str, "revenue": ZERO, "cogs": ZERO}
+                daily_map[day_str]["revenue"] += line_rev
+                daily_map[day_str]["cogs"] += line_cost
 
-                if cat_name not in categories_map:
-                    categories_map[cat_name] = {"revenue": ZERO, "units": ZERO, "cogs": ZERO}
-                categories_map[cat_name]["revenue"] += line_rev
-                categories_map[cat_name]["units"] += qty
-                categories_map[cat_name]["cogs"] += line_cost
+            # Format Daily Trends with explicit revenue, cogs, profit keys
+            daily_trends = []
+            for k, v in sorted(daily_map.items()):
+                if k == "Unknown":
+                    continue
+                rev_val = float(quantize_money(v["revenue"]))
+                cogs_val = float(quantize_money(v["cogs"]))
+                profit_val = float(quantize_money(v["revenue"] - v["cogs"]))
+                daily_trends.append({
+                    "date": k,
+                    "revenue": rev_val,
+                    "cogs": cogs_val,
+                    "profit": max(0.0, profit_val)
+                })
 
             gross_profit = total_gross_revenue - total_cogs
             net_revenue = total_gross_revenue - total_discounts
@@ -9853,34 +9965,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             avg_basket_value = quantize_money(total_gross_revenue / transaction_count) if transaction_count > 0 else ZERO
             avg_items_per_basket = round(float(total_units_sold / transaction_count), 2) if transaction_count > 0 else 0.0
 
-            # Daily Trends
-            daily_map = {}
-            for s in sales_qs:
-                day_str = s.sale_date.strftime('%Y-%m-%d') if hasattr(s.sale_date, 'strftime') else str(s.sale_date)[:10]
-                amt = quantize_money(s.total_amount or ZERO)
-                if day_str not in daily_map:
-                    daily_map[day_str] = {"date": day_str, "revenue": ZERO, "transactions": 0}
-                daily_map[day_str]["revenue"] += amt
-                daily_map[day_str]["transactions"] += 1
-
-            daily_trends = [
-                {
-                    "date": k,
-                    "revenue": float(v["revenue"]),
-                    "transactions": v["transactions"]
-                } for k, v in sorted(daily_map.items())
-            ]
-
-            category_breakdown = [
-                {
-                    "category": cat_name,
-                    "revenue": float(quantize_money(data["revenue"])),
-                    "units": float(data["units"]),
-                    "profit": float(quantize_money(data["revenue"] - data["cogs"])),
-                }
-                for cat_name, data in sorted(categories_map.items(), key=lambda x: x[1]["revenue"], reverse=True)
-            ]
-
+            # Fast / Slow Movers Velocity Analysis
             performers = []
             for v in products_map.values():
                 rev_val = v["gross_revenue"]
@@ -9897,43 +9982,65 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     "profit_margin_percent": round(m_pct, 1)
                 })
 
-            top_performers = sorted(performers, key=lambda x: x["gross_revenue"], reverse=True)[:15]
-            slow_movers = sorted(performers, key=lambda x: (x["units_sold"], x["gross_revenue"]))[:15]
+            sorted_by_velocity = sorted(
+                performers, 
+                key=lambda x: (x["gross_revenue"], x["units_sold"]), 
+                reverse=True
+            )
 
-            hourly_trends = [
-                {"hour": k, "revenue": float(quantize_money(v))}
-                for k, v in sorted(hourly_map.items())
-            ]
+            total_items = len(sorted_by_velocity)
+            if total_items <= 5:
+                split_idx = max(1, total_items // 2)
+                fast_movers = sorted_by_velocity[:split_idx]
+                slow_movers = sorted_by_velocity[split_idx:]
+            else:
+                fast_movers = sorted_by_velocity[:10]
+                slow_movers = sorted(
+                    sorted_by_velocity[10:], 
+                    key=lambda x: (x["units_sold"], x["gross_revenue"])
+                )[:10]
 
+            summary_payload = {
+                "gross_revenue": float(quantize_money(total_gross_revenue)),
+                "net_revenue": float(quantize_money(net_revenue)),
+                "total_cogs": float(quantize_money(total_cogs)),
+                "gross_profit": float(quantize_money(gross_profit)),
+                "profit_margin_percent": round(profit_margin_pct, 2),
+                "total_discounts": float(quantize_money(total_discounts)),
+                "discount_rate_percent": round(discount_rate_pct, 2),
+                "transaction_count": transaction_count,
+                "avg_basket_value": float(avg_basket_value),
+                "avg_items_per_basket": avg_items_per_basket,
+                "total_units_sold": float(total_units_sold),
+                "credit_sales_exposure": float(quantize_money(credit_sales_exposure)),
+                "returned_orders_count": returns_qs.count()
+            }
+
+            insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
+
+            # Array Breakdown (for Table component)
             payment_breakdown = [
                 {"method": k, "amount": float(quantize_money(v))}
-                for k, v in payment_methods_map.items()
+                for k, v in channel_totals.items() if v > ZERO and k != "SPLIT"
             ]
 
+            # Object Breakdown (for Financial report component)
+            payment_channel_breakdown = {
+                k.lower(): float(quantize_money(v))
+                for k, v in channel_totals.items()
+            }
+
             return Response({
-                "summary": {
-                    "gross_revenue": float(quantize_money(total_gross_revenue)),
-                    "net_revenue": float(quantize_money(net_revenue)),
-                    "total_cogs": float(quantize_money(total_cogs)),
-                    "gross_profit": float(quantize_money(gross_profit)),
-                    "profit_margin_percent": round(profit_margin_pct, 2),
-                    "total_discounts": float(quantize_money(total_discounts)),
-                    "discount_rate_percent": round(discount_rate_pct, 2),
-                    "transaction_count": transaction_count,
-                    "avg_basket_value": float(avg_basket_value),
-                    "avg_items_per_basket": avg_items_per_basket,
-                    "total_units_sold": float(total_units_sold),
-                    "credit_sales_exposure": float(quantize_money(credit_sales_exposure)),
-                    "returned_orders_count": returns_qs.count()
-                },
+                "summary": summary_payload,
                 "daily_trends": daily_trends,
-                "hourly_trends": hourly_trends,
-                "category_breakdown": category_breakdown,
                 "payment_breakdown": payment_breakdown,
-                "top_performers": top_performers,
-                "slow_movers": slow_movers
+                "payment_channel_breakdown": payment_channel_breakdown,
+                "fast_movers": fast_movers,
+                "top_performers": fast_movers,
+                "slow_movers": slow_movers,
+                "insights": insights
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
             logger.exception("Error generating detailed sales analysis report")
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)            
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)           
