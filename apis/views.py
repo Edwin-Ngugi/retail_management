@@ -9762,7 +9762,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 returns_qs = returns_qs.filter(branch=branch_obj)
 
-            sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'item__category')
+            # Updated select_related: Removed 'item__category' as Item model has no category relation
+            sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item')
 
             total_gross_revenue = ZERO
             total_cogs = ZERO
@@ -9801,7 +9802,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 price = Decimal(str(line.unit_selling_price or 0))
                 disc = Decimal(str(line.discount_per_item or 0))
                 
-                unit_cost = line.unit_cost_price
+                unit_cost = getattr(line, 'unit_cost_price', None)
                 if unit_cost is None and line.item:
                     unit_cost = getattr(line.item, 'cost_price', 0)
                 cost = Decimal(str(unit_cost or 0))
@@ -9832,11 +9833,12 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 products_map[i_id]["cogs"] += line_cost
                 products_map[i_id]["discounts"] += line_disc_total
 
-                # Category Breakdown
+                # Category Breakdown (Safely resolution without assuming FK relation)
                 cat_name = "Uncategorized"
-                if line.item and getattr(line.item, 'category', None):
-                    cat_obj = line.item.category
-                    cat_name = cat_obj.name if hasattr(cat_obj, 'name') else str(cat_obj)
+                if line.item:
+                    cat_val = getattr(line.item, 'category', None)
+                    if cat_val:
+                        cat_name = str(getattr(cat_val, 'name', cat_val))
 
                 if cat_name not in categories_map:
                     categories_map[cat_name] = {"revenue": ZERO, "units": ZERO, "cogs": ZERO}
