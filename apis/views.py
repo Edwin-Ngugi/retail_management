@@ -6886,18 +6886,27 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     def sales_overview(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-            returns_qs = CustomerReturn.objects.filter(date__range=(start_date, end_date))
             
+            # Base querysets
+            sales_qs = SaleTransaction.objects.all()
+            returns_qs = CustomerReturn.objects.all()
+
+            # Apply date range filtering if explicitly provided
+            if start_dt and end_dt:
+                sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
+            if start_date and end_date:
+                returns_qs = returns_qs.filter(date__range=(start_date, end_date))
+
+            # Apply branch filtering
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 returns_qs = returns_qs.filter(branch=branch_obj)
 
             gross_revenue = sum((quantize_money(s.total_amount or ZERO) for s in sales_qs), ZERO)
-            total_paid = sum((quantize_money(s.amount_paid or s.total_amount or ZERO) for s in sales_qs if s.payment_method != 'CREDIT'), ZERO)
+            total_paid = sum((quantize_money(s.amount_paid or s.total_amount or ZERO) for s in sales_qs if str(getattr(s, 'payment_method', '')).upper() != 'CREDIT'), ZERO)
             count = sales_qs.count()
             avg_val = quantize_money(gross_revenue / count) if count > 0 else ZERO
-            credit_exposure = sum((s.credit_payment_amount for s in sales_qs), ZERO)
+            credit_exposure = sum((quantize_money(getattr(s, 'credit_payment_amount', ZERO) or ZERO) for s in sales_qs), ZERO)
 
             sale_items = SaleItem.objects.filter(transaction__in=sales_qs)
             total_discounts = sum((Decimal(str(item.quantity_sold or 0)) * Decimal(str(item.discount_per_item or 0)) for item in sale_items), ZERO)
@@ -6923,27 +6932,39 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             }, status=status.HTTP_200_OK)
         except Exception as e:
             logger.exception("Sales Overview Error")
-            return Response({"summary": {"gross_revenue": 0.0, "total_paid": 0.0, "transaction_count": 0, "average_transaction_value": 0.0}}, status=status.HTTP_200_OK)
+            return Response({
+                "summary": {"gross_revenue": 0.0, "total_paid": 0.0, "transaction_count": 0, "average_transaction_value": 0.0},
+                "operational_health": {"credit_sales_exposure": 0.0, "total_discounts_granted": 0.0, "discount_rate_percent": 0.0, "average_items_per_basket": 0.0, "total_units_sold": 0.0, "returned_orders_count": 0}
+            }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='sales-analysis')
     def sales_analysis(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
+            sales_qs = SaleTransaction.objects.all()
+
+            if start_dt and end_dt:
+                sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
 
-            sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item')
+            sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'item__category')
 
             revenue = ZERO
             cogs = ZERO
             products_map = {}
+            categories_map = {}
 
             for line in sale_items_qs:
                 qty = Decimal(str(line.quantity_sold or 0))
                 price = Decimal(str(line.unit_selling_price or 0))
                 disc = Decimal(str(line.discount_per_item or 0))
-                cost = Decimal(str(line.unit_cost_price or 0))
+                
+                # COGS fallback to Item.cost_price if unit_cost_price is missing
+                unit_cost = line.unit_cost_price
+                if unit_cost is None and line.item:
+                    unit_cost = getattr(line.item, 'cost_price', 0)
+                cost = Decimal(str(unit_cost or 0))
 
                 line_rev = qty * (price - disc)
                 line_cost = qty * cost
@@ -6951,26 +6972,49 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 revenue += line_rev
                 cogs += line_cost
 
+                # Item Aggregation
                 i_id = line.item_id
                 name = line.item.name if line.item else f"Item #{i_id}"
                 if i_id not in products_map:
-                    products_map[i_id] = {"item_id": i_id, "item_name": name, "units_sold": ZERO, "gross_revenue": ZERO, "cogs": ZERO}
+                    products_map[i_id] = {
+                        "item_id": i_id,
+                        "item_name": name,
+                        "units_sold": ZERO,
+                        "gross_revenue": ZERO,
+                        "cogs": ZERO
+                    }
                 products_map[i_id]["units_sold"] += qty
                 products_map[i_id]["gross_revenue"] += line_rev
                 products_map[i_id]["cogs"] += line_cost
 
+                # Category Breakdown Aggregation
+                cat_name = "Uncategorized"
+                if line.item and getattr(line.item, 'category', None):
+                    cat_name = line.item.category.name if hasattr(line.item.category, 'name') else str(line.item.category)
+
+                if cat_name not in categories_map:
+                    categories_map[cat_name] = ZERO
+                categories_map[cat_name] += line_rev
+
             gross_profit = revenue - cogs
             margin_pct = float((gross_profit / revenue * Decimal("100.0")) if revenue > ZERO else ZERO)
 
+            # Daily Revenue Trajectory
             daily_map = {}
             for s in sales_qs:
-                day_str = s.sale_date.strftime('%Y-%m-%d')
+                day_str = s.sale_date.strftime('%Y-%m-%d') if hasattr(s.sale_date, 'strftime') else str(s.sale_date)[:10]
                 amt = quantize_money(s.total_amount or ZERO)
                 if day_str not in daily_map:
                     daily_map[day_str] = {"date": day_str, "revenue": ZERO}
                 daily_map[day_str]["revenue"] += amt
 
             daily_trends = [{"date": k, "revenue": float(v["revenue"])} for k, v in sorted(daily_map.items())]
+
+            # Formatted Category Breakdown
+            category_breakdown = [
+                {"category": cat_title, "revenue": float(quantize_money(cat_rev))}
+                for cat_title, cat_rev in sorted(categories_map.items(), key=lambda x: x[1], reverse=True)
+            ]
 
             performers = []
             for v in products_map.values():
@@ -6996,13 +7040,19 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "profit_margin_percent": round(margin_pct, 1)
                 },
                 "daily_trends": daily_trends,
-                "category_breakdown": [],
+                "category_breakdown": category_breakdown,
                 "top_performers": top_performers,
                 "slow_movers": slow_movers
             }, status=status.HTTP_200_OK)
-        except Exception:
+        except Exception as e:
             logger.exception("Sales Analysis Error")
-            return Response({"branch_summary": {"gross_revenue": 0.0, "total_cogs": 0.0, "gross_profit": 0.0, "profit_margin_percent": 0.0}}, status=status.HTTP_200_OK)
+            return Response({
+                "branch_summary": {"gross_revenue": 0.0, "total_cogs": 0.0, "gross_profit": 0.0, "profit_margin_percent": 0.0},
+                "daily_trends": [],
+                "category_breakdown": [],
+                "top_performers": [],
+                "slow_movers": []
+            }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='sales-register')
     def sales_register(self, request):
