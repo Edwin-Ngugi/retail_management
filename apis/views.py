@@ -7563,51 +7563,134 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "records": []
             }, status=status.HTTP_200_OK)
 
-    @action(detail=False, methods=['get'], url_path='inventory-overview')
-    def inventory_overview(self, request):
+    @action(detail=False, methods=['get'], url_path='inventory-valuation')
+    def inventory_report(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            pricing_qs = BranchItemPricing.objects.filter(branch=branch_obj) if branch_obj else BranchItemPricing.objects.all()
+            # 1. Parse branch parameters
+            branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+            branch_obj = None
+            if branch_id and str(branch_id).lower() not in ['all', 'null', 'undefined', '']:
+                branch_obj = RetailBranch.objects.filter(pk=branch_id).first()
 
-            total_asset_value = sum((p.remaining_stock_value for p in pricing_qs), ZERO)
-            low_stock_count = len([p for p in pricing_qs if p.is_low_stock])
+            # 2. Query Item Catalog & Branch Pricing
+            pricings_qs = BranchItemPricing.objects.select_related('item', 'branch').all()
+            stock_qs = BranchStock.objects.select_related('item', 'branch').all()
+            movements_qs = StockMovement.objects.all()
 
-            movements = StockMovement.objects.filter(branch=branch_obj) if branch_obj else StockMovement.objects.all()
-            movements = movements.filter(created_at__range=(start_dt, end_dt))
+            if branch_obj:
+                pricings_qs = pricings_qs.filter(branch=branch_obj)
+                stock_qs = stock_qs.filter(branch=branch_obj)
+                movements_qs = movements_qs.filter(branch=branch_obj)
+            elif hasattr(request.user, 'retailer') and request.user.retailer:
+                pricings_qs = pricings_qs.filter(branch__retailer=request.user.retailer)
+                stock_qs = stock_qs.filter(branch__retailer=request.user.retailer)
+                movements_qs = movements_qs.filter(branch__retailer=request.user.retailer)
 
+            # Fallback to general Item model if BranchItemPricing is unconfigured
+            all_items = Item.objects.all()
+            if hasattr(request.user, 'retailer') and request.user.retailer:
+                all_items = all_items.filter(Q(retailer=request.user.retailer) | Q(retailer__isnull=True))
+
+            # 3. Calculate Valuation Metrics
+            total_valuation = ZERO
+            active_skus_count = max(pricings_qs.count(), all_items.count())
+            low_stock_alerts_count = 0
+            inventory_items = []
+
+            # Process pricing entries
+            processed_item_ids = set()
+            for pricing in pricings_qs:
+                processed_item_ids.add(pricing.item_id)
+                rem_stock = pricing.remaining_stock
+                cost = pricing.unit_cost_price or ZERO
+                item_val = rem_stock * cost
+
+                total_valuation += item_val
+                if pricing.is_low_stock:
+                    low_stock_alerts_count += 1
+
+                inventory_items.append({
+                    "item_id": pricing.item.pk,
+                    "item_name": pricing.item.name,
+                    "sku": pricing.item.sku or "N/A",
+                    "remaining_stock": float(rem_stock),
+                    "unit_cost_price": float(quantize_money(cost)),
+                    "unit_selling_price": float(quantize_money(pricing.unit_selling_price or ZERO)),
+                    "total_valuation": float(quantize_money(item_val)),
+                    "is_low_stock": pricing.is_low_stock,
+                })
+
+            # Process unconfigured catalog items as fallbacks
+            for item in all_items.exclude(id__in=processed_item_ids):
+                b_stock = stock_qs.filter(item=item).first()
+                stock_qty = b_stock.quantity if b_stock else ZERO
+                
+                inventory_items.append({
+                    "item_id": item.pk,
+                    "item_name": item.name,
+                    "sku": item.sku or "N/A",
+                    "remaining_stock": float(stock_qty),
+                    "unit_cost_price": 0.00,
+                    "unit_selling_price": 0.00,
+                    "total_valuation": 0.00,
+                    "is_low_stock": False,
+                })
+
+            # 4. Movement Ledger Totals
             inbound_types = [
                 StockMovement.MovementType.PURCHASE,
                 StockMovement.MovementType.CUSTOMER_RETURN,
                 StockMovement.MovementType.TRANSFER_IN,
-                StockMovement.MovementType.ADJUSTMENT_IN
+                StockMovement.MovementType.ADJUSTMENT_IN,
+                StockMovement.MovementType.OPENING_STOCK,
             ]
             outbound_types = [
                 StockMovement.MovementType.SALE,
                 StockMovement.MovementType.SUPPLIER_RETURN,
                 StockMovement.MovementType.TRANSFER_OUT,
                 StockMovement.MovementType.DAMAGE,
-                StockMovement.MovementType.ADJUSTMENT_OUT
+                StockMovement.MovementType.ADJUSTMENT_OUT,
             ]
 
-            inbound_qty = movements.filter(movement_type__in=inbound_types).aggregate(total=Coalesce(Sum('quantity'), ZERO))['total']
-            outbound_qty = movements.filter(movement_type__in=outbound_types).aggregate(total=Coalesce(Sum('quantity'), ZERO))['total']
+            inbound_units = movements_qs.filter(movement_type__in=inbound_types).aggregate(
+                total=Coalesce(Sum('quantity'), ZERO)
+            )['total']
 
-            transfers_count = StockTransfer.objects.filter(
-                Q(from_branch=branch_obj) | Q(to_branch=branch_obj)
-            ).count() if branch_obj else StockTransfer.objects.count()
+            outbound_units = movements_qs.filter(movement_type__in=outbound_types).aggregate(
+                total=Coalesce(Sum('quantity'), ZERO)
+            )['total']
+
+            damage_records_count = movements_qs.filter(movement_type=StockMovement.MovementType.DAMAGE).count()
+            transfer_logs_count = movements_qs.filter(
+                movement_type__in=[StockMovement.MovementType.TRANSFER_IN, StockMovement.MovementType.TRANSFER_OUT]
+            ).count()
+
+            # Sort descending by asset valuation
+            inventory_items.sort(key=lambda x: x["total_valuation"], reverse=True)
 
             return Response({
-                "summary": {
-                    "total_asset_value": float(quantize_money(total_asset_value)),
-                    "total_items_count": pricing_qs.count(),
-                    "low_stock_count": low_stock_count,
-                    "inbound_quantity": float(inbound_qty),
-                    "outbound_quantity": float(outbound_qty),
-                    "transfers_count": transfers_count
-                }
+                "total_stock_valuation": float(quantize_money(total_valuation)),
+                "active_catalog_skus": active_skus_count,
+                "low_stock_threshold_alerts": low_stock_alerts_count,
+                "inter_branch_transfers": transfer_logs_count,
+                "inbound_stock_units": float(inbound_units),
+                "outbound_stock_units": float(outbound_units),
+                "damaged_shrinkage_logs": damage_records_count,
+                "inventory_summary": inventory_items,
             }, status=status.HTTP_200_OK)
+
         except Exception:
-            return Response({"summary": {"total_asset_value": 0.0, "total_items_count": 0, "low_stock_count": 0, "inbound_quantity": 0, "outbound_quantity": 0, "transfers_count": 0}}, status=status.HTTP_200_OK)
+            logger.exception("Inventory Valuation Report Error")
+            return Response({
+                "total_stock_valuation": 0.00,
+                "active_catalog_skus": 0,
+                "low_stock_threshold_alerts": 0,
+                "inter_branch_transfers": 0,
+                "inbound_stock_units": 0,
+                "outbound_stock_units": 0,
+                "damaged_shrinkage_logs": 0,
+                "inventory_summary": [],
+            }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='stock-levels')
     def stock_levels(self, request):
