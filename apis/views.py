@@ -7572,10 +7572,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             if branch_id and str(branch_id).lower() not in ['all', 'null', 'undefined', '']:
                 branch_obj = RetailBranch.objects.filter(pk=branch_id).first()
 
-            # 2. Query Item Catalog & Branch Pricing
+            # 2. Base QuerySets
             pricings_qs = BranchItemPricing.objects.select_related('item', 'branch').all()
             stock_qs = BranchStock.objects.select_related('item', 'branch').all()
-            movements_qs = StockMovement.objects.all()
+            movements_qs = StockMovement.objects.select_related('item', 'created_by').all()
 
             if branch_obj:
                 pricings_qs = pricings_qs.filter(branch=branch_obj)
@@ -7586,19 +7586,17 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 stock_qs = stock_qs.filter(branch__retailer=request.user.retailer)
                 movements_qs = movements_qs.filter(branch__retailer=request.user.retailer)
 
-            # Fallback to general Item model if BranchItemPricing is unconfigured
             all_items = Item.objects.all()
             if hasattr(request.user, 'retailer') and request.user.retailer:
                 all_items = all_items.filter(Q(retailer=request.user.retailer) | Q(retailer__isnull=True))
 
-            # 3. Calculate Valuation Metrics
+            # 3. Stock Asset Calculation
             total_valuation = ZERO
             active_skus_count = max(pricings_qs.count(), all_items.count())
             low_stock_alerts_count = 0
             inventory_items = []
-
-            # Process pricing entries
             processed_item_ids = set()
+
             for pricing in pricings_qs:
                 processed_item_ids.add(pricing.item_id)
                 rem_stock = pricing.remaining_stock
@@ -7620,11 +7618,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "is_low_stock": pricing.is_low_stock,
                 })
 
-            # Process unconfigured catalog items as fallbacks
             for item in all_items.exclude(id__in=processed_item_ids):
                 b_stock = stock_qs.filter(item=item).first()
                 stock_qty = b_stock.quantity if b_stock else ZERO
-                
                 inventory_items.append({
                     "item_id": item.pk,
                     "item_name": item.name,
@@ -7636,7 +7632,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "is_low_stock": False,
                 })
 
-            # 4. Movement Ledger Totals
+            inventory_items.sort(key=lambda x: x["total_valuation"], reverse=True)
+
+            # 4. Inbound & Outbound Movement Categories
             inbound_types = [
                 StockMovement.MovementType.PURCHASE,
                 StockMovement.MovementType.CUSTOMER_RETURN,
@@ -7652,21 +7650,44 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 StockMovement.MovementType.ADJUSTMENT_OUT,
             ]
 
-            inbound_units = movements_qs.filter(movement_type__in=inbound_types).aggregate(
-                total=Coalesce(Sum('quantity'), ZERO)
-            )['total']
+            inbound_movements = movements_qs.filter(movement_type__in=inbound_types).order_by('-created_at')
+            outbound_movements = movements_qs.filter(movement_type__in=outbound_types).order_by('-created_at')
 
-            outbound_units = movements_qs.filter(movement_type__in=outbound_types).aggregate(
-                total=Coalesce(Sum('quantity'), ZERO)
-            )['total']
+            inbound_units = inbound_movements.aggregate(total=Coalesce(Sum('quantity'), ZERO))['total']
+            outbound_units = outbound_movements.aggregate(total=Coalesce(Sum('quantity'), ZERO))['total']
+
+            recent_inbound = []
+            for m in inbound_movements[:10]:
+                unit_cost = m.unit_cost_price or ZERO
+                tot_cost = m.quantity * unit_cost
+                recent_inbound.append({
+                    "id": m.pk,
+                    "ref_code": m.reference or f"IN-{m.pk}",
+                    "item_name": m.item.name if m.item else "Unknown Item",
+                    "quantity": float(m.quantity),
+                    "unit_cost_price": float(quantize_money(unit_cost)),
+                    "total_cost": float(quantize_money(tot_cost)),
+                    "date": m.date.strftime('%Y-%m-%d') if m.date else "",
+                })
+
+            recent_outbound = []
+            for m in outbound_movements[:10]:
+                unit_cost = m.unit_cost_price or ZERO
+                tot_cost = m.quantity * unit_cost
+                recent_outbound.append({
+                    "id": m.pk,
+                    "ref_code": m.reference or f"OUT-{m.pk}",
+                    "item_name": m.item.name if m.item else "Unknown Item",
+                    "quantity": float(m.quantity),
+                    "unit_cost_price": float(quantize_money(unit_cost)),
+                    "total_cost": float(quantize_money(tot_cost)),
+                    "date": m.date.strftime('%Y-%m-%d') if m.date else "",
+                })
 
             damage_records_count = movements_qs.filter(movement_type=StockMovement.MovementType.DAMAGE).count()
             transfer_logs_count = movements_qs.filter(
                 movement_type__in=[StockMovement.MovementType.TRANSFER_IN, StockMovement.MovementType.TRANSFER_OUT]
             ).count()
-
-            # Sort descending by asset valuation
-            inventory_items.sort(key=lambda x: x["total_valuation"], reverse=True)
 
             return Response({
                 "total_stock_valuation": float(quantize_money(total_valuation)),
@@ -7677,6 +7698,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "outbound_stock_units": float(outbound_units),
                 "damaged_shrinkage_logs": damage_records_count,
                 "inventory_summary": inventory_items,
+                "recent_inbound": recent_inbound,
+                "recent_outbound": recent_outbound,
             }, status=status.HTTP_200_OK)
 
         except Exception:
@@ -7690,6 +7713,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "outbound_stock_units": 0,
                 "damaged_shrinkage_logs": 0,
                 "inventory_summary": [],
+                "recent_inbound": [],
+                "recent_outbound": [],
             }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='stock-levels')
