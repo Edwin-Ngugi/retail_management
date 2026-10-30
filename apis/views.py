@@ -6927,7 +6927,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 end_dt = timezone.now()
                 end_date = end_dt.date()
 
-            # 3. Query Credit Sale Transactions matching Customer Receipts query
+            # 3. Query Credit Sale Transactions
             st_credit_filter = Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) | Q(payment_method='Credit')
             credit_sales_qs = SaleTransaction.objects.filter(st_credit_filter, sale_date__lte=end_dt)
 
@@ -6941,7 +6941,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             
             total_recovered = repayment_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
-            # 5. Group credit sales and compute net balances per customer
+            # 5. Group credit sales by Customer
             debtors_map = {}
             total_credit_issued = ZERO
             total_unpaid_invoices_count = 0
@@ -6968,17 +6968,17 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 total_credit_issued += gross_sale_amt
                 total_unpaid_invoices_count += 1
 
-            # 6. Format debtors summary items with net repayments deducted
+            # 6. Deduct specific repayments per debtor
             debtors_summary = []
-            total_receivables = ZERO
-
+            
             for key, data in debtors_map.items():
                 cust_obj = data["customer_obj"]
                 cust_repayments = ZERO
 
                 if cust_obj:
-                    cust_repay_qs = repayment_qs.filter(customer=cust_obj)
-                    cust_repayments = cust_repay_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+                    cust_repayments = repayment_qs.filter(customer=cust_obj).aggregate(
+                        total=Coalesce(Sum('amount'), ZERO)
+                    )['total']
 
                 net_balance = max(ZERO, data["gross_credit"] - cust_repayments)
 
@@ -6990,7 +6990,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "unpaid_invoices_count": data["unpaid_invoices_count"],
                         "outstanding_balance": float(quantize_money(net_balance)),
                     })
-                    total_receivables += net_balance
+
+            # Total Receivables is strictly Net Credit (Gross Credit - Total Recoveries)
+            total_receivables = max(ZERO, total_credit_issued - total_recovered)
 
             # Sort descending by outstanding debt amount
             debtors_summary.sort(key=lambda x: x["outstanding_balance"], reverse=True)
