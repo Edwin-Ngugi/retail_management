@@ -8506,7 +8506,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             branch_obj, _, end_date, _, end_dt = self._get_branch_and_dates(request)
 
             # ------------------------------------------------------------------
-            # 1. Cash Inflows (Liquid Sales + Customer Credit Repayments)
+            # 1. Cash & Liquid Assets (Inflows - Outflows)
             # ------------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt)
             repayments_qs = CreditRepayment.objects.filter(
@@ -8527,9 +8527,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             tot_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             tot_inflows = tot_sales_cash + tot_repayments
 
-            # ------------------------------------------------------------------
-            # 2. Cash Outflows (OpEx + Direct Purchases + Supplier Repayments)
-            # ------------------------------------------------------------------
             expenses_qs = Expense.objects.filter(
                 Q(date__lte=end_date) | Q(created_at__lte=end_dt)
             ).exclude(description__icontains='Supplier Repayment')
@@ -8560,17 +8557,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             tot_supplier_repay = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             tot_outflows = tot_expenses + tot_purchases_direct + tot_supplier_repay
 
-            # Handle positive vs negative cash position
-            net_cash = tot_inflows - tot_outflows
-            if net_cash >= ZERO:
-                cash_bank_mpesa = net_cash
-                bank_overdraft = ZERO
-            else:
-                cash_bank_mpesa = ZERO
-                bank_overdraft = abs(net_cash)
+            # Raw net cash (Actual Cash in Hand / Bank / M-Pesa Tills)
+            cash_bank_mpesa = tot_inflows - tot_outflows
 
             # ------------------------------------------------------------------
-            # 3. Customer Debts (Accounts Receivable)
+            # 2. Customer Debts & Inventory Stock Assets
             # ------------------------------------------------------------------
             credit_sales_qs = SaleTransaction.objects.filter(
                 sale_date__lte=end_dt,
@@ -8581,9 +8572,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             customer_debts = sum((s.balance_due for s in credit_sales_qs), ZERO)
 
-            # ------------------------------------------------------------------
-            # 4. Inventory Stock Value
-            # ------------------------------------------------------------------
             inventory_stock = ZERO
             pricing_qs = BranchItemPricing.objects.all().select_related('item', 'branch')
             if branch_obj:
@@ -8596,7 +8584,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
 
             # ------------------------------------------------------------------
-            # 5. Accounts Payable & Liabilities
+            # 3. Actual Liabilities (Real Debts Only)
             # ------------------------------------------------------------------
             supplier_debts = ZERO
             for p in purchases_qs.filter(payment_method=Purchase.PaymentMethod.CREDIT):
@@ -8607,12 +8595,21 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 supplier_debts += max(ZERO, po_bal)
 
             bank_loan = ZERO
-            total_liabilities = supplier_debts + bank_loan + bank_overdraft
+            bank_overdraft = ZERO  # Removed artificial overdraft logic
+            total_liabilities = supplier_debts + bank_loan
 
             # ------------------------------------------------------------------
-            # 6. Equity & Balance Check
+            # 4. Retained Profits (Calculated from Real Sales Revenue, COGS & Expenses)
             # ------------------------------------------------------------------
-            capital_and_retained_profits = total_assets - total_liabilities
+            # Calculate total sales revenue
+            total_revenue = ZERO
+            total_cogs = ZERO
+            for s in sales_qs:
+                total_revenue += Decimal(str(s.total_amount or ZERO))
+                total_cogs += s.total_cost
+
+            # Retained earnings = Revenue - COGS - OpEx
+            capital_and_retained_profits = total_revenue - total_cogs - tot_expenses
             liabilities_plus_equity = total_liabilities + capital_and_retained_profits
 
             return Response({
@@ -8626,7 +8623,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 },
                 "liabilities": {
                     "supplier_debts": float(quantize_money(supplier_debts)),
-                    "bank_overdraft": float(quantize_money(bank_overdraft)),
+                    "bank_overdraft": 0.00,
                     "bank_loan": float(quantize_money(bank_loan)),
                     "total_liabilities": float(quantize_money(total_liabilities)),
                 },
