@@ -6905,18 +6905,17 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='customer-receivables')
     def customer_receivables_report(self, request):
         try:
-            # ------------------------------------------------------------------
-            # 1. Parse Request Parameters
-            # ------------------------------------------------------------------
+            # 1. Parse branch parameters
             branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
-            end_date_str = request.query_params.get('end_date') or request.query_params.get('endDate')
-
             branch_obj = None
-            if branch_id and str(branch_id).lower() not in ['all', 'null', 'undefined']:
+            if branch_id and str(branch_id).lower() not in ['all', 'null', 'undefined', '']:
                 branch_obj = RetailBranch.objects.filter(pk=branch_id).first()
 
+            # 2. Parse end date limit (Ignore start_date as debtors reports are cumulative)
+            end_date_str = request.query_params.get('end_date') or request.query_params.get('endDate')
             end_dt = None
             end_date = None
+            
             if end_date_str:
                 try:
                     end_date = timezone.datetime.strptime(end_date_str, '%Y-%m-%d').date()
@@ -6928,104 +6927,71 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 end_dt = timezone.now()
                 end_date = end_dt.date()
 
-            # ------------------------------------------------------------------
-            # 2. Query Credit Sales & Customers
-            # ------------------------------------------------------------------
-            # Base QuerySets for credit transactions
-            st_credit_filter = Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) | Q(split_payments__method='CREDIT')
-            st_qs = SaleTransaction.objects.filter(st_credit_filter, sale_date__lte=end_dt).distinct()
-            legacy_sales_qs = Sale.objects.filter(payment_method='CREDIT', date__lte=end_date)
+            # 3. Base QuerySet for credit sales
+            st_credit_filter = Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) | Q(payment_method='Credit')
+            credit_sales_qs = SaleTransaction.objects.filter(st_credit_filter, sale_date__lte=end_dt)
 
             if branch_obj:
-                st_qs = st_qs.filter(branch=branch_obj)
-                legacy_sales_qs = legacy_sales_qs.filter(branch=branch_obj)
-            elif hasattr(request.user, 'retailer') and request.user.retailer:
-                st_qs = st_qs.filter(branch__retailer=request.user.retailer)
-                legacy_sales_qs = legacy_sales_qs.filter(branch__retailer=request.user.retailer)
+                credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
 
-            # Collect all distinct registered customers + custom text debtor names
-            registered_customers = Customer.objects.all()
-            if hasattr(request.user, 'retailer') and request.user.retailer:
-                registered_customers = registered_customers.filter(retailer=request.user.retailer)
+            # 4. Group sales by Customer or Customer Name
+            debtors_map = {}
 
-            # ------------------------------------------------------------------
-            # 3. Calculate Debtors Summary Ledger
-            # ------------------------------------------------------------------
+            for sale in credit_sales_qs:
+                cust_key = sale.customer_id if sale.customer_id else (sale.customer_name or "Walk-in Debtor").strip()
+                cust_disp_name = sale.customer.name if sale.customer else (sale.customer_name or "Walk-in Debtor").strip()
+                cust_phone = (sale.customer.phone_number if sale.customer else sale.customer_phone) or "N/A"
+
+                if cust_key not in debtors_map:
+                    debtors_map[cust_key] = {
+                        "customer_id": cust_key,
+                        "customer_obj": sale.customer,
+                        "customer_name": cust_disp_name,
+                        "phone": cust_phone,
+                        "unpaid_invoices_count": 0,
+                        "total_credit_amount": ZERO,
+                        "total_repayments": ZERO,
+                        "outstanding_balance": ZERO,
+                    }
+
+                bal = sale.balance_due
+                debtors_map[cust_key]["total_credit_amount"] += sale.total_amount
+                
+                if bal > ZERO:
+                    debtors_map[cust_key]["unpaid_invoices_count"] += 1
+
+            # 5. Calculate repayments and finalize net balances
             debtors_summary = []
             total_receivables = ZERO
             total_unpaid_invoices_count = 0
-            processed_names = set()
 
-            # Process registered Customer model entries
-            for customer in registered_customers:
-                processed_names.add(customer.name.strip().lower())
-
-                # Fetch credit sales matching foreign key OR name
-                cust_st_sales = st_qs.filter(
-                    Q(customer=customer) | Q(customer_name__iexact=customer.name)
-                ).distinct()
-
-                st_unpaid_invoices = [s for s in cust_st_sales if s.balance_due > ZERO]
-                st_balance = sum((s.balance_due for s in cust_st_sales), ZERO)
-
-                # Fetch legacy credit sales matching name
-                cust_legacy = legacy_sales_qs.filter(customer_name__iexact=customer.name)
-                legacy_total = sum((s.total_selling_price for s in cust_legacy), ZERO)
-
-                # Deduct customer repayments
-                repayments = CreditRepayment.objects.filter(customer=customer, date__lte=end_date)
-                if branch_obj:
-                    repayments = repayments.filter(branch=branch_obj)
+            for key, data in debtors_map.items():
+                cust_obj = data["customer_obj"]
                 
-                total_repayments = repayments.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+                # Fetch repayments made by registered customer
+                repayments_amount = ZERO
+                if cust_obj:
+                    repay_qs = CreditRepayment.objects.filter(customer=cust_obj, date__lte=end_date)
+                    if branch_obj:
+                        repay_qs = repay_qs.filter(branch=branch_obj)
+                    repayments_amount = repay_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
-                gross_debt = st_balance + legacy_total
-                net_balance = max(ZERO, gross_debt - total_repayments)
-                unpaid_count = len(st_unpaid_invoices) + (1 if legacy_total > ZERO else 0)
+                net_balance = max(ZERO, data["total_credit_amount"] - repayments_amount)
 
-                if net_balance > ZERO or unpaid_count > 0:
+                if net_balance > ZERO or data["unpaid_invoices_count"] > 0:
                     debtors_summary.append({
-                        "customer_id": customer.pk,
-                        "customer_name": customer.name,
-                        "phone": customer.phone_number or "N/A",
-                        "unpaid_invoices_count": unpaid_count,
+                        "customer_id": data["customer_id"],
+                        "customer_name": data["customer_name"],
+                        "phone": data["phone"],
+                        "unpaid_invoices_count": data["unpaid_invoices_count"],
                         "credit_limit": 0.00,
                         "outstanding_balance": float(quantize_money(net_balance)),
                     })
 
                     total_receivables += net_balance
-                    total_unpaid_invoices_count += unpaid_count
+                    total_unpaid_invoices_count += data["unpaid_invoices_count"]
 
-            # Process walk-in/unlinked text customer names in SaleTransaction
-            unlinked_names = st_qs.filter(customer__isnull=True).exclude(
-                customer_name__isnull=True
-            ).values_list('customer_name', flat=True).distinct()
-
-            for name in unlinked_names:
-                clean_name = name.strip()
-                if clean_name.lower() in processed_names:
-                    continue
-
-                processed_names.add(clean_name.lower())
-                cust_st_sales = st_qs.filter(customer_name__iexact=clean_name)
-                st_unpaid_invoices = [s for s in cust_st_sales if s.balance_due > ZERO]
-                st_balance = sum((s.balance_due for s in cust_st_sales), ZERO)
-
-                if st_balance > ZERO:
-                    phone = cust_st_sales.exclude(customer_phone__isnull=True).values_list('customer_phone', flat=True).first()
-                    debtors_summary.append({
-                        "customer_id": f"walkin-{hash(clean_name)}",
-                        "customer_name": clean_name,
-                        "phone": phone or "N/A",
-                        "unpaid_invoices_count": len(st_unpaid_invoices),
-                        "credit_limit": 0.00,
-                        "outstanding_balance": float(quantize_money(st_balance)),
-                    })
-
-                    total_receivables += st_balance
-                    total_unpaid_invoices_count += len(st_unpaid_invoices)
-
-            # Sort descending by highest outstanding balance
+            # Sort descending by outstanding debt amount
             debtors_summary.sort(key=lambda x: x["outstanding_balance"], reverse=True)
 
             active_debtors_count = len(debtors_summary)
@@ -7035,9 +7001,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 else ZERO
             )
 
-            # ------------------------------------------------------------------
-            # 4. Return Payload Response
-            # ------------------------------------------------------------------
             return Response({
                 "as_at_date": end_date.strftime('%d %b %Y') if end_date else timezone.localdate().strftime('%d %b %Y'),
                 "total_receivables": float(quantize_money(total_receivables)),
