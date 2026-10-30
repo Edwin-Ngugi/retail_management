@@ -6910,33 +6910,34 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # ------------------------------------------------------------------
             # 1. Base QuerySet Filters
             # ------------------------------------------------------------------
-            # Accounts receivable is a cumulative statement as of end_dt
+            # Accounts receivable is cumulative up to end_dt
             credit_sales_qs = SaleTransaction.objects.filter(
                 sale_date__lte=end_dt,
                 payment_method=SaleTransaction.PaymentMethod.CREDIT
             )
 
-            customers_qs = Customer.objects.all()
-
             if branch_obj:
                 credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
-                # Filter customers who have recorded credit sales at this branch
-                customers_qs = customers_qs.filter(sales__branch=branch_obj).distinct()
-            elif hasattr(request.user, 'retailer'):
-                customers_qs = customers_qs.filter(retailer=request.user.retailer)
 
             # ------------------------------------------------------------------
-            # 2. Build Customer Debtors Summary Ledger
+            # 2. Extract Debtors via Credit Sale Transactions
             # ------------------------------------------------------------------
             debtors_summary = []
             total_receivables = ZERO
             total_unpaid_invoices_count = 0
 
-            for customer in customers_qs:
-                # Get credit sales for this specific customer
+            # Get distinct customer IDs that have credit sales
+            customer_ids = credit_sales_qs.exclude(
+                customer__isnull=True
+            ).values_list('customer_id', flat=True).distinct()
+
+            customers = Customer.objects.filter(pk__in=customer_ids)
+
+            for customer in customers:
+                # Get all credit sales for this specific customer
                 cust_credit_sales = credit_sales_qs.filter(customer=customer)
 
-                # Filter unpaid/partially paid credit invoices
+                # Filter sales with remaining balance
                 unpaid_invoices = [s for s in cust_credit_sales if s.balance_due > ZERO]
                 unpaid_count = len(unpaid_invoices)
                 cust_balance = sum((s.balance_due for s in cust_credit_sales), ZERO)
@@ -6947,14 +6948,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "customer_name": customer.name,
                         "phone": customer.phone_number or "N/A",
                         "unpaid_invoices_count": unpaid_count,
-                        "credit_limit": 0.00,  # Default limit (can be extended on Customer model)
+                        "credit_limit": 0.00,
                         "outstanding_balance": float(quantize_money(cust_balance)),
                     })
 
                     total_receivables += cust_balance
                     total_unpaid_invoices_count += unpaid_count
 
-            # Sort debtors by highest outstanding balance first
+            # Sort descending by outstanding debt
             debtors_summary.sort(key=lambda x: x["outstanding_balance"], reverse=True)
 
             active_debtors_count = len(debtors_summary)
@@ -6965,7 +6966,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             )
 
             # ------------------------------------------------------------------
-            # 3. Response Construction (Matches DebtorsView.jsx Payload)
+            # 3. Response Construction
             # ------------------------------------------------------------------
             return Response({
                 "as_at_date": end_date.strftime('%d %b %Y') if end_date else timezone.localdate().strftime('%d %b %Y'),
@@ -6974,6 +6975,17 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "total_unpaid_invoices": total_unpaid_invoices_count,
                 "average_debt_per_customer": float(quantize_money(avg_debt_per_customer)),
                 "debtors_summary": debtors_summary,
+            }, status=status.HTTP_200_OK)
+
+        except Exception:
+            logger.exception("Customer Receivables Report Error")
+            return Response({
+                "as_at_date": timezone.localdate().strftime('%d %b %Y'),
+                "total_receivables": 0.00,
+                "active_debtors_count": 0,
+                "total_unpaid_invoices": 0,
+                "average_debt_per_customer": 0.00,
+                "debtors_summary": [],
             }, status=status.HTTP_200_OK)
 
         except Exception:
