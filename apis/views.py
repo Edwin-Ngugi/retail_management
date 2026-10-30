@@ -8506,7 +8506,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             branch_obj, _, end_date, _, end_dt = self._get_branch_and_dates(request)
 
             # ------------------------------------------------------------------
-            # 1. Cash & Liquid Assets (Inflows - Outflows)
+            # 1. Liquid Cash Inflows (Sales via Cash, M-Pesa, Paybill/Bank + Repayments)
             # ------------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt)
             repayments_qs = CreditRepayment.objects.filter(
@@ -8527,41 +8527,37 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             tot_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
             tot_inflows = tot_sales_cash + tot_repayments
 
+            # ------------------------------------------------------------------
+            # 2. Liquid Cash Outflows (Operating Expenses & Non-Credit Purchases)
+            # ------------------------------------------------------------------
+            # Expense model already includes Supplier Payments via SupplierPayment.save()
             expenses_qs = Expense.objects.filter(
                 Q(date__lte=end_date) | Q(created_at__lte=end_dt)
-            ).exclude(description__icontains='Supplier Repayment')
+            )
 
             purchases_qs = Purchase.objects.filter(
                 Q(purchase_date__lte=end_dt) | Q(created_at__lte=end_dt)
             )
-            po_qs = PurchaseOrder.objects.filter(
-                Q(purchase_date__lte=end_dt) | Q(created_at__lte=end_dt)
-            )
-            supplier_payments_qs = SupplierPayment.objects.filter(created_at__lte=end_dt)
 
             if branch_obj:
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
-                po_qs = po_qs.filter(branch=branch_obj)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
 
+            # Total expenses recorded in cashbook
             tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
-            tot_purchases_direct = ZERO
+            # Direct cash purchases that were paid upfront (non-credit)
+            tot_direct_purchases = ZERO
             for p in purchases_qs.exclude(payment_method=Purchase.PaymentMethod.CREDIT):
-                tot_purchases_direct += Decimal(str(p.amount_paid or ZERO))
+                tot_direct_purchases += Decimal(str(p.amount_paid or ZERO))
 
-            for po in po_qs.exclude(payment_method=PurchaseOrder.PaymentMethod.CREDIT):
-                tot_purchases_direct += Decimal(str(po.amount_paid or ZERO))
+            tot_outflows = tot_expenses + tot_direct_purchases
 
-            tot_supplier_repay = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            tot_outflows = tot_expenses + tot_purchases_direct + tot_supplier_repay
-
-            # Raw net cash (Actual Cash in Hand / Bank / M-Pesa Tills)
+            # Raw Net Liquid Cash Position (Cash, Bank & M-Pesa Tills)
             cash_bank_mpesa = tot_inflows - tot_outflows
 
             # ------------------------------------------------------------------
-            # 2. Customer Debts & Inventory Stock Assets
+            # 3. Customer Debts & Inventory Stock Assets
             # ------------------------------------------------------------------
             credit_sales_qs = SaleTransaction.objects.filter(
                 sale_date__lte=end_dt,
@@ -8584,31 +8580,24 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
 
             # ------------------------------------------------------------------
-            # 3. Actual Liabilities (Real Debts Only)
+            # 4. Actual Liabilities (Accounts Payable)
             # ------------------------------------------------------------------
             supplier_debts = ZERO
             for p in purchases_qs.filter(payment_method=Purchase.PaymentMethod.CREDIT):
                 supplier_debts += p.balance_due
 
-            for po in po_qs.filter(payment_method=PurchaseOrder.PaymentMethod.CREDIT):
-                po_bal = Decimal(str(po.total_amount or ZERO)) - Decimal(str(po.amount_paid or ZERO))
-                supplier_debts += max(ZERO, po_bal)
-
             bank_loan = ZERO
-            bank_overdraft = ZERO  # Removed artificial overdraft logic
             total_liabilities = supplier_debts + bank_loan
 
             # ------------------------------------------------------------------
-            # 4. Retained Profits (Calculated from Real Sales Revenue, COGS & Expenses)
+            # 5. Equity & Balance Check
             # ------------------------------------------------------------------
-            # Calculate total sales revenue
             total_revenue = ZERO
             total_cogs = ZERO
             for s in sales_qs:
                 total_revenue += Decimal(str(s.total_amount or ZERO))
                 total_cogs += s.total_cost
 
-            # Retained earnings = Revenue - COGS - OpEx
             capital_and_retained_profits = total_revenue - total_cogs - tot_expenses
             liabilities_plus_equity = total_liabilities + capital_and_retained_profits
 
@@ -8623,7 +8612,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 },
                 "liabilities": {
                     "supplier_debts": float(quantize_money(supplier_debts)),
-                    "bank_overdraft": 0.00,
                     "bank_loan": float(quantize_money(bank_loan)),
                     "total_liabilities": float(quantize_money(total_liabilities)),
                 },
@@ -8638,7 +8626,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             return Response({
                 "as_at_date": timezone.localdate().strftime('%d %b %Y'),
                 "assets": {"cash_bank_mpesa": 0.0, "customer_debts": 0.0, "inventory_stock": 0.0, "equipment": 0.0, "total_assets": 0.0},
-                "liabilities": {"supplier_debts": 0.0, "bank_overdraft": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
+                "liabilities": {"supplier_debts": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
                 "equity": {"capital_and_retained_profits": 0.0},
                 "liabilities_plus_equity": 0.0
             }, status=status.HTTP_200_OK)
