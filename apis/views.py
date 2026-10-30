@@ -6927,16 +6927,23 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 end_dt = timezone.now()
                 end_date = end_dt.date()
 
-            # 3. Query Credit Sale Transactions exactly matching Customer Receipts query
+            # 3. Query Credit Sale Transactions matching Customer Receipts query
             st_credit_filter = Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) | Q(payment_method='Credit')
             credit_sales_qs = SaleTransaction.objects.filter(st_credit_filter, sale_date__lte=end_dt)
 
             if branch_obj:
                 credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
 
-            # 4. Group sales by Customer to mirror total credit value
+            # 4. Query Total Repayments / Recoveries
+            repayment_qs = CreditRepayment.objects.filter(date__lte=end_date)
+            if branch_obj:
+                repayment_qs = repayment_qs.filter(branch=branch_obj)
+            
+            total_recovered = repayment_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+            # 5. Group credit sales and compute net balances per customer
             debtors_map = {}
-            total_receivables = ZERO
+            total_credit_issued = ZERO
             total_unpaid_invoices_count = 0
 
             for sale in credit_sales_qs:
@@ -6947,30 +6954,43 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 if cust_key not in debtors_map:
                     debtors_map[cust_key] = {
                         "customer_id": cust_key,
+                        "customer_obj": sale.customer,
                         "customer_name": cust_disp_name,
                         "phone": cust_phone,
                         "unpaid_invoices_count": 0,
-                        "outstanding_balance": ZERO,
+                        "gross_credit": ZERO,
                     }
 
                 gross_sale_amt = sale.total_amount or ZERO
-                debtors_map[cust_key]["outstanding_balance"] += gross_sale_amt
+                debtors_map[cust_key]["gross_credit"] += gross_sale_amt
                 debtors_map[cust_key]["unpaid_invoices_count"] += 1
 
-                total_receivables += gross_sale_amt
+                total_credit_issued += gross_sale_amt
                 total_unpaid_invoices_count += 1
 
-            # 5. Format debtors summary items
+            # 6. Format debtors summary items with net repayments deducted
             debtors_summary = []
+            total_receivables = ZERO
+
             for key, data in debtors_map.items():
-                debtors_summary.append({
-                    "customer_id": data["customer_id"],
-                    "customer_name": data["customer_name"],
-                    "phone": data["phone"],
-                    "unpaid_invoices_count": data["unpaid_invoices_count"],
-                    "credit_limit": 0.00,
-                    "outstanding_balance": float(quantize_money(data["outstanding_balance"])),
-                })
+                cust_obj = data["customer_obj"]
+                cust_repayments = ZERO
+
+                if cust_obj:
+                    cust_repay_qs = repayment_qs.filter(customer=cust_obj)
+                    cust_repayments = cust_repay_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+
+                net_balance = max(ZERO, data["gross_credit"] - cust_repayments)
+
+                if net_balance > ZERO or data["unpaid_invoices_count"] > 0:
+                    debtors_summary.append({
+                        "customer_id": data["customer_id"],
+                        "customer_name": data["customer_name"],
+                        "phone": data["phone"],
+                        "unpaid_invoices_count": data["unpaid_invoices_count"],
+                        "outstanding_balance": float(quantize_money(net_balance)),
+                    })
+                    total_receivables += net_balance
 
             # Sort descending by outstanding debt amount
             debtors_summary.sort(key=lambda x: x["outstanding_balance"], reverse=True)
@@ -6985,6 +7005,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             return Response({
                 "as_at_date": end_date.strftime('%d %b %Y') if end_date else timezone.localdate().strftime('%d %b %Y'),
                 "total_receivables": float(quantize_money(total_receivables)),
+                "total_recovered": float(quantize_money(total_recovered)),
+                "total_credit_issued": float(quantize_money(total_credit_issued)),
                 "active_debtors_count": active_debtors_count,
                 "total_unpaid_invoices": total_unpaid_invoices_count,
                 "average_debt_per_customer": float(quantize_money(avg_debt)),
@@ -6996,6 +7018,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             return Response({
                 "as_at_date": timezone.localdate().strftime('%d %b %Y'),
                 "total_receivables": 0.00,
+                "total_recovered": 0.00,
+                "total_credit_issued": 0.00,
                 "active_debtors_count": 0,
                 "total_unpaid_invoices": 0,
                 "average_debt_per_customer": 0.00,
