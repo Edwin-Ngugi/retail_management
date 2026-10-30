@@ -8505,7 +8505,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # Use range if start_dt exists, otherwise fallback to lte
             sales_filter = {"sale_date__range": (start_dt, end_dt)} if start_dt else {"sale_date__lte": end_dt}
             repay_filter = {"date__range": (start_date, end_date)} if start_date else {"date__lte": end_date}
             expense_filter = {"date__range": (start_date, end_date)} if start_date else {"date__lte": end_date}
@@ -8533,7 +8532,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             # ------------------------------------------------------------------
             # 2. Period Liquid Cash Outflows (OpEx + Non-Credit Purchases)
-            # Exclude auto-generated "Supplier Repayment" entries from Expense
             # ------------------------------------------------------------------
             expenses_qs = Expense.objects.filter(**expense_filter).exclude(
                 description__icontains='Supplier Repayment'
@@ -8546,18 +8544,23 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
-            # Direct cash purchases paid upfront (non-credit)
             tot_purchases_direct = ZERO
             for p in purchases_qs.exclude(payment_method=Purchase.PaymentMethod.CREDIT):
                 tot_purchases_direct += Decimal(str(p.amount_paid or ZERO))
 
             tot_outflows = tot_expenses + tot_purchases_direct
+            net_cash = tot_inflows - tot_outflows
 
-            # Exact Period Net Cash Position (-7,345.00 for Oct 2026)
-            cash_bank_mpesa = tot_inflows - tot_outflows
+            # Reclassify negative cash as bank overdraft liability
+            if net_cash < ZERO:
+                cash_bank_mpesa = ZERO
+                bank_overdraft = abs(net_cash)
+            else:
+                cash_bank_mpesa = net_cash
+                bank_overdraft = ZERO
 
             # ------------------------------------------------------------------
-            # 3. Customer Debts & Inventory Stock Assets (Cumulative as of end_dt)
+            # 3. Customer Debts & Inventory Stock Assets
             # ------------------------------------------------------------------
             credit_sales_qs = SaleTransaction.objects.filter(
                 sale_date__lte=end_dt,
@@ -8580,7 +8583,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
 
             # ------------------------------------------------------------------
-            # 4. Actual Liabilities
+            # 4. Liabilities (Supplier Debts + Bank Overdraft)
             # ------------------------------------------------------------------
             cum_purchases_qs = Purchase.objects.filter(purchase_date__lte=end_dt)
             if branch_obj:
@@ -8591,7 +8594,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 supplier_debts += p.balance_due
 
             bank_loan = ZERO
-            total_liabilities = supplier_debts + bank_loan
+            total_liabilities = supplier_debts + bank_loan + bank_overdraft
 
             # ------------------------------------------------------------------
             # 5. Equity & Balance Equation
@@ -8628,6 +8631,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 },
                 "liabilities": {
                     "supplier_debts": float(quantize_money(supplier_debts)),
+                    "bank_overdraft": float(quantize_money(bank_overdraft)),
                     "bank_loan": float(quantize_money(bank_loan)),
                     "total_liabilities": float(quantize_money(total_liabilities)),
                 },
@@ -8642,7 +8646,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             return Response({
                 "as_at_date": timezone.localdate().strftime('%d %b %Y'),
                 "assets": {"cash_bank_mpesa": 0.0, "customer_debts": 0.0, "inventory_stock": 0.0, "equipment": 0.0, "total_assets": 0.0},
-                "liabilities": {"supplier_debts": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
+                "liabilities": {"supplier_debts": 0.0, "bank_overdraft": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
                 "equity": {"capital_and_retained_profits": 0.0},
                 "liabilities_plus_equity": 0.0
             }, status=status.HTTP_200_OK)
