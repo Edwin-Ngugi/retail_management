@@ -6687,23 +6687,28 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             )
 
             # -----------------------------------------------------------------
-            # 2. FINANCIAL PERFORMANCE METRICS (Fast SQL Aggregations)
+            # 2. FINANCIAL PERFORMANCE METRICS (FIXED JOIN MULTIPLICATION)
             # -----------------------------------------------------------------
-            sales_summary = sales_qs.aggregate(
-                total_sales=Coalesce(Sum('total_amount'), ZERO),
-                total_cogs=Coalesce(
+            # Total Revenue from Transaction Headers directly (No JOIN duplication)
+            total_sales = sales_qs.aggregate(
+                total=Coalesce(Sum('total_amount'), ZERO)
+            )['total']
+
+            # COGS evaluated on SaleItem table directly
+            cogs = SaleItem.objects.filter(
+                transaction__in=sales_qs
+            ).aggregate(
+                total=Coalesce(
                     Sum(
                         ExpressionWrapper(
-                            F('items__quantity_sold') * F('items__unit_cost_price'),
+                            F('quantity_sold') * F('unit_cost_price'),
                             output_field=models.DecimalField(max_digits=12, decimal_places=2)
                         )
                     ),
                     ZERO
                 )
-            )
+            )['total']
 
-            total_sales = sales_summary['total_sales']
-            cogs = sales_summary['total_cogs']
             operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
             gross_profit = total_sales - cogs
@@ -6800,20 +6805,25 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             def append_trajectory_point(label, full_date, sales_qs_for_bucket,
                                         expenses_qs_for_bucket, bucket_type):
-                bucket_summary = sales_qs_for_bucket.aggregate(
-                    sales=Coalesce(Sum('total_amount'), ZERO),
+                # Separate queries for bucket sales and bucket cogs to avoid multiplication
+                bucket_sales = sales_qs_for_bucket.aggregate(
+                    sales=Coalesce(Sum('total_amount'), ZERO)
+                )['sales']
+
+                bucket_cogs = SaleItem.objects.filter(
+                    transaction__in=sales_qs_for_bucket
+                ).aggregate(
                     cogs=Coalesce(
                         Sum(
                             ExpressionWrapper(
-                                F('items__quantity_sold') * F('items__unit_cost_price'),
+                                F('quantity_sold') * F('unit_cost_price'),
                                 output_field=models.DecimalField(max_digits=12, decimal_places=2)
                             )
                         ),
                         ZERO
                     )
-                )
-                bucket_sales = bucket_summary['sales']
-                bucket_cogs = bucket_summary['cogs']
+                )['cogs']
+
                 bucket_expenses = expenses_qs_for_bucket.aggregate(tot=Coalesce(Sum('amount'), ZERO))['tot']
 
                 trajectory_data.append({
