@@ -1123,7 +1123,7 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
         "customer",
         "payment_method",
         "status_icon",
-        "display_amount_paid",     # <--- Replaced raw 'amount_paid' with formatted method
+        "display_amount_paid",
         "display_total_amount",
         "display_profit",
         "sale_date",
@@ -1194,7 +1194,6 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
         method = (obj.payment_method or "").strip().upper()
         balance_due = (obj.total_amount or 0) - (obj.amount_paid or 0)
 
-        # 1. Split Payment with an outstanding credit balance -> Grey Check Mark
         if method in ["SPLIT", "SPLIT PAYMENT"]:
             if balance_due > 0 or not obj.is_paid:
                 return mark_safe(
@@ -1204,69 +1203,69 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
                 '<span style="color: #28a745; font-size: 16px; font-weight: bold;" title="Fully Paid">&#10004;</span>'
             )
 
-        # 2. Fully Paid Non-Split Sales -> Green Check Mark
         if obj.is_paid or balance_due <= 0:
             return mark_safe(
                 '<span style="color: #28a745; font-size: 16px; font-weight: bold;" title="Fully Paid">&#10004;</span>'
             )
 
-        # 3. Full Credit / Unpaid Sales -> Red Cross Icon
         return mark_safe(
             '<span style="color: #dc3545; font-size: 16px; font-weight: bold;" title="Unpaid / Full Credit">&#10008;</span>'
         )
 
-    def _cleanup_related_records(self, obj):
-        """Helper to clear related movements and inline items before deletion."""
-        StockMovement.objects.filter(reference=f"SALE-{obj.id}").delete()
-        StockMovement.objects.filter(reference=f"SALE-{obj.receipt_number}").delete()
-        if hasattr(obj, "receipt_number") and obj.receipt_number:
-            StockMovement.objects.filter(reference=obj.receipt_number).delete()
-        StockMovement.objects.filter(reference_id=obj.pk, movement_type=StockMovement.MovementType.SALE).delete()
-
-        # Remove child objects directly
-        obj.items.all().delete()
-        if hasattr(obj, "split_payments"):
-            obj.split_payments.all().delete()
-
     @admin.action(description="Delete selected sale transactions safely")
     def delete_sales_safely(self, request, queryset):
-        """Custom action that safely deletes selected sales and cleans up dependencies."""
         deleted_count = 0
-        with transaction.atomic():
-            for obj in queryset:
-                self._cleanup_related_records(obj)
-                obj.delete()
-                deleted_count += 1
+        sale_ids = list(queryset.values_list("id", flat=True))
+        receipt_numbers = list(queryset.exclude(receipt_number__isnull=True).values_list("receipt_number", flat=True))
 
-        self.message_user(request, f"Successfully deleted {deleted_count} sale transaction(s).")
+        with transaction.atomic():
+            # 1. Clean up StockMovements using direct QuerySet delete (bypasses model delete signals)
+            StockMovement.objects.filter(reference_id__in=sale_ids, movement_type=StockMovement.MovementType.SALE).delete()
+            StockMovement.objects.filter(reference__in=[f"SALE-{sid}" for sid in sale_ids]).delete()
+            if receipt_numbers:
+                StockMovement.objects.filter(reference__in=[f"SALE-{r}" for r in receipt_numbers]).delete()
+                StockMovement.objects.filter(reference__in=receipt_numbers).delete()
+
+            # 2. Direct QuerySet delete on child models
+            SaleItem.objects.filter(transaction_id__in=sale_ids).delete()
+            
+            # Delete split payments if model exists
+            try:
+                from stocks.models import SalePayment
+                SalePayment.objects.filter(transaction_id__in=sale_ids).delete()
+            except (ImportError, AttributeError):
+                pass
+
+            # 3. Direct QuerySet delete on SaleTransaction
+            deleted_count, _ = SaleTransaction.objects.filter(id__in=sale_ids).delete()
+
+        self.message_user(request, f"Successfully deleted {deleted_count} sale transaction records.")
 
     def get_actions(self, request):
-        """Override actions to remove standard delete_selected and enforce safe deletion."""
         actions = super().get_actions(request)
         if "delete_selected" in actions:
             del actions["delete_selected"]
         return actions
 
     def delete_model(self, request, obj):
-        """Cleanly delete stock movements prior to deleting single sale transaction."""
         with transaction.atomic():
-            self._cleanup_related_records(obj)
-            super().delete_model(request, obj)
+            StockMovement.objects.filter(reference_id=obj.pk, movement_type=StockMovement.MovementType.SALE).delete()
+            StockMovement.objects.filter(reference=f"SALE-{obj.id}").delete()
+            if obj.receipt_number:
+                StockMovement.objects.filter(reference=f"SALE-{obj.receipt_number}").delete()
+                StockMovement.objects.filter(reference=obj.receipt_number).delete()
+
+            SaleItem.objects.filter(transaction=obj).delete()
+            SaleTransaction.objects.filter(pk=obj.pk).delete()
 
     def delete_queryset(self, request, queryset):
-        """Cleanly delete stock movements during bulk admin deletion."""
-        with transaction.atomic():
-            for obj in queryset:
-                self._cleanup_related_records(obj)
-            super().delete_queryset(request, queryset)
+        self.delete_sales_safely(request, queryset)
 
     def save_related(self, request, form, formsets, change):
-        # Save inlines first so database contains all SaleItem and SalePayment rows
         super().save_related(request, form, formsets, change)
         obj = form.instance
 
         with transaction.atomic():
-            # 1. Sync StockMovements for all items
             for item in obj.items.all():
                 cost_price = item.unit_cost_price
                 if not cost_price:
@@ -1294,7 +1293,6 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
 
                 recalculate_wac_sales_cost(obj.branch, item.item)
 
-            # 2. Recalculate transaction total strictly from saved items
             total = sum(
                 (item.quantity_sold * item.unit_selling_price) - (item.quantity_sold * item.discount_per_item)
                 for item in obj.items.all()
@@ -1336,14 +1334,12 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
                             reference_code="",
                         )
 
-            # 3. Direct DB update
             SaleTransaction.objects.filter(pk=obj.pk).update(
                 total_amount=total,
                 amount_paid=amount_paid,
                 is_paid=is_paid,
             )
 
-            # 4. Mutate memory instance for current response display
             obj.total_amount = total
             obj.amount_paid = amount_paid
             obj.is_paid = is_paid
