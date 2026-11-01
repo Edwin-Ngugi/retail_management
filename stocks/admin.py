@@ -1213,6 +1213,27 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
             '<span style="color: #dc3545; font-size: 16px; font-weight: bold;" title="Unpaid / Full Credit">&#10008;</span>'
         )
 
+    def delete_model(self, request, obj):
+        """Cleanly delete stock movements prior to deleting single sale transaction."""
+        with transaction.atomic():
+            StockMovement.objects.filter(reference=f"SALE-{obj.id}").delete()
+            StockMovement.objects.filter(reference=f"SALE-{obj.receipt_number}").delete()
+            if hasattr(obj, "receipt_number") and obj.receipt_number:
+                StockMovement.objects.filter(reference=obj.receipt_number).delete()
+            StockMovement.objects.filter(reference_id=obj.pk, movement_type=StockMovement.MovementType.SALE).delete()
+            super().delete_model(request, obj)
+
+    def delete_queryset(self, request, queryset):
+        """Cleanly delete stock movements during bulk admin deletion."""
+        with transaction.atomic():
+            for obj in queryset:
+                StockMovement.objects.filter(reference=f"SALE-{obj.id}").delete()
+                StockMovement.objects.filter(reference=f"SALE-{obj.receipt_number}").delete()
+                if hasattr(obj, "receipt_number") and obj.receipt_number:
+                    StockMovement.objects.filter(reference=obj.receipt_number).delete()
+                StockMovement.objects.filter(reference_id=obj.pk, movement_type=StockMovement.MovementType.SALE).delete()
+            super().delete_queryset(request, queryset)
+
     def save_related(self, request, form, formsets, change):
         # Save inlines first so database contains all SaleItem and SalePayment rows
         super().save_related(request, form, formsets, change)
