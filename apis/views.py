@@ -6671,7 +6671,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 base_expenses_qs = base_expenses_qs.filter(branch=branch_obj)
                 base_purchases_qs = base_purchases_qs.filter(branch=branch_obj)
                 base_supplier_pmts_qs = base_supplier_pmts_qs.filter(purchase__branch=branch_obj)
-                base_credit_repay_qs = base_credit_repay_qs.filter(branch=branch_obj)
+                base_credit_repay_qs = base_credit_repay_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
+                )
 
             # Filtered QuerySets for Selected Period Range
             sales_qs = base_sales_qs.filter(sale_date__range=(start_dt, end_dt))
@@ -6687,14 +6689,12 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             )
 
             # -----------------------------------------------------------------
-            # 2. FINANCIAL PERFORMANCE METRICS (FIXED JOIN MULTIPLICATION)
+            # 2. FINANCIAL PERFORMANCE METRICS
             # -----------------------------------------------------------------
-            # Total Revenue from Transaction Headers directly (No JOIN duplication)
             total_sales = sales_qs.aggregate(
                 total=Coalesce(Sum('total_amount'), ZERO)
             )['total']
 
-            # COGS evaluated on SaleItem table directly
             cogs = SaleItem.objects.filter(
                 transaction__in=sales_qs
             ).aggregate(
@@ -6715,19 +6715,95 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             net_profit = gross_profit - operating_expenses
 
             # -----------------------------------------------------------------
-            # 3. CASH RECEIPTS & DEBTORS
+            # 3. CASH MOVEMENT & PAYMENT CHANNEL BREAKDOWN
             # -----------------------------------------------------------------
-            # Liquid Cash Collections (Non-credit portions from SaleTransaction)
-            non_credit_sales = sales_qs.exclude(payment_method=SaleTransaction.PaymentMethod.CREDIT)
-            liquid_sales_cash = non_credit_sales.aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            cash_channel = ZERO
+            paybill_channel = ZERO
+            send_money_channel = ZERO
+            mpesa_std_channel = ZERO
+            bank_channel = ZERO
+            other_channel = ZERO
+            period_credit_sales_total = ZERO
 
-            customer_repayments = customer_repayments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO)
-            )['total']
+            sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
 
-            actual_cash_receipts = liquid_sales_cash + customer_repayments
+            for sale in sales_with_payments:
+                amt = quantize_money(sale.total_amount or ZERO)
+                method = self._normalize_payment_method(sale.payment_method)
 
-            # Synchronized Receivables Logic (Cumulative Gross Credit - Cumulative Repayments)
+                # Extract split payment lines safely using helper logic
+                split_records = self._get_split_payments(sale)
+
+                if method == "SPLIT" or split_records:
+                    for sp in split_records:
+                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
+                        sp_amount = quantize_money(sp.amount or ZERO)
+
+                        if sp_method == "CASH":
+                            cash_channel += sp_amount
+                        elif sp_method == "PAYBILL":
+                            paybill_channel += sp_amount
+                        elif sp_method == "SEND_MONEY":
+                            send_money_channel += sp_amount
+                        elif sp_method == "MPESA":
+                            mpesa_std_channel += sp_amount
+                        elif sp_method == "BANK_TRANSFER":
+                            bank_channel += sp_amount
+                        elif sp_method == "CREDIT":
+                            period_credit_sales_total += sp_amount
+                        else:
+                            other_channel += sp_amount
+                else:
+                    is_credit = self._is_credit_sale(sale)
+
+                    if is_credit or method == "CREDIT":
+                        period_credit_sales_total += amt
+                    elif method == "CASH":
+                        cash_channel += amt
+                    elif method == "PAYBILL":
+                        paybill_channel += amt
+                    elif method == "SEND_MONEY":
+                        send_money_channel += amt
+                    elif method == "MPESA":
+                        mpesa_std_channel += amt
+                    elif method == "BANK_TRANSFER":
+                        bank_channel += amt
+                    else:
+                        other_channel += amt
+
+            # Add Customer Credit Repayments to liquid channels
+            period_credit_repayments = ZERO
+            for rep in customer_repayments_qs.select_related("customer", "transaction"):
+                rep_amt = quantize_money(rep.amount or ZERO)
+                if rep_amt <= ZERO:
+                    continue
+
+                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
+                period_credit_repayments += rep_amt
+
+                if rep_method == "CASH":
+                    cash_channel += rep_amt
+                elif rep_method == "PAYBILL":
+                    paybill_channel += rep_amt
+                elif rep_method == "SEND_MONEY":
+                    send_money_channel += rep_amt
+                elif rep_method == "MPESA":
+                    mpesa_std_channel += rep_amt
+                elif rep_method == "BANK_TRANSFER":
+                    bank_channel += rep_amt
+                else:
+                    other_channel += rep_amt
+
+            actual_cash_receipts = (
+                cash_channel +
+                paybill_channel +
+                send_money_channel +
+                mpesa_std_channel +
+                bank_channel +
+                other_channel
+            )
+
+            # Synchronized Receivables Logic
             st_credit_filter = (
                 Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) |
                 Q(payment_method='Credit') |
@@ -6735,7 +6811,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 Q(split_payments__method='Credit')
             )
             all_credit_sales = base_sales_qs.filter(st_credit_filter, sale_date__lte=end_dt).distinct()
-            gross_credit_issued = all_credit_sales.aggregate(total=Coalesce(Sum('total_amount'), ZERO))['total']
+            gross_credit_issued = ZERO
+
+            for c_sale in all_credit_sales.prefetch_related("split_payments"):
+                gross_credit_issued += self._get_sale_credit_amount(c_sale)
 
             all_repayments_to_date = base_credit_repay_qs.filter(date__lte=end_date).aggregate(
                 total=Coalesce(Sum('amount'), ZERO)
@@ -6805,7 +6884,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             def append_trajectory_point(label, full_date, sales_qs_for_bucket,
                                         expenses_qs_for_bucket, bucket_type):
-                # Separate queries for bucket sales and bucket cogs to avoid multiplication
                 bucket_sales = sales_qs_for_bucket.aggregate(
                     sales=Coalesce(Sum('total_amount'), ZERO)
                 )['sales']
@@ -6835,7 +6913,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "net_profit": float(quantize_money((bucket_sales - bucket_cogs) - bucket_expenses)),
                 })
 
-            # YEARLY: Jan-Dec buckets
             if period_type == "year":
                 target_year = start_date.year
 
@@ -6867,7 +6944,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "month",
                     )
 
-            # MONTHLY / WEEKLY / DAILY BUCKETS
             else:
                 current_day = start_date
 
@@ -6929,6 +7005,18 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "cash_flow": {
                     "receipts": float(quantize_money(actual_cash_receipts)),
                     "receipts_formatted": self._format_currency(actual_cash_receipts),
+                    "cash_payments": float(quantize_money(cash_channel)),
+                    "cash_payments_formatted": self._format_currency(cash_channel),
+                    "paybill_payments": float(quantize_money(paybill_channel)),
+                    "paybill_payments_formatted": self._format_currency(paybill_channel),
+                    "send_money_payments": float(quantize_money(send_money_channel)),
+                    "send_money_payments_formatted": self._format_currency(send_money_channel),
+                    "mpesa_std_payments": float(quantize_money(mpesa_std_channel)),
+                    "mpesa_std_payments_formatted": self._format_currency(mpesa_std_channel),
+                    "bank_payments": float(quantize_money(bank_channel)),
+                    "bank_payments_formatted": self._format_currency(bank_channel),
+                    "customer_repayments": float(quantize_money(period_credit_repayments)),
+                    "customer_repayments_formatted": self._format_currency(period_credit_repayments),
                     "payments": float(quantize_money(operating_expenses)),
                     "payments_formatted": self._format_currency(operating_expenses),
                     "purchases": float(quantize_money(purchases_total)),
