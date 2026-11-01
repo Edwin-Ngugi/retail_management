@@ -2703,78 +2703,95 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
         {"code": "SPLIT", "label": "Split Payment"},
     ]
 
-    # ... keep existing _normalize_sale_date, _normalize_payment_method, get_queryset methods ...
-
     def create(self, request, *args, **kwargs):
-        data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data or {})
-        items_payload = data.get("items") or data.get("sale_items") or []
-
-        if not items_payload:
-            return Response(
-                {"error": "At least one sale item is required to complete transaction."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 1. Resolve Branch
-        branch_param = (
-            data.get("branch")
-            or data.get("branch_id")
-            or request.query_params.get("branch")
-            or request.query_params.get("branch_id")
-        )
-        branch = _resolve_branch(branch_param)
-        if not branch:
-            return Response(
-                {"error": "A valid branch is required for sales transactions."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 2. Resolve Payment Method & Sale Date
-        payment_method = self._normalize_payment_method(data.get("payment_method") or "CASH")
-        sale_date = self._normalize_sale_date(data.get("sale_date") or data.get("date"))
-
-        # 3. Resolve Customer (Cash defaults to Walk-in Customer; Credit requires/creates Customer)
-        customer_input = data.get("customer") or data.get("customer_id")
-        retailer = getattr(branch, "retailer", None)
-        customer_obj = _resolve_customer(customer_input, retailer=retailer)
-
-        if payment_method == "CREDIT":
-            if not customer_obj:
-                cust_name = data.get("customer_name") or (str(customer_input) if customer_input else "Walk-in Debtor")
-                customer_obj, _ = Customer.objects.get_or_create(
-                    retailer=retailer,
-                    name=cust_name,
-                    defaults={"phone_number": data.get("customer_phone", "") or ""},
-                )
-            data["customer"] = customer_obj.id
-            data["customer_name"] = customer_obj.name
-            data["customer_phone"] = customer_obj.phone_number or ""
-        else:
-            data["customer"] = customer_obj.id if customer_obj else None
-            data["customer_name"] = (
-                data.get("customer_name")
-                or (customer_obj.name if customer_obj else "Walk-in Customer")
-            )
-
-        # Ensure branch, dates, and methods are assigned cleanly
-        data["branch"] = branch.id
-        data["payment_method"] = payment_method
-        if sale_date:
-            data["sale_date"] = sale_date.isoformat()
-
-        # 4. Serialize & Save
-        serializer = self.get_serializer(data=data, context={"request": request})
-        
         try:
+            data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data or {})
+            items_payload = data.get("items") or data.get("sale_items") or []
+
+            if not items_payload:
+                return Response(
+                    {"error": "At least one sale item is required to complete transaction."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 1. Safe Branch Resolution
+            branch_param = (
+                data.get("branch")
+                or data.get("branch_id")
+                or request.query_params.get("branch")
+                or request.query_params.get("branch_id")
+            )
+            
+            branch_obj = None
+            if branch_param is not None:
+                if isinstance(branch_param, RetailBranch):
+                    branch_obj = branch_param
+                elif isinstance(branch_param, int) or (isinstance(branch_param, str) and branch_param.isdigit()):
+                    branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
+                elif isinstance(branch_param, str) and branch_param.strip():
+                    branch_obj = RetailBranch.objects.filter(name__iexact=branch_param.strip()).first()
+
+            if not branch_obj:
+                # Fallback to retailer's first branch or system default if unassigned
+                user = _get_request_user(self) if hasattr(self, "get_serializer") else None
+                if user:
+                    branch_obj = RetailBranch.objects.filter(retailer=user).first()
+                if not branch_obj:
+                    branch_obj = RetailBranch.objects.first()
+
+            if not branch_obj:
+                return Response(
+                    {"error": "A valid branch is required to record sales."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 2. Safe Payment Method Normalization
+            raw_payment = str(data.get("payment_method") or "CASH").strip().upper()
+            payment_method = PAYMENT_METHOD_ALIASES.get(raw_payment, raw_payment)
+
+            # 3. Safe Sale Date Parsing
+            raw_date = data.get("sale_date") or data.get("date")
+            parsed_sale_date = _coerce_to_datetime(raw_date) or timezone.now()
+
+            # 4. Resolve Customer (Cash Defaults to Walk-in; Credit Resolves Debtor)
+            customer_input = data.get("customer") or data.get("customer_id")
+            retailer = getattr(branch_obj, "retailer", None)
+            customer_obj = _resolve_customer(customer_input, retailer=retailer)
+
+            if payment_method == "CREDIT":
+                if not customer_obj:
+                    cust_name = data.get("customer_name") or (str(customer_input) if customer_input else "Walk-in Debtor")
+                    customer_obj, _ = Customer.objects.get_or_create(
+                        retailer=retailer,
+                        name=cust_name,
+                        defaults={"phone_number": data.get("customer_phone", "") or ""},
+                    )
+                data["customer"] = customer_obj.id
+                data["customer_name"] = customer_obj.name
+                data["customer_phone"] = customer_obj.phone_number or ""
+            else:
+                data["customer"] = customer_obj.id if customer_obj else None
+                data["customer_name"] = (
+                    data.get("customer_name")
+                    or (customer_obj.name if customer_obj else "Walk-in Customer")
+                )
+
+            # Format cleaned fields into serializer data dictionary
+            data["branch"] = branch_obj.id
+            data["payment_method"] = payment_method
+            data["sale_date"] = parsed_sale_date.isoformat()
+
+            # 5. Delegate to Serializer
+            serializer = self.get_serializer(data=data, context={"request": request})
             serializer.is_valid(raise_exception=True)
             sale = serializer.save()
 
-            # 5. Broadcast real-time WebSocket event
+            # 6. WebSocket Real-time Broadcast
             channel_layer = get_channel_layer()
             if channel_layer:
                 try:
                     async_to_sync(channel_layer.group_send)(
-                        f"analytics_branch_{branch.id}",
+                        f"analytics_branch_{branch_obj.id}",
                         {
                             "type": "analytics_update",
                             "event": "SALE_CREATED",
@@ -2790,7 +2807,7 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
         except serializers.ValidationError as e:
             return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.exception(f"Sale transaction submission failed: {e}")
+            logger.exception(f"Sale transaction submission error: {e}")
             return Response(
                 {"error": "Failed to complete sale transaction.", "details": str(e)},
                 status=status.HTTP_400_BAD_REQUEST,
