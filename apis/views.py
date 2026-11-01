@@ -2833,7 +2833,7 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # 1. Branch Resolution
+            # 1. Resolve Branch
             branch_param = (
                 data.get("branch")
                 or data.get("branch_id")
@@ -2871,9 +2871,8 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
 
             customer_name = data.get("customer_name") or ("Walk-in Customer" if normalized_pm != "CREDIT" else "")
 
-            # 3. Transactional Sale Processing
+            # 3. Process Sale via Transaction Atomic Block
             with transaction.atomic():
-                # A. Create SaleTransaction Record
                 sale = SaleTransaction.objects.create(
                     branch=branch_obj,
                     customer_name=customer_name,
@@ -2886,7 +2885,6 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
 
                 calculated_total = Decimal("0.00")
 
-                # B. Process Sale Items
                 for item_data in items_payload:
                     item_id = item_data.get("item") or item_data.get("item_id") or item_data.get("id")
                     if not item_id:
@@ -2908,7 +2906,7 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                     line_total = qty * (retail_price - discount)
                     calculated_total += line_total
 
-                    # Create SaleItem
+                    # Creating SaleItem automatically triggers stock deduction/movement signal
                     SaleItem.objects.create(
                         transaction=sale,
                         item=item_obj,
@@ -2918,24 +2916,12 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                         discount_per_item=discount,
                     )
 
-                    # Deduct Stock via StockMovement
-                    StockMovement.objects.create(
-                        item=item_obj,
-                        branch=branch_obj,
-                        movement_type=StockMovement.MovementType.SALE,
-                        quantity=qty,
-                        unit_cost_price=cost_price,
-                        date=parsed_date.date(),
-                        reference=f"SALE-{sale.id}",
-                        created_by=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
-                    )
-
                 sale.total_amount = calculated_total
                 if normalized_pm != "CREDIT" and sale.amount_paid == ZERO:
                     sale.amount_paid = calculated_total
                 sale.save()
 
-            # 4. Broadcast Real-Time Analytics Event
+            # 4. Broadcast Real-time WebSocket Analytics Event
             channel_layer = get_channel_layer()
             if channel_layer:
                 try:
@@ -2951,7 +2937,6 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 except Exception as ws_err:
                     logger.warning("WebSocket broadcast failed: %s", ws_err)
 
-            # Return serialized response
             serializer = self.get_serializer(sale)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
