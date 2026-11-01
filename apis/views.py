@@ -6657,6 +6657,57 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
 
+            # --- Internal Inline Helpers to prevent AttributeError ---
+            def extract_split_payments(sale_obj):
+                relation = getattr(sale_obj, "split_payments", None) or getattr(sale_obj, "payments", None)
+                if relation is not None:
+                    try:
+                        return list(relation.all())
+                    except Exception:
+                        pass
+                return []
+
+            def extract_sp_method(sp_obj):
+                for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
+                    val = getattr(sp_obj, attr, None)
+                    if val:
+                        return val
+                return None
+
+            def is_credit_sale_check(sale_obj, c_ids=None):
+                method = self._normalize_payment_method(getattr(sale_obj, "payment_method", None))
+                if method == "CREDIT":
+                    return True
+                if getattr(sale_obj, "is_invoice", False):
+                    return True
+                if c_ids and getattr(sale_obj, "pk", None) in c_ids:
+                    return True
+                balance_due = getattr(sale_obj, "balance_due", None)
+                if balance_due is not None:
+                    try:
+                        if Decimal(str(balance_due or ZERO)) > ZERO:
+                            return True
+                    except Exception:
+                        pass
+                return False
+
+            def get_sale_credit_amt(sale_obj, c_ids=None):
+                method = self._normalize_payment_method(getattr(sale_obj, "payment_method", None))
+                sale_amount = quantize_money(sale_obj.total_amount or ZERO)
+                split_records = extract_split_payments(sale_obj)
+
+                if method == "SPLIT" or split_records:
+                    credit_total = ZERO
+                    for sp in split_records:
+                        sp_method = self._normalize_payment_method(extract_sp_method(sp))
+                        if sp_method == "CREDIT":
+                            credit_total += quantize_money(sp.amount or ZERO)
+                    return quantize_money(credit_total)
+
+                if is_credit_sale_check(sale_obj, c_ids):
+                    return sale_amount
+                return ZERO
+
             # -----------------------------------------------------------------
             # 1. UNFILTERED BASE QUERYSETS BY BRANCH
             # -----------------------------------------------------------------
@@ -6689,7 +6740,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
             )
 
-            # Credit transaction identification
             credit_transaction_ids = set(
                 base_credit_repay_qs
                 .exclude(transaction_id=None)
@@ -6698,7 +6748,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             )
 
             # -----------------------------------------------------------------
-            # 2. FINANCIAL PERFORMANCE METRICS (REVENUE & COGS)
+            # 2. FINANCIAL PERFORMANCE METRICS
             # -----------------------------------------------------------------
             total_sales = sales_qs.aggregate(
                 total=Coalesce(Sum('total_amount'), ZERO)
@@ -6739,11 +6789,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             for sale in sales_with_payments:
                 amt = quantize_money(sale.total_amount or ZERO)
                 method = self._normalize_payment_method(getattr(sale, "payment_method", None))
-                split_records = self._get_split_payments(sale)
+                split_records = extract_split_payments(sale)
 
                 if method == "SPLIT" or split_records:
                     for sp in split_records:
-                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
+                        sp_method = self._normalize_payment_method(extract_sp_method(sp))
                         sp_amount = quantize_money(sp.amount or ZERO)
 
                         if sp_method == "CASH":
@@ -6761,7 +6811,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         else:
                             other_total += sp_amount
                 else:
-                    is_credit = self._is_credit_sale(sale, credit_transaction_ids)
+                    is_credit = is_credit_sale_check(sale, credit_transaction_ids)
 
                     if is_credit or method == "CREDIT":
                         period_credit_sales_total += amt
@@ -6778,7 +6828,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     else:
                         other_total += amt
 
-            # Add Customer Credit Repayments into liquid channel inflows
             period_credit_repayments_total = ZERO
             for rep in customer_repayments_qs.select_related("customer", "transaction"):
                 rep_amt = quantize_money(rep.amount or ZERO)
@@ -6810,7 +6859,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 other_total
             )
 
-            # Synchronized Receivables Logic
+            # Receivables calculation
             st_credit_filter = (
                 Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) |
                 Q(payment_method='Credit') |
@@ -6828,7 +6877,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             )
 
             for c_sale in all_credit_sales.prefetch_related("split_payments"):
-                gross_credit_issued += self._get_sale_credit_amount(c_sale, all_credit_ids)
+                gross_credit_issued += get_sale_credit_amt(c_sale, all_credit_ids)
 
             all_repayments_to_date = base_credit_repay_qs.filter(date__lte=end_date).aggregate(
                 total=Coalesce(Sum('amount'), ZERO)
