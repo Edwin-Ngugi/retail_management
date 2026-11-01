@@ -2823,80 +2823,146 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
         return queryset
 
     def create(self, request, *args, **kwargs):
-        data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data or {})
-        items_payload = data.get("items") or data.get("sale_items") or []
+        try:
+            data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data or {})
+            items_payload = data.get("items") or data.get("sale_items") or []
 
-        if not items_payload:
-            return Response(
-                {"error": "At least one sale item is required to complete transaction."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 1. Resolve Branch
-        branch_param = (
-            data.get("branch")
-            or data.get("branch_id")
-            or request.query_params.get("branch")
-            or request.query_params.get("branch_id")
-        )
-        branch_obj = None
-        if branch_param is not None:
-            if isinstance(branch_param, RetailBranch):
-                branch_obj = branch_param
-            elif isinstance(branch_param, int) or (isinstance(branch_param, str) and str(branch_param).isdigit()):
-                branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
-            elif isinstance(branch_param, str) and branch_param.strip():
-                branch_obj = RetailBranch.objects.filter(name__iexact=branch_param.strip()).first()
-
-        if not branch_obj:
-            user = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
-            if user:
-                branch_obj = RetailBranch.objects.filter(retailer=user).first()
-            if not branch_obj:
-                branch_obj = RetailBranch.objects.first()
-
-        if not branch_obj:
-            return Response(
-                {"error": "A valid branch is required to record sales."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        data["branch"] = branch_obj.id
-
-        # 2. Normalize Payment Method & Date
-        raw_payment = data.get("payment_method") or "CASH"
-        data["payment_method"] = self._normalize_payment_method(raw_payment)
-
-        raw_date = data.get("sale_date") or data.get("date")
-        parsed_date = self._normalize_sale_date(raw_date)
-        data["sale_date"] = parsed_date.isoformat()
-
-        # 3. Default customer name for non-credit sales
-        if data["payment_method"] != "CREDIT" and not data.get("customer_name"):
-            data["customer_name"] = "Walk-in Customer"
-
-        # 4. Save through Serializer
-        serializer = self.get_serializer(data=data, context={"request": request})
-        serializer.is_valid(raise_exception=True)
-        sale = serializer.save()
-
-        # 5. Broadcast WebSocket Analytics Event
-        channel_layer = get_channel_layer()
-        if channel_layer:
-            try:
-                async_to_sync(channel_layer.group_send)(
-                    f"analytics_branch_{branch_obj.id}",
-                    {
-                        "type": "analytics_update",
-                        "event": "SALE_CREATED",
-                        "transaction_id": sale.id,
-                        "total_amount": float(sale.total_amount),
-                    },
+            if not items_payload:
+                return Response(
+                    {"error": "At least one sale item is required to complete transaction."},
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
-            except Exception:
-                pass
 
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+            # 1. Branch Resolution
+            branch_param = (
+                data.get("branch")
+                or data.get("branch_id")
+                or request.query_params.get("branch")
+                or request.query_params.get("branch_id")
+            )
+            branch_obj = None
+            if branch_param is not None:
+                if isinstance(branch_param, RetailBranch):
+                    branch_obj = branch_param
+                elif str(branch_param).isdigit():
+                    branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
+                elif isinstance(branch_param, str) and branch_param.strip():
+                    branch_obj = RetailBranch.objects.filter(name__iexact=branch_param.strip()).first()
+
+            if not branch_obj:
+                user = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
+                if user and hasattr(user, "retailer"):
+                    branch_obj = RetailBranch.objects.filter(retailer=user.retailer).first()
+                if not branch_obj:
+                    branch_obj = RetailBranch.objects.first()
+
+            if not branch_obj:
+                return Response(
+                    {"error": "A valid branch is required to record sales."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 2. Normalize Payment Method & Date
+            raw_payment = data.get("payment_method") or "CASH"
+            normalized_pm = self._normalize_payment_method(raw_payment)
+            
+            raw_date = data.get("sale_date") or data.get("date")
+            parsed_date = self._normalize_sale_date(raw_date)
+
+            customer_name = data.get("customer_name") or ("Walk-in Customer" if normalized_pm != "CREDIT" else "")
+
+            # 3. Transactional Sale Processing
+            with transaction.atomic():
+                # A. Create SaleTransaction Record
+                sale = SaleTransaction.objects.create(
+                    branch=branch_obj,
+                    customer_name=customer_name,
+                    payment_method=normalized_pm,
+                    sale_date=parsed_date,
+                    total_amount=Decimal("0.00"),
+                    amount_paid=Decimal(str(data.get("amount_paid") or "0.00")),
+                    created_by=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
+                )
+
+                calculated_total = Decimal("0.00")
+
+                # B. Process Sale Items
+                for item_data in items_payload:
+                    item_id = item_data.get("item") or item_data.get("item_id") or item_data.get("id")
+                    if not item_id:
+                        continue
+
+                    item_obj = Item.objects.select_for_update().filter(pk=item_id).first()
+                    if not item_obj:
+                        continue
+
+                    qty = Decimal(str(item_data.get("quantity") or item_data.get("quantity_sold") or 1))
+                    if qty <= ZERO:
+                        continue
+
+                    pricing = BranchItemPricing.objects.filter(item=item_obj, branch=branch_obj).first()
+                    cost_price = Decimal(str(pricing.unit_cost_price if pricing else getattr(item_obj, "unit_cost_price", ZERO) or ZERO))
+                    retail_price = Decimal(str(item_data.get("unit_selling_price") or item_data.get("unit_retail_price") or (pricing.unit_selling_price if pricing else ZERO) or ZERO))
+                    discount = Decimal(str(item_data.get("discount_per_item") or "0.00"))
+
+                    line_total = qty * (retail_price - discount)
+                    calculated_total += line_total
+
+                    # Create SaleItem
+                    SaleItem.objects.create(
+                        transaction=sale,
+                        item=item_obj,
+                        quantity_sold=qty,
+                        unit_cost_price=cost_price,
+                        unit_selling_price=retail_price,
+                        discount_per_item=discount,
+                    )
+
+                    # Deduct Stock via StockMovement
+                    StockMovement.objects.create(
+                        item=item_obj,
+                        branch=branch_obj,
+                        movement_type=StockMovement.MovementType.SALE,
+                        quantity=qty,
+                        unit_cost_price=cost_price,
+                        date=parsed_date.date(),
+                        reference=f"SALE-{sale.id}",
+                        created_by=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
+                    )
+
+                sale.total_amount = calculated_total
+                if normalized_pm != "CREDIT" and sale.amount_paid == ZERO:
+                    sale.amount_paid = calculated_total
+                sale.save()
+
+            # 4. Broadcast Real-Time Analytics Event
+            channel_layer = get_channel_layer()
+            if channel_layer:
+                try:
+                    async_to_sync(channel_layer.group_send)(
+                        f"analytics_branch_{branch_obj.id}",
+                        {
+                            "type": "analytics_update",
+                            "event": "SALE_CREATED",
+                            "transaction_id": sale.id,
+                            "total_amount": float(sale.total_amount),
+                        },
+                    )
+                except Exception as ws_err:
+                    logger.warning("WebSocket broadcast failed: %s", ws_err)
+
+            # Return serialized response
+            serializer = self.get_serializer(sale)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+        except DRFValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Sale Creation Error: %s", e)
+            return Response(
+                {"error": f"Failed to record sale: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class SupplierPaymentViewSet(viewsets.ModelViewSet):
