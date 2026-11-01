@@ -1435,6 +1435,143 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
             return "PARTIAL"
         return "PENDING"
 
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop("items", [])
+        payments_data = validated_data.pop("payments", [])
+        
+        request = self.context.get("request")
+        user = _get_request_user(self)
+
+        branch = validated_data.get("branch")
+        if not branch:
+            raise serializers.ValidationError({"branch": "A valid branch is required for sales transactions."})
+
+        payment_method = _normalize_payment_method(validated_data.get("payment_method", "CASH"))
+        validated_data["payment_method"] = payment_method
+
+        # Customer Resolution:
+        # 1. For Cash / Split / Standard Sales: Defaults to "Walk-in Customer" if omitted
+        # 2. For Credit Sales: Requires or auto-creates a Customer object for accounts receivable
+        customer_input = validated_data.pop("customer", None)
+        retailer = getattr(branch, "retailer", None)
+        customer_obj = _resolve_customer(customer_input, retailer=retailer)
+
+        if payment_method == "CREDIT":
+            if not customer_obj:
+                cust_name = validated_data.get("customer_name") or (str(customer_input) if customer_input else "Walk-in Debtor")
+                customer_obj, _ = Customer.objects.get_or_create(
+                    retailer=retailer,
+                    name=cust_name,
+                    defaults={"phone_number": ""}
+                )
+            validated_data["customer"] = customer_obj
+            validated_data["customer_name"] = customer_obj.name
+            validated_data["customer_phone"] = customer_obj.phone_number or ""
+        else:
+            # Walk-in customer for cash sales
+            validated_data["customer"] = customer_obj  # None for random walk-in cash customers
+            validated_data["customer_name"] = (
+                validated_data.get("customer_name")
+                or (customer_obj.name if customer_obj else "Walk-in Customer")
+            )
+
+        sale_date = validated_data.get("sale_date") or timezone.now()
+        validated_data["sale_date"] = sale_date
+
+        if user and "created_by" not in validated_data:
+            validated_data["created_by"] = user
+
+        if not validated_data.get("receipt_number"):
+            validated_data["receipt_number"] = generate_branch_receipt_no(branch, dt=sale_date)
+
+        try:
+            # 1. Create Transaction Header
+            transaction_obj = SaleTransaction.objects.create(**validated_data)
+
+            computed_total = ZERO
+
+            # 2. Save Line Items & Decrement Stock
+            for item_data in items_data:
+                item_id = item_data.get("item")
+                item = Item.objects.select_for_update().filter(pk=item_id).first() if isinstance(item_id, int) else item_id
+                if not item:
+                    raise serializers.ValidationError({"items": f"Item ID '{item_id}' was not found in the catalog."})
+
+                qty_sold = _money(item_data.get("quantity_sold", Decimal("1.00")))
+                unit_selling = _money(item_data.get("unit_selling_price", ZERO))
+                discount = _money(item_data.get("discount_per_item", ZERO))
+
+                pricing = _get_pricing(item, branch)
+                unit_cost = _money(pricing.unit_cost_price) if pricing else ZERO
+
+                line_net = (unit_selling - discount) * qty_sold
+                computed_total += line_net
+
+                SaleItem.objects.create(
+                    transaction=transaction_obj,
+                    item=item,
+                    quantity_sold=qty_sold,
+                    unit_selling_price=unit_selling,
+                    unit_cost_price=unit_cost,
+                    discount_per_item=discount,
+                )
+
+                StockMovement.objects.create(
+                    item=item,
+                    branch=branch,
+                    movement_type=StockMovement.MovementType.SALE,
+                    quantity=qty_sold,
+                    unit_cost_price=unit_cost,
+                    date=_coerce_to_date(sale_date),
+                    reference=transaction_obj.receipt_number,
+                    notes=f"Sale transaction #{transaction_obj.id} ({payment_method})",
+                    created_by=user,
+                )
+
+                if pricing:
+                    pricing.remaining_stock = max(0, pricing.remaining_stock - int(qty_sold))
+                    pricing.save(update_fields=["remaining_stock"])
+
+            # 3. Finalize Totals & Credit Balance
+            if not validated_data.get("total_amount"):
+                transaction_obj.total_amount = computed_total
+
+            if payment_method == "CREDIT":
+                transaction_obj.amount_paid = ZERO
+                transaction_obj.is_paid = False
+            else:
+                transaction_obj.amount_paid = transaction_obj.total_amount
+                transaction_obj.is_paid = True
+
+            transaction_obj.save(update_fields=["total_amount", "amount_paid", "is_paid"])
+
+            # 4. Handle Split Payments
+            if payment_method == "SPLIT" and payments_data:
+                paid_sum = ZERO
+                for p_data in payments_data:
+                    sp_method = p_data.get("method")
+                    sp_amount = _money(p_data.get("amount", ZERO))
+                    paid_sum += sp_amount
+
+                    SalePayment.objects.create(
+                        transaction=transaction_obj,
+                        method=sp_method,
+                        amount=sp_amount,
+                        reference_code=p_data.get("reference_code", ""),
+                    )
+
+                transaction_obj.amount_paid = paid_sum
+                transaction_obj.is_paid = paid_sum >= transaction_obj.total_amount
+                transaction_obj.save(update_fields=["amount_paid", "is_paid"])
+
+            return transaction_obj
+
+        except DjangoValidationError as e:
+            raise _validation_error(e)
+        except IntegrityError as e:
+            raise _integrity_error(e)
+
 
 # ============================================================
 # EXPENSE & STOCK TRANSFERS
