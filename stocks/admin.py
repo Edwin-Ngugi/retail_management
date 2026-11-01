@@ -1164,6 +1164,8 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
         SalePaymentInline,
     ]
 
+    actions = ["delete_sales_safely"]
+
     class Media:
         js = ("admin/js/sale_item_pricing.js",)
 
@@ -1213,25 +1215,49 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
             '<span style="color: #dc3545; font-size: 16px; font-weight: bold;" title="Unpaid / Full Credit">&#10008;</span>'
         )
 
+    def _cleanup_related_records(self, obj):
+        """Helper to clear related movements and inline items before deletion."""
+        StockMovement.objects.filter(reference=f"SALE-{obj.id}").delete()
+        StockMovement.objects.filter(reference=f"SALE-{obj.receipt_number}").delete()
+        if hasattr(obj, "receipt_number") and obj.receipt_number:
+            StockMovement.objects.filter(reference=obj.receipt_number).delete()
+        StockMovement.objects.filter(reference_id=obj.pk, movement_type=StockMovement.MovementType.SALE).delete()
+
+        # Remove child objects directly
+        obj.items.all().delete()
+        if hasattr(obj, "split_payments"):
+            obj.split_payments.all().delete()
+
+    @admin.action(description="Delete selected sale transactions safely")
+    def delete_sales_safely(self, request, queryset):
+        """Custom action that safely deletes selected sales and cleans up dependencies."""
+        deleted_count = 0
+        with transaction.atomic():
+            for obj in queryset:
+                self._cleanup_related_records(obj)
+                obj.delete()
+                deleted_count += 1
+
+        self.message_user(request, f"Successfully deleted {deleted_count} sale transaction(s).")
+
+    def get_actions(self, request):
+        """Override actions to remove standard delete_selected and enforce safe deletion."""
+        actions = super().get_actions(request)
+        if "delete_selected" in actions:
+            del actions["delete_selected"]
+        return actions
+
     def delete_model(self, request, obj):
         """Cleanly delete stock movements prior to deleting single sale transaction."""
         with transaction.atomic():
-            StockMovement.objects.filter(reference=f"SALE-{obj.id}").delete()
-            StockMovement.objects.filter(reference=f"SALE-{obj.receipt_number}").delete()
-            if hasattr(obj, "receipt_number") and obj.receipt_number:
-                StockMovement.objects.filter(reference=obj.receipt_number).delete()
-            StockMovement.objects.filter(reference_id=obj.pk, movement_type=StockMovement.MovementType.SALE).delete()
+            self._cleanup_related_records(obj)
             super().delete_model(request, obj)
 
     def delete_queryset(self, request, queryset):
         """Cleanly delete stock movements during bulk admin deletion."""
         with transaction.atomic():
             for obj in queryset:
-                StockMovement.objects.filter(reference=f"SALE-{obj.id}").delete()
-                StockMovement.objects.filter(reference=f"SALE-{obj.receipt_number}").delete()
-                if hasattr(obj, "receipt_number") and obj.receipt_number:
-                    StockMovement.objects.filter(reference=obj.receipt_number).delete()
-                StockMovement.objects.filter(reference_id=obj.pk, movement_type=StockMovement.MovementType.SALE).delete()
+                self._cleanup_related_records(obj)
             super().delete_queryset(request, queryset)
 
     def save_related(self, request, form, formsets, change):
