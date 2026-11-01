@@ -8680,9 +8680,37 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='cash-book')
     def cash_book(self, request):
         try:
-            branch_id, start_date, end_date = self._get_filter_params(request)
+            # Extract query parameters directly or via helper
+            branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+            start_date_param = request.query_params.get('start_date')
+            end_date_param = request.query_params.get('end_date')
+            period_type = request.query_params.get('period_type', 'month')
 
-            # Base Sales QuerySet (excluding Credit / Invoice sales)
+            # Compute fallback start/end dates if missing
+            now = datetime.now()
+            year = int(request.query_params.get('year', now.year))
+            month = int(request.query_params.get('month', now.month))
+
+            if start_date_param and end_date_param:
+                start_date = datetime.strptime(str(start_date_param)[:10], '%Y-%m-%d').date()
+                end_date = datetime.strptime(str(end_date_param)[:10], '%Y-%m-%d').date()
+            elif period_type == 'month':
+                _, last_day = calendar.monthrange(year, month)
+                start_date = date(year, month, 1)
+                end_date = date(year, month, last_day)
+            elif period_type == 'day':
+                d_str = request.query_params.get('date', str(now.date()))[:10]
+                start_date = datetime.strptime(d_str, '%Y-%m-%d').date()
+                end_date = start_date
+            elif period_type == 'year':
+                start_date = date(year, 1, 1)
+                end_date = date(year, 12, 31)
+            else:
+                start_date = date(year, month, 1)
+                _, last_day = calendar.monthrange(year, month)
+                end_date = date(year, month, last_day)
+
+            # Base QuerySets
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__date__gte=start_date,
                 sale_date__date__lte=end_date
@@ -8690,13 +8718,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
 
-            # Base Repayments, Expenses, Purchases, and Supplier Payments
             repayments_qs = CreditRepayment.objects.filter(
                 date__gte=start_date,
                 date__lte=end_date
             )
 
-            # Exclude supplier repayment entries from general operating expenses
             expenses_qs = Expense.objects.filter(
                 date__gte=start_date,
                 date__lte=end_date
@@ -8712,14 +8738,20 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 created_at__date__lte=end_date
             )
 
+            # Apply Branch Filter safely
             if branch_id and str(branch_id).lower() != 'all':
-                sales_qs = sales_qs.filter(branch_id=branch_id)
+                try:
+                    clean_branch_id = int(branch_id)
+                except (ValueError, TypeError):
+                    clean_branch_id = branch_id
+
+                sales_qs = sales_qs.filter(branch_id=clean_branch_id)
                 repayments_qs = repayments_qs.filter(
-                    Q(branch_id=branch_id) | Q(transaction__branch_id=branch_id)
+                    Q(branch_id=clean_branch_id) | Q(transaction__branch_id=clean_branch_id)
                 )
-                expenses_qs = expenses_qs.filter(branch_id=branch_id)
-                purchases_qs = purchases_qs.filter(branch_id=branch_id)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch_id=branch_id)
+                expenses_qs = expenses_qs.filter(branch_id=clean_branch_id)
+                purchases_qs = purchases_qs.filter(branch_id=clean_branch_id)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch_id=clean_branch_id)
 
             # -----------------------------------------------------------------
             # 1. CHANNEL INFLOWS (PREVENT DOUBLE COUNTING OF SPLIT PAYMENTS)
@@ -8758,22 +8790,18 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # 2. OUTFLOWS (PURCHASES & OPERATING EXPENSES)
             # -----------------------------------------------------------------
-            # Direct cash purchases (excluding credit orders with existing supplier payments)
             direct_purchases = purchases_qs.exclude(
                 payment_method='CREDIT'
             ).filter(
                 supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
 
-            # Settlement payments made against supplier accounts
             supplier_repayments = supplier_payments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO)
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
 
-            # Total inventory/supplier cash spent
             purchases_cost = direct_purchases + supplier_repayments
 
-            # Operating Expenses excluding supplier repayments
             expenses_total = expenses_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
@@ -8784,9 +8812,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             date_str = str(end_date)
 
-            # -----------------------------------------------------------------
-            # 3. SUMMARY ROWS
-            # -----------------------------------------------------------------
             summary_entries = [
                 {
                     "id": "SUMMARY-CASH",
@@ -8796,9 +8821,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "type": "INFLOW",
                     "payment_method": "CASH",
                     "channel": "CASH",
-                    "inflow": float(quantize_money(tot_cash)),
+                    "inflow": float(tot_cash),
                     "outflow": 0.0,
-                    "amount": float(quantize_money(tot_cash))
+                    "amount": float(tot_cash)
                 },
                 {
                     "id": "SUMMARY-PAYBILL",
@@ -8808,9 +8833,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "type": "INFLOW",
                     "payment_method": "PAYBILL",
                     "channel": "PAYBILL",
-                    "inflow": float(quantize_money(tot_paybill)),
+                    "inflow": float(tot_paybill),
                     "outflow": 0.0,
-                    "amount": float(quantize_money(tot_paybill))
+                    "amount": float(tot_paybill)
                 },
                 {
                     "id": "SUMMARY-SENDMONEY",
@@ -8820,9 +8845,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "type": "INFLOW",
                     "payment_method": "SEND_MONEY",
                     "channel": "SEND_MONEY",
-                    "inflow": float(quantize_money(tot_send_money)),
+                    "inflow": float(tot_send_money),
                     "outflow": 0.0,
-                    "amount": float(quantize_money(tot_send_money))
+                    "amount": float(tot_send_money)
                 },
                 {
                     "id": "SUMMARY-PURCHASES",
@@ -8833,8 +8858,8 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "payment_method": "PURCHASE",
                     "channel": "STOCK_PURCHASE",
                     "inflow": 0.0,
-                    "outflow": float(quantize_money(purchases_cost)),
-                    "amount": float(quantize_money(purchases_cost))
+                    "outflow": float(purchases_cost),
+                    "amount": float(purchases_cost)
                 },
                 {
                     "id": "SUMMARY-EXPENSES",
@@ -8845,19 +8870,19 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "payment_method": "EXPENSE",
                     "channel": "EXPENSE",
                     "inflow": 0.0,
-                    "outflow": float(quantize_money(expenses_total)),
-                    "amount": float(quantize_money(expenses_total))
+                    "outflow": float(expenses_total),
+                    "amount": float(expenses_total)
                 }
             ]
 
             return Response({
                 "summary": {
-                    "total_inflows": float(quantize_money(tot_inflow)),
-                    "total_outflows": float(quantize_money(tot_outflow)),
-                    "net_position": float(quantize_money(net_position)),
-                    "total_inflow": float(quantize_money(tot_inflow)),
-                    "total_outflow": float(quantize_money(tot_outflow)),
-                    "net_cash_flow": float(quantize_money(net_position)),
+                    "total_inflows": float(tot_inflow),
+                    "total_outflows": float(tot_outflow),
+                    "net_position": float(net_position),
+                    "total_inflow": float(tot_inflow),
+                    "total_outflow": float(tot_outflow),
+                    "net_cash_flow": float(net_position),
                 },
                 "count": len(summary_entries),
                 "results": summary_entries,
