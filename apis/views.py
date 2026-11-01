@@ -2703,115 +2703,200 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
         {"code": "SPLIT", "label": "Split Payment"},
     ]
 
-    def create(self, request, *args, **kwargs):
-        try:
-            data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data or {})
-            items_payload = data.get("items") or data.get("sale_items") or []
+    def _normalize_sale_date(self, raw_date):
+        if raw_date in (None, ""):
+            return timezone.now()
 
-            if not items_payload:
-                return Response(
-                    {"error": "At least one sale item is required to complete transaction."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+        tz = timezone.get_current_timezone()
 
-            # 1. Safe Branch Resolution
-            branch_param = (
-                data.get("branch")
-                or data.get("branch_id")
-                or request.query_params.get("branch")
-                or request.query_params.get("branch_id")
+        if isinstance(raw_date, datetime):
+            return timezone.make_aware(raw_date, tz) if timezone.is_naive(raw_date) else raw_date
+
+        if isinstance(raw_date, date):
+            current_time = (
+                timezone.localtime().time()
+                if raw_date == timezone.localdate()
+                else datetime.min.time()
             )
-            
-            branch_obj = None
-            if branch_param is not None:
-                if isinstance(branch_param, RetailBranch):
-                    branch_obj = branch_param
-                elif isinstance(branch_param, int) or (isinstance(branch_param, str) and branch_param.isdigit()):
-                    branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
-                elif isinstance(branch_param, str) and branch_param.strip():
-                    branch_obj = RetailBranch.objects.filter(name__iexact=branch_param.strip()).first()
+            return timezone.make_aware(datetime.combine(raw_date, current_time), tz)
 
-            if not branch_obj:
-                # Fallback to retailer's first branch or system default if unassigned
-                user = _get_request_user(self) if hasattr(self, "get_serializer") else None
-                if user:
-                    branch_obj = RetailBranch.objects.filter(retailer=user).first()
-                if not branch_obj:
-                    branch_obj = RetailBranch.objects.first()
+        if isinstance(raw_date, str):
+            raw_date = raw_date.strip()
 
-            if not branch_obj:
-                return Response(
-                    {"error": "A valid branch is required to record sales."},
-                    status=status.HTTP_400_BAD_REQUEST,
+            try:
+                parsed = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                return timezone.make_aware(parsed, tz) if timezone.is_naive(parsed) else parsed
+            except ValueError:
+                pass
+
+            try:
+                parsed_date = datetime.strptime(raw_date[:10], "%Y-%m-%d").date()
+                current_time = (
+                    timezone.localtime().time()
+                    if parsed_date == timezone.localdate()
+                    else datetime.min.time()
                 )
+                return timezone.make_aware(datetime.combine(parsed_date, current_time), tz)
+            except ValueError:
+                raise DRFValidationError({
+                    "sale_date": "Invalid date format. Use YYYY-MM-DD or ISO datetime format."
+                })
 
-            # 2. Safe Payment Method Normalization
-            raw_payment = str(data.get("payment_method") or "CASH").strip().upper()
-            payment_method = PAYMENT_METHOD_ALIASES.get(raw_payment, raw_payment)
+        raise DRFValidationError({"sale_date": "Invalid sale date value."})
 
-            # 3. Safe Sale Date Parsing
-            raw_date = data.get("sale_date") or data.get("date")
-            parsed_sale_date = _coerce_to_datetime(raw_date) or timezone.now()
+    def _normalize_payment_method(self, raw_method):
+        if not raw_method:
+            return "CASH"
 
-            # 4. Resolve Customer (Cash Defaults to Walk-in; Credit Resolves Debtor)
-            customer_input = data.get("customer") or data.get("customer_id")
-            retailer = getattr(branch_obj, "retailer", None)
-            customer_obj = _resolve_customer(customer_input, retailer=retailer)
+        normalized = str(raw_method).strip().upper()
+        normalized = normalized.replace("-", "_").replace(" ", "_")
+        normalized = normalized.replace("/", "_").replace("\\", "_")
+        normalized = "_".join(part for part in normalized.split("_") if part)
 
-            if payment_method == "CREDIT":
-                if not customer_obj:
-                    cust_name = data.get("customer_name") or (str(customer_input) if customer_input else "Walk-in Debtor")
-                    customer_obj, _ = Customer.objects.get_or_create(
-                        retailer=retailer,
-                        name=cust_name,
-                        defaults={"phone_number": data.get("customer_phone", "") or ""},
-                    )
-                data["customer"] = customer_obj.id
-                data["customer_name"] = customer_obj.name
-                data["customer_phone"] = customer_obj.phone_number or ""
+        mappings = {
+            ("CASH", "CASH_PAYMENT"): "CASH",
+            ("MPESA", "M_PESA", "MOBILE_MONEY", "MOBILE_PAYMENT", "M_PESA_MONEY"): "MPESA",
+            ("PAYBILL", "M_PESA_PAYBILL", "MPESA_PAYBILL", "M_PESA_PAY_BILL", "MPESA_PAY_BILL"): "PAYBILL",
+            ("SEND_MONEY", "M_PESA_SEND_MONEY", "MPESA_SEND_MONEY", "SENDMONEY", "SEND_MONEY_MPESA", "MPESA_SENDMONEY"): "SEND_MONEY",
+            ("BANK_TRANSFER", "BANK", "TRANSFER", "BANK_PAYMENT"): "BANK_TRANSFER",
+            ("CREDIT", "ON_CREDIT", "CREDIT_SALE"): "CREDIT",
+            ("SPLIT", "SPLIT_PAYMENT", "SPLIT_PAYMENTS", "MULTIPLE"): "SPLIT",
+        }
+
+        for keys, target in mappings.items():
+            if normalized in keys:
+                return target
+
+        if "PAYBILL" in normalized or "PAY_BILL" in normalized:
+            return "PAYBILL"
+        if "SEND_MONEY" in normalized or "SENDMONEY" in normalized:
+            return "SEND_MONEY"
+        if "BANK" in normalized or "TRANSFER" in normalized:
+            return "BANK_TRANSFER"
+        if "CREDIT" in normalized:
+            return "CREDIT"
+        if "CASH" in normalized:
+            return "CASH"
+        if "MPESA" in normalized or "M_PESA" in normalized or "MOBILE" in normalized:
+            return "MPESA"
+
+        return normalized
+
+    def get_queryset(self):
+        queryset = (
+            SaleTransaction.objects
+            .select_related("branch", "customer")
+            .prefetch_related("items__item", "split_payments")
+            .all()
+            .order_by("-sale_date")
+        )
+
+        branch_param = (
+            self.request.query_params.get("branch")
+            or self.request.query_params.get("branch_id")
+        )
+        payment_method = self.request.query_params.get("payment_method")
+        customer_id = self.request.query_params.get("customer")
+
+        if branch_param and str(branch_param).lower() != "all":
+            if str(branch_param).isdigit():
+                queryset = queryset.filter(branch_id=int(branch_param))
             else:
-                data["customer"] = customer_obj.id if customer_obj else None
-                data["customer_name"] = (
-                    data.get("customer_name")
-                    or (customer_obj.name if customer_obj else "Walk-in Customer")
-                )
+                queryset = queryset.filter(branch__name__iexact=str(branch_param).strip())
 
-            # Format cleaned fields into serializer data dictionary
-            data["branch"] = branch_obj.id
-            data["payment_method"] = payment_method
-            data["sale_date"] = parsed_sale_date.isoformat()
+        if payment_method:
+            normalized_pm = self._normalize_payment_method(payment_method)
+            pm_filters = {
+                "CASH": Q(payment_method__iexact="CASH") | Q(split_payments__method__iexact="CASH"),
+                "MPESA": Q(payment_method__iexact="MPESA") | Q(payment_method__iexact="M-PESA") | Q(payment_method__iexact="MOBILE_MONEY") | Q(split_payments__method__iexact="MPESA"),
+                "PAYBILL": Q(payment_method__iexact="PAYBILL") | Q(split_payments__method__iexact="PAYBILL"),
+                "SEND_MONEY": Q(payment_method__iexact="SEND_MONEY") | Q(payment_method__iexact="SEND MONEY") | Q(split_payments__method__iexact="SEND_MONEY"),
+                "BANK_TRANSFER": Q(payment_method__iexact="BANK_TRANSFER") | Q(payment_method__iexact="BANK") | Q(payment_method__iexact="TRANSFER") | Q(split_payments__method__iexact="BANK_TRANSFER"),
+                "CREDIT": Q(payment_method__iexact="CREDIT") | Q(payment_method__iexact="ON_CREDIT") | Q(payment_method__iexact="CREDIT SALE") | Q(split_payments__method__iexact="CREDIT"),
+                "SPLIT": Q(payment_method__iexact="SPLIT"),
+            }
+            queryset = queryset.filter(pm_filters.get(normalized_pm, Q(payment_method__iexact=payment_method))).distinct()
 
-            # 5. Delegate to Serializer
-            serializer = self.get_serializer(data=data, context={"request": request})
-            serializer.is_valid(raise_exception=True)
-            sale = serializer.save()
+        if customer_id:
+            queryset = queryset.filter(customer_id=customer_id)
 
-            # 6. WebSocket Real-time Broadcast
-            channel_layer = get_channel_layer()
-            if channel_layer:
-                try:
-                    async_to_sync(channel_layer.group_send)(
-                        f"analytics_branch_{branch_obj.id}",
-                        {
-                            "type": "analytics_update",
-                            "event": "SALE_CREATED",
-                            "transaction_id": sale.id,
-                            "total_amount": float(sale.total_amount),
-                        },
-                    )
-                except Exception:
-                    pass
+        return queryset
 
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data or {})
+        items_payload = data.get("items") or data.get("sale_items") or []
 
-        except serializers.ValidationError as e:
-            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            logger.exception(f"Sale transaction submission error: {e}")
+        if not items_payload:
             return Response(
-                {"error": "Failed to complete sale transaction.", "details": str(e)},
+                {"error": "At least one sale item is required to complete transaction."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # 1. Resolve Branch
+        branch_param = (
+            data.get("branch")
+            or data.get("branch_id")
+            or request.query_params.get("branch")
+            or request.query_params.get("branch_id")
+        )
+        branch_obj = None
+        if branch_param is not None:
+            if isinstance(branch_param, RetailBranch):
+                branch_obj = branch_param
+            elif isinstance(branch_param, int) or (isinstance(branch_param, str) and str(branch_param).isdigit()):
+                branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
+            elif isinstance(branch_param, str) and branch_param.strip():
+                branch_obj = RetailBranch.objects.filter(name__iexact=branch_param.strip()).first()
+
+        if not branch_obj:
+            user = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
+            if user:
+                branch_obj = RetailBranch.objects.filter(retailer=user).first()
+            if not branch_obj:
+                branch_obj = RetailBranch.objects.first()
+
+        if not branch_obj:
+            return Response(
+                {"error": "A valid branch is required to record sales."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data["branch"] = branch_obj.id
+
+        # 2. Normalize Payment Method & Date
+        raw_payment = data.get("payment_method") or "CASH"
+        data["payment_method"] = self._normalize_payment_method(raw_payment)
+
+        raw_date = data.get("sale_date") or data.get("date")
+        parsed_date = self._normalize_sale_date(raw_date)
+        data["sale_date"] = parsed_date.isoformat()
+
+        # 3. Default customer name for non-credit sales
+        if data["payment_method"] != "CREDIT" and not data.get("customer_name"):
+            data["customer_name"] = "Walk-in Customer"
+
+        # 4. Save through Serializer
+        serializer = self.get_serializer(data=data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        sale = serializer.save()
+
+        # 5. Broadcast WebSocket Analytics Event
+        channel_layer = get_channel_layer()
+        if channel_layer:
+            try:
+                async_to_sync(channel_layer.group_send)(
+                    f"analytics_branch_{branch_obj.id}",
+                    {
+                        "type": "analytics_update",
+                        "event": "SALE_CREATED",
+                        "transaction_id": sale.id,
+                        "total_amount": float(sale.total_amount),
+                    },
+                )
+            except Exception:
+                pass
+
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class SupplierPaymentViewSet(viewsets.ModelViewSet):

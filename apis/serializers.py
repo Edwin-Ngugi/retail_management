@@ -1400,13 +1400,14 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
         total = _money(getattr(obj, "total_amount", ZERO) or ZERO)
 
         if getattr(obj, "payment_method", None) == "SPLIT":
-            credit_total = SalePayment.objects.filter(
-                transaction=obj,
-                method="CREDIT",
-            ).aggregate(
-                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField())
-            )["total"] or ZERO
-            return _money(credit_total)
+            payments_qs = getattr(obj, "split_payments", None) or getattr(obj, "payments", None)
+            if payments_qs is not None:
+                credit_total = payments_qs.filter(
+                    method="CREDIT"
+                ).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField())
+                )["total"] or ZERO
+                return _money(credit_total)
 
         if _normalize_payment_method(getattr(obj, "payment_method", None)) == "CREDIT":
             return total
@@ -1441,7 +1442,7 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
         payments_data = validated_data.pop("payments", [])
         
         request = self.context.get("request")
-        user = _get_request_user(self)
+        user = _get_request_user(self) if hasattr(self, "context") else None
 
         branch = validated_data.get("branch")
         if not branch:
@@ -1450,27 +1451,24 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
         payment_method = _normalize_payment_method(validated_data.get("payment_method", "CASH"))
         validated_data["payment_method"] = payment_method
 
-        # Customer Resolution:
-        # 1. For Cash / Split / Standard Sales: Defaults to "Walk-in Customer" if omitted
-        # 2. For Credit Sales: Requires or auto-creates a Customer object for accounts receivable
+        # Resolve Customer (Debtor vs Walk-in)
         customer_input = validated_data.pop("customer", None)
         retailer = getattr(branch, "retailer", None)
         customer_obj = _resolve_customer(customer_input, retailer=retailer)
 
         if payment_method == "CREDIT":
             if not customer_obj:
-                cust_name = validated_data.get("customer_name") or (str(customer_input) if customer_input else "Walk-in Debtor")
+                cust_name = validated_data.get("customer_name") or "Walk-in Debtor"
                 customer_obj, _ = Customer.objects.get_or_create(
                     retailer=retailer,
                     name=cust_name,
-                    defaults={"phone_number": ""}
+                    defaults={"phone_number": validated_data.get("customer_phone") or ""}
                 )
             validated_data["customer"] = customer_obj
             validated_data["customer_name"] = customer_obj.name
             validated_data["customer_phone"] = customer_obj.phone_number or ""
         else:
-            # Walk-in customer for cash sales
-            validated_data["customer"] = customer_obj  # None for random walk-in cash customers
+            validated_data["customer"] = customer_obj
             validated_data["customer_name"] = (
                 validated_data.get("customer_name")
                 or (customer_obj.name if customer_obj else "Walk-in Customer")
@@ -1483,26 +1481,28 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
             validated_data["created_by"] = user
 
         if not validated_data.get("receipt_number"):
-            validated_data["receipt_number"] = generate_branch_receipt_no(branch, dt=sale_date)
+            validated_data["receipt_number"] = generate_document_number(
+                is_credit=(payment_method == "CREDIT")
+            )
 
         try:
-            # 1. Create Transaction Header
+            # 1. Instantiate SaleTransaction Header
             transaction_obj = SaleTransaction.objects.create(**validated_data)
 
             computed_total = ZERO
 
-            # 2. Save Line Items & Decrement Stock
+            # 2. Process Line Items (SaleItem.save() handles StockMovement & WAC automatically)
             for item_data in items_data:
                 item_id = item_data.get("item")
-                item = Item.objects.select_for_update().filter(pk=item_id).first() if isinstance(item_id, int) else item_id
+                item = Item.objects.filter(pk=item_id).first() if isinstance(item_id, int) else item_id
                 if not item:
-                    raise serializers.ValidationError({"items": f"Item ID '{item_id}' was not found in the catalog."})
+                    raise serializers.ValidationError({"items": f"Item ID '{item_id}' not found."})
 
                 qty_sold = _money(item_data.get("quantity_sold", Decimal("1.00")))
                 unit_selling = _money(item_data.get("unit_selling_price", ZERO))
                 discount = _money(item_data.get("discount_per_item", ZERO))
 
-                pricing = _get_pricing(item, branch)
+                pricing = BranchItemPricing.objects.filter(branch=branch, item=item).first()
                 unit_cost = _money(pricing.unit_cost_price) if pricing else ZERO
 
                 line_net = (unit_selling - discount) * qty_sold
@@ -1517,31 +1517,18 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
                     discount_per_item=discount,
                 )
 
-                StockMovement.objects.create(
-                    item=item,
-                    branch=branch,
-                    movement_type=StockMovement.MovementType.SALE,
-                    quantity=qty_sold,
-                    unit_cost_price=unit_cost,
-                    date=_coerce_to_date(sale_date),
-                    reference=transaction_obj.receipt_number,
-                    notes=f"Sale transaction #{transaction_obj.id} ({payment_method})",
-                    created_by=user,
-                )
-
                 if pricing:
                     pricing.remaining_stock = max(0, pricing.remaining_stock - int(qty_sold))
                     pricing.save(update_fields=["remaining_stock"])
 
-            # 3. Finalize Totals & Credit Balance
-            if not validated_data.get("total_amount"):
-                transaction_obj.total_amount = computed_total
+            # 3. Always recalculate total_amount directly from computed items to prevent data inflation
+            transaction_obj.total_amount = computed_total
 
             if payment_method == "CREDIT":
                 transaction_obj.amount_paid = ZERO
                 transaction_obj.is_paid = False
             else:
-                transaction_obj.amount_paid = transaction_obj.total_amount
+                transaction_obj.amount_paid = computed_total
                 transaction_obj.is_paid = True
 
             transaction_obj.save(update_fields=["total_amount", "amount_paid", "is_paid"])

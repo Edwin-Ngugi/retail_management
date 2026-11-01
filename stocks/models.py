@@ -1784,9 +1784,7 @@ class SaleTransaction(models.Model):
             )
         )
 
-        self.total_amount = quantize_money(
-            aggregated["total"] or ZERO
-        )
+        self.total_amount = quantize_money(aggregated["total"] or ZERO)
 
     @property
     def total_cost(self):
@@ -1805,19 +1803,15 @@ class SaleTransaction(models.Model):
 
     @property
     def profit(self):
-        return (
-            self.total_amount or ZERO
-        ) - self.total_cost
+        return (self.total_amount or ZERO) - self.total_cost
 
     @property
     def credit_payment_amount(self):
         if self.payment_method == self.PaymentMethod.CREDIT:
-            return quantize_money(
-                self.total_amount or ZERO
-            )
+            return quantize_money(self.total_amount or ZERO)
 
         if self.payment_method == self.PaymentMethod.SPLIT:
-            payments_qs = getattr(self, "payments", None)
+            payments_qs = getattr(self, "payments", None) or getattr(self, "split_payments", None)
 
             if payments_qs is not None:
                 credit_total = payments_qs.filter(
@@ -1826,12 +1820,11 @@ class SaleTransaction(models.Model):
                     total=Coalesce(
                         Sum("amount"),
                         ZERO,
+                        output_field=models.DecimalField(max_digits=12, decimal_places=2)
                     )
                 )["total"]
 
-                return quantize_money(
-                    credit_total or ZERO
-                )
+                return quantize_money(credit_total or ZERO)
 
         return ZERO
 
@@ -1841,14 +1834,11 @@ class SaleTransaction(models.Model):
             total=Coalesce(
                 Sum("amount"),
                 ZERO,
+                output_field=models.DecimalField(max_digits=12, decimal_places=2)
             )
         )["total"]
 
-        return quantize_money(
-            repayment_total or ZERO
-        )
-
-    # models.py inside class SaleTransaction:
+        return quantize_money(repayment_total or ZERO)
 
     @property
     def liquid_payments_breakdown(self):
@@ -1858,9 +1848,9 @@ class SaleTransaction(models.Model):
         """
         totals = {"MPESA": Decimal("0.00"), "PAYBILL": Decimal("0.00"), "CASH": Decimal("0.00"), "CREDIT": Decimal("0.00")}
         
-        split_qs = self.split_payments.all()
-        if self.payment_method == self.PaymentMethod.SPLIT or split_qs.exists():
-            for sp in split_qs:
+        split_qs = getattr(self, "split_payments", None) or getattr(self, "payments", None)
+        if (self.payment_method == self.PaymentMethod.SPLIT or (split_qs and split_qs.exists())):
+            for sp in split_qs.all():
                 amt = Decimal(str(sp.amount or 0))
                 method = str(sp.method or "").upper()
                 if "PAYBILL" in method or "BANK" in method:
@@ -1872,7 +1862,6 @@ class SaleTransaction(models.Model):
                 else:
                     totals["CASH"] += amt
         else:
-            # Single payment method: Use amount_paid if present/less than total_amount
             amt = Decimal(str(self.amount_paid if self.amount_paid is not None else self.total_amount or 0))
             method = str(self.payment_method or "").upper()
             
@@ -1885,7 +1874,7 @@ class SaleTransaction(models.Model):
             else:
                 totals["CASH"] += amt
 
-        return totals    
+        return totals
 
     @property
     def is_invoice(self):
@@ -1902,14 +1891,8 @@ class SaleTransaction(models.Model):
         if credit_amount <= ZERO:
             return ZERO
 
-        balance = (
-            credit_amount
-            - self.credit_repayments
-        )
-
-        return quantize_money(
-            max(ZERO, balance)
-        )
+        balance = credit_amount - self.credit_repayments
+        return quantize_money(max(ZERO, balance))
 
     @property
     def invoice_status(self):
@@ -1929,99 +1912,61 @@ class SaleTransaction(models.Model):
 
         if self.payment_method == self.PaymentMethod.CREDIT:
             self.is_paid = False
+            self.amount_paid = ZERO
         else:
             self.is_paid = True
+            if self.amount_paid is None or self.amount_paid == ZERO:
+                self.amount_paid = self.total_amount or ZERO
 
-        if (
-            self.amount_paid is not None
-            and self.amount_paid < ZERO
-        ):
-            raise ValidationError(
-                {
-                    "amount_paid":
-                        "Amount paid cannot be negative."
-                }
-            )
+        if self.amount_paid is not None and self.amount_paid < ZERO:
+            raise ValidationError({"amount_paid": "Amount paid cannot be negative."})
 
     def save(self, *args, **kwargs):
-        is_credit = (
-            self.payment_method
-            == self.PaymentMethod.CREDIT
-        )
+        is_credit = (self.payment_method == self.PaymentMethod.CREDIT)
 
         if is_credit and not self.customer:
             retailer_user = self.created_by
 
-            if (
-                not retailer_user
-                and hasattr(self, "branch")
-                and self.branch
-            ):
+            if not retailer_user and hasattr(self, "branch") and self.branch:
                 if hasattr(self.branch, "retailer"):
                     retailer_user = self.branch.retailer
                 elif hasattr(self.branch, "user"):
                     retailer_user = self.branch.user
 
-            branch_name = (
-                self.branch.name
-                if hasattr(self, "branch")
-                and self.branch
-                else "Branch"
-            )
+            branch_name = self.branch.name if hasattr(self, "branch") and self.branch else "Branch"
+            cust_name = self.customer_name or f"Walk-in Debtor ({branch_name})"
 
-            cust_name = (
-                self.customer_name
-                or f"Walk-in Customer ({branch_name})"
-            )
-
-            customer_kwargs = {
-                "name": cust_name,
-            }
-
+            customer_kwargs = {"name": cust_name}
             if retailer_user:
                 customer_kwargs["retailer"] = retailer_user
-
             if self.customer_phone:
-                customer_kwargs["phone_number"] = (
-                    self.customer_phone
-                )
+                customer_kwargs["phone_number"] = self.customer_phone
 
-            default_customer = Customer.objects.filter(
-                **customer_kwargs
-            ).first()
-
+            default_customer = Customer.objects.filter(**customer_kwargs).first()
             if not default_customer:
-                default_customer = Customer.objects.create(
-                    **customer_kwargs
-                )
+                default_customer = Customer.objects.create(**customer_kwargs)
 
             self.customer = default_customer
 
-        if not self.receipt_number:
-            self.receipt_number = generate_document_number(
-                is_credit=is_credit
-            )
+        if not is_credit and not self.customer_name:
+            self.customer_name = "Walk-in Customer"
 
-        if (
-            is_credit
-            and not self.due_date
-            and self.sale_date
-        ):
+        if not self.receipt_number:
+            self.receipt_number = generate_document_number(is_credit=is_credit)
+
+        if is_credit and not self.due_date and self.sale_date:
             base_date = (
                 self.sale_date.date()
                 if isinstance(self.sale_date, datetime)
                 else self.sale_date
             )
-
-            self.due_date = (
-                base_date
-                + timedelta(
-                    days=self.credit_days or 30
-                )
-            )
+            self.due_date = base_date + timedelta(days=self.credit_days or 30)
 
         self.full_clean()
         super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Sale {self.receipt_number} ({self.branch.name}) - KSh {self.total_amount}"
 
 
 class SaleItem(models.Model):

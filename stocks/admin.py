@@ -1123,7 +1123,7 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
         "customer",
         "payment_method",
         "status_icon",
-        "amount_paid",
+        "display_amount_paid",     # <--- Replaced raw 'amount_paid' with formatted method
         "display_total_amount",
         "display_profit",
         "sale_date",
@@ -1167,10 +1167,30 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
     class Media:
         js = ("admin/js/sale_item_pricing.js",)
 
+    @admin.display(description="Amount Paid", ordering="amount_paid")
+    def display_amount_paid(self, obj):
+        val = obj.amount_paid or 0
+        return f"KSh {val:,.2f}"
+
+    @admin.display(description="Total Amount", ordering="total_amount")
+    def display_total_amount(self, obj):
+        val = obj.total_amount or 0
+        return f"KSh {val:,.2f}"
+
+    @admin.display(description="Total Cost")
+    def display_total_cost(self, obj):
+        val = obj.total_cost or 0
+        return f"KSh {val:,.2f}"
+
+    @admin.display(description="Profit")
+    def display_profit(self, obj):
+        val = obj.profit or 0
+        return f"KSh {val:,.2f}"
+
     @admin.display(description="Is Paid", ordering="is_paid")
     def status_icon(self, obj):
         method = (obj.payment_method or "").strip().upper()
-        balance_due = obj.total_amount - obj.amount_paid
+        balance_due = (obj.total_amount or 0) - (obj.amount_paid or 0)
 
         # 1. Split Payment with an outstanding credit balance -> Grey Check Mark
         if method in ["SPLIT", "SPLIT PAYMENT"]:
@@ -1243,7 +1263,6 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
                     payments_qs.all().delete()
 
             elif method in ["SPLIT", "SPLIT PAYMENT"]:
-                # Fetch fresh payments directly from DB after inline saving
                 if payments_qs is not None:
                     actual_payments = [
                         p.amount for p in payments_qs.all()
@@ -1254,8 +1273,6 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
 
                 paid_sum = sum(actual_payments)
                 amount_paid = paid_sum
-
-                # STRICT ACCURACY: is_paid is ONLY True if actual paid sum meets or exceeds total
                 is_paid = bool(total > 0 and paid_sum >= total)
 
             else:
@@ -1285,12 +1302,10 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
             obj.is_paid = is_paid
 
     def response_change(self, request, obj):
-        # Refresh instance from DB before rendering change view response
         obj.refresh_from_db()
         return super().response_change(request, obj)
 
     def response_add(self, request, obj, post_url_continue=None):
-        # Refresh instance from DB before rendering add view response
         obj.refresh_from_db()
         return super().response_add(request, obj, post_url_continue)
 
@@ -1305,18 +1320,6 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
             )
             .prefetch_related("items", "split_payments")
         )
-
-    @admin.display(description="Total Amount")
-    def display_total_amount(self, obj):
-        return f"KSh {obj.total_amount:,.2f}"
-
-    @admin.display(description="Total Cost")
-    def display_total_cost(self, obj):
-        return f"KSh {obj.total_cost:,.2f}"
-
-    @admin.display(description="Profit")
-    def display_profit(self, obj):
-        return f"KSh {obj.profit:,.2f}"
 
 
 @admin.register(Sale)
