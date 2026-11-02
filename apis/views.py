@@ -7401,84 +7401,84 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             return Response({"summary": {"total_discounts_granted": 0.0, "total_returns_value": 0.0, "total_returns_count": 0}}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='profit-loss')
-def profit_loss(self, request):
-    try:
-        branch_id, start_date, end_date = self._get_filter_params(request)
+    def profit_loss(self, request):
+        try:
+            branch_id, start_date, end_date = self._get_filter_params(request)
 
-        # 1. Fetch ALL transactions (Cash, Paybill, Send Money, Credit, Split) within the date range
-        sales_tx_qs = SaleTransaction.objects.filter(
-            sale_date__date__gte=start_date,
-            sale_date__date__lte=end_date
-        )
+            # 1. Fetch ALL transactions (Cash, Paybill, Send Money, Credit, Split) within the date range
+            sales_tx_qs = SaleTransaction.objects.filter(
+                sale_date__date__gte=start_date,
+                sale_date__date__lte=end_date
+            )
 
-        expenses_qs = Expense.objects.filter(
-            date__gte=start_date,
-            date__lte=end_date
-        )
+            expenses_qs = Expense.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date
+            )
 
-        if branch_id and str(branch_id).lower() != 'all':
-            sales_tx_qs = sales_tx_qs.filter(branch_id=branch_id)
-            expenses_qs = expenses_qs.filter(branch_id=branch_id)
+            if branch_id and str(branch_id).lower() != 'all':
+                sales_tx_qs = sales_tx_qs.filter(branch_id=branch_id)
+                expenses_qs = expenses_qs.filter(branch_id=branch_id)
 
-        # 2. Total Sales Revenue (includes Credit Sales & Cash Sales)
-        total_sales_dec = sales_tx_qs.aggregate(
-            total=Coalesce(Sum('total_amount'), Decimal('0.00'), output_field=DecimalField())
-        )['total']
+            # 2. Total Sales Revenue (includes Credit Sales & Cash Sales)
+            total_sales_dec = sales_tx_qs.aggregate(
+                total=Coalesce(Sum('total_amount'), Decimal('0.00'), output_field=DecimalField())
+            )['total']
 
-        # 3. Calculate Cost of Goods Sold (COGS) properly
-        sale_items = SaleItem.objects.filter(transaction__in=sales_tx_qs).select_related('item', 'transaction')
+            # 3. Calculate Cost of Goods Sold (COGS) properly
+            sale_items = SaleItem.objects.filter(transaction__in=sales_tx_qs).select_related('item', 'transaction')
 
-        total_cogs_dec = Decimal('0.00')
+            total_cogs_dec = Decimal('0.00')
 
-        # Expression for direct item unit_cost_price calculation
-        cogs_expr = ExpressionWrapper(
-            F('quantity_sold') * F('unit_cost_price'),
-            output_field=DecimalField(max_digits=12, decimal_places=2)
-        )
+            # Expression for direct item unit_cost_price calculation
+            cogs_expr = ExpressionWrapper(
+                F('quantity_sold') * F('unit_cost_price'),
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
 
-        direct_cogs = sale_items.filter(unit_cost_price__gt=0).aggregate(
-            total=Coalesce(Sum(cogs_expr), Decimal('0.00'), output_field=DecimalField())
-        )['total']
+            direct_cogs = sale_items.filter(unit_cost_price__gt=0).aggregate(
+                total=Coalesce(Sum(cogs_expr), Decimal('0.00'), output_field=DecimalField())
+            )['total']
 
-        total_cogs_dec += direct_cogs
+            total_cogs_dec += direct_cogs
 
-        # Fallback for line items saved with 0.00 unit_cost_price (look up current BranchItemPricing cost)
-        zero_cost_items = sale_items.filter(Q(unit_cost_price=0) | Q(unit_cost_price__isnull=True))
+            # Fallback for line items saved with 0.00 unit_cost_price (look up current BranchItemPricing cost)
+            zero_cost_items = sale_items.filter(Q(unit_cost_price=0) | Q(unit_cost_price__isnull=True))
 
-        for line in zero_cost_items:
-            b_id = line.transaction.branch_id
-            pricing = BranchItemPricing.objects.filter(branch_id=b_id, item=line.item).first()
-            cost_unit = pricing.unit_cost_price if (pricing and pricing.unit_cost_price > 0) else Decimal('0.00')
-            total_cogs_dec += Decimal(str(line.quantity_sold or 0)) * Decimal(str(cost_unit))
+            for line in zero_cost_items:
+                b_id = line.transaction.branch_id
+                pricing = BranchItemPricing.objects.filter(branch_id=b_id, item=line.item).first()
+                cost_unit = pricing.unit_cost_price if (pricing and pricing.unit_cost_price > 0) else Decimal('0.00')
+                total_cogs_dec += Decimal(str(line.quantity_sold or 0)) * Decimal(str(cost_unit))
 
-        # 4. Operating Expenses
-        expenses_dec = expenses_qs.aggregate(
-            total=Coalesce(Sum('amount'), Decimal('0.00'), output_field=DecimalField())
-        )['total']
+            # 4. Operating Expenses
+            expenses_dec = expenses_qs.aggregate(
+                total=Coalesce(Sum('amount'), Decimal('0.00'), output_field=DecimalField())
+            )['total']
 
-        # 5. Financial Calculations using exact Decimals
-        gross_profit_dec = total_sales_dec - total_cogs_dec
-        net_profit_dec = gross_profit_dec - expenses_dec
+            # 5. Financial Calculations using exact Decimals
+            gross_profit_dec = total_sales_dec - total_cogs_dec
+            net_profit_dec = gross_profit_dec - expenses_dec
 
-        return Response({
-            'period': {
-                'start_date': str(start_date),
-                'end_date': str(end_date),
-            },
-            'total_sales': float(total_sales_dec),
-            'total_sales_formatted': f"KSh {total_sales_dec:,.2f}",
-            'cost_of_goods_sold': float(total_cogs_dec),
-            'cost_of_goods_sold_formatted': f"KSh {total_cogs_dec:,.2f}",
-            'gross_profit': float(gross_profit_dec),
-            'gross_profit_formatted': f"KSh {gross_profit_dec:,.2f}",
-            'operating_expenses': float(expenses_dec),
-            'operating_expenses_formatted': f"KSh {expenses_dec:,.2f}",
-            'net_profit': float(net_profit_dec),
-            'net_profit_formatted': f"KSh {net_profit_dec:,.2f}",
-        }, status=status.HTTP_200_OK)
+            return Response({
+                'period': {
+                    'start_date': str(start_date),
+                    'end_date': str(end_date),
+                },
+                'total_sales': float(total_sales_dec),
+                'total_sales_formatted': f"KSh {total_sales_dec:,.2f}",
+                'cost_of_goods_sold': float(total_cogs_dec),
+                'cost_of_goods_sold_formatted': f"KSh {total_cogs_dec:,.2f}",
+                'gross_profit': float(gross_profit_dec),
+                'gross_profit_formatted': f"KSh {gross_profit_dec:,.2f}",
+                'operating_expenses': float(expenses_dec),
+                'operating_expenses_formatted': f"KSh {expenses_dec:,.2f}",
+                'net_profit': float(net_profit_dec),
+                'net_profit_formatted': f"KSh {net_profit_dec:,.2f}",
+            }, status=status.HTTP_200_OK)
 
-    except Exception as e:
-        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path='sales-performance')
     def sales_performance(self, request):
