@@ -10,7 +10,8 @@ from asgiref.sync import async_to_sync
 
 def broadcast_to_branch(branch_id, event, **extra):
     """
-    Broadcast an analytics/POS update to a specific branch channel group.
+    Broadcast an analytics/POS update to branch channel groups.
+    Sends to both analytics_branch_<id> and branch_<id> for frontend compatibility.
     """
     if not branch_id:
         return
@@ -21,17 +22,26 @@ def broadcast_to_branch(branch_id, event, **extra):
 
     payload = {
         "type": "analytics_update",
+        "action": event,
         "event": event,
+        "branch_id": branch_id,
         **extra,
     }
 
-    try:
-        async_to_sync(channel_layer.group_send)(
-            f"analytics_branch_{branch_id}",
-            payload,
-        )
-    except Exception as e:
-        print(f"WebSocket broadcast error for branch {branch_id}: {e}")
+    # Target channel groups
+    target_groups = [
+        f"analytics_branch_{branch_id}",
+        f"branch_{branch_id}"
+    ]
+
+    for group_name in target_groups:
+        try:
+            async_to_sync(channel_layer.group_send)(
+                group_name,
+                payload,
+            )
+        except Exception as e:
+            print(f"WebSocket broadcast error for group {group_name}: {e}")
 
 
 @receiver([post_save, post_delete], sender="stocks.Item")
@@ -52,19 +62,55 @@ def item_analytics_update(sender, instance, **kwargs):
             branch_id,
             "DATA_CHANGED",
             item_id=instance.id,
+            item_name=instance.name,
         )
 
 
 @receiver([post_save, post_delete], sender="stocks.StockMovement")
 def stock_movement_analytics_update(sender, instance, **kwargs):
     """
-    Broadcast whenever a stock movement changes or is created.
+    Broadcast whenever a stock movement changes, created, or deleted.
+    Calculates current stock balance, updates BranchStock, and transmits live to subscribers.
     """
+    branch_id = getattr(instance, "branch_id", None)
+    item_id = getattr(instance, "item_id", None)
+
+    if not branch_id or not item_id:
+        return
+
+    new_stock = 0.0
+    item_name = ""
+
+    try:
+        BranchItemPricing = apps.get_model("stocks", "BranchItemPricing")
+        BranchStock = apps.get_model("stocks", "BranchStock")
+
+        # 1. Fetch recalculated balance from BranchItemPricing property
+        pricing = BranchItemPricing.objects.filter(branch_id=branch_id, item_id=item_id).first()
+        if pricing:
+            new_stock = float(getattr(pricing, "remaining_stock", 0) or 0)
+
+        # 2. Sync to BranchStock for O(1) indexed database lookups
+        BranchStock.objects.update_or_create(
+            branch_id=branch_id,
+            item_id=item_id,
+            defaults={"quantity": Decimal(str(new_stock))}
+        )
+
+        item_name = getattr(instance.item, "name", "")
+    except Exception as e:
+        print(f"Error updating live stock level for broadcast: {e}")
+
     broadcast_to_branch(
-        instance.branch_id,
-        "STOCK_MOVEMENT_CHANGED",
+        branch_id,
+        "STOCK_UPDATED",
         movement_id=instance.id,
-        item_id=instance.item_id,
+        item_id=item_id,
+        item_name=item_name,
+        new_stock=new_stock,
+        remaining_stock=new_stock,
+        movement_type=getattr(instance, "movement_type", None),
+        quantity=float(getattr(instance, "quantity", 0) or 0),
     )
 
 
@@ -80,6 +126,8 @@ def sale_analytics_update(sender, instance, **kwargs):
             branch_id,
             "SALE_CHANGED",
             sale_id=instance.id,
+            total_amount=float(getattr(instance, "total_amount", 0) or 0),
+            payment_method=getattr(instance, "payment_method", "CASH"),
         )
 
 
@@ -121,7 +169,7 @@ def remove_stock_movement_on_sale_item_delete(sender, instance, **kwargs):
     if transaction_id and item_id:
         StockMovement = apps.get_model("stocks", "StockMovement")
         
-        # 1. Delete associated stock movement (this automatically restores calculated remaining_stock)
+        # 1. Delete associated stock movement
         StockMovement.objects.filter(
             item_id=item_id,
             movement_type=StockMovement.MovementType.SALE,
@@ -130,11 +178,11 @@ def remove_stock_movement_on_sale_item_delete(sender, instance, **kwargs):
 
         # 2. Recalculate WAC safely
         try:
-            recalculate_wac_sales_cost = apps.get_model("stocks", "BranchItemPricing")
-            branch_id = getattr(instance.transaction, "branch_id", None)
-            if branch_id:
+            branch = getattr(instance.transaction, "branch", None)
+            item = getattr(instance, "item", None)
+            if branch and item:
                 from stocks.models import recalculate_wac_sales_cost
-                recalculate_wac_sales_cost(instance.transaction.branch, instance.item)
+                recalculate_wac_sales_cost(branch, item)
         except Exception as e:
             print(f"Error recalculating WAC on SaleItem delete: {e}")
 
@@ -151,11 +199,15 @@ def expense_analytics_update(sender, instance, **kwargs):
             branch_id,
             "EXPENSE_CHANGED",
             expense_id=instance.id,
+            amount=float(getattr(instance, "amount", 0) or 0),
         )
 
 
 @receiver([post_save, post_delete], sender="stocks.CreditRepayment")
 def update_transaction_payment_status(sender, instance, **kwargs):
+    """
+    Updates parent SaleTransaction status and broadcasts repayment changes.
+    """
     SaleTransaction = apps.get_model("stocks", "SaleTransaction")
     CreditRepayment = apps.get_model("stocks", "CreditRepayment")
 
@@ -189,3 +241,14 @@ def update_transaction_payment_status(sender, instance, **kwargs):
             transaction.payment_method = repayment_method
 
     transaction.save(update_fields=["amount_paid", "is_paid", "payment_method"])
+
+    # 4. Broadcast live credit update over WebSocket
+    branch_id = getattr(transaction, "branch_id", None)
+    if branch_id:
+        broadcast_to_branch(
+            branch_id,
+            "CREDIT_REPAYMENT_UPDATED",
+            transaction_id=transaction.id,
+            amount_paid=float(total_repaid),
+            is_paid=is_fully_paid,
+        )
