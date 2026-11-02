@@ -8557,7 +8557,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     # 1. PROFIT & LOSS REPORT (/management-reports/profit-loss/)
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='profit-loss')
-        def profit_report(self, request):
+    def profit_report(self, request):
             try:
                 branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
