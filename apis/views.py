@@ -8562,20 +8562,15 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
             # -----------------------------------------------------------------
-            # 1. TOTAL REVENUE AGGREGATION (INCLUDES CASH, CREDIT & REPAYMENTS)
+            # 1. ACCRUAL REVENUE AGGREGATION (CASH + CREDIT SALES ISSUED)
             # -----------------------------------------------------------------
-            # Fetch all sales transactions regardless of payment type (Cash, Credit, Split, etc.)
+            # Include ALL SaleTransactions created during the period (Cash, Credit, Split)
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__date__gte=start_date,
                 sale_date__date__lte=end_date
             )
 
-            repayments_qs = CreditRepayment.objects.filter(
-                date__gte=start_date,
-                date__lte=end_date
-            )
-
-            # Exclude supplier repayments and inventory-related expenses from operating expenses
+            # Exclude supplier repayments from operating expenses
             expenses_qs = Expense.objects.filter(
                 date__gte=start_date,
                 date__lte=end_date
@@ -8585,44 +8580,20 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(
-                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
-                )
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-            # A) Find all transactions that have split entries
-            split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
-
-            # B) Single-Method Transactions (Includes CASH, CREDIT, PAYBILL, etc., excludes SPLIT)
-            non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
-            
-            single_sales_revenue = non_split_sales.aggregate(
+            # Total Sales Revenue (Accrual basis: includes both Cash and Credit sales issued in date range)
+            revenue = sales_qs.aggregate(
                 total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
             )['total']
 
-            # C) Split Payments (Includes CREDIT, PAYBILL, BANK, CASH, MPESA, SEND_MONEY, TILL)
-            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs)
-            
-            split_payments_revenue = split_payments_qs.aggregate(
-                total=Coalesce(
-                    Sum('amount'),
-                    ZERO,
-                    output_field=DecimalField()
-                )
-            )['total']
-
-            # D) Credit Repayments
-            repayments_revenue = repayments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            # Total Recognized Revenue
-            revenue = single_sales_revenue + split_payments_revenue + repayments_revenue
+            # NOTE: CreditRepayment is intentionally EXCLUDED here to prevent double-counting.
+            # Repayments only impact Cash Flow, not Profit & Loss.
 
             # -----------------------------------------------------------------
             # 2. COST OF GOODS SOLD (COGS) & OPERATING EXPENSES
             # -----------------------------------------------------------------
-            # Query ALL sale line items within period (including Credit Sales)
+            # Query ALL sale line items linked to the period's sales transactions
             items_qs = SaleItem.objects.filter(
                 transaction__in=sales_qs
             ).select_related('item', 'transaction')
@@ -8672,12 +8643,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "net_profit": float(quantize_money(net_profit)),
             }, status=status.HTTP_200_OK)
 
-        except Exception:
-            logger.exception("Profit Report Error")
-            return Response({
-                "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
-                "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
-            }, status=status.HTTP_200_OK)
+    except Exception:
+        logger.exception("Profit Report Error")
+        return Response({
+            "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
+            "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
+        }, status=status.HTTP_200_OK)
 
     # =========================================================================
     # 2. CASH FLOW REPORT (/management-reports/cash-flow/)
