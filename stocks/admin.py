@@ -691,43 +691,57 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
             super()
             .get_queryset(request)
             .select_related("branch", "customer", "created_by")
-            .prefetch_related("items")
         )
 
     @admin.display(description="Amount Paid", ordering="amount_paid")
     def display_amount_paid(self, obj):
-        val = obj.amount_paid or 0
-        return f"KSh {val:,.2f}"
+        try:
+            val = obj.amount_paid or 0
+            return f"KSh {val:,.2f}"
+        except Exception:
+            return "KSh 0.00"
 
     @admin.display(description="Total Amount", ordering="total_amount")
     def display_total_amount(self, obj):
-        val = obj.total_amount or 0
-        return f"KSh {val:,.2f}"
+        try:
+            val = obj.total_amount or 0
+            return f"KSh {val:,.2f}"
+        except Exception:
+            return "KSh 0.00"
 
     @admin.display(description="Total Cost")
     def display_total_cost(self, obj):
-        val = obj.total_cost or 0
-        return f"KSh {val:,.2f}"
+        try:
+            val = obj.total_cost or 0
+            return f"KSh {val:,.2f}"
+        except Exception:
+            return "KSh 0.00"
 
     @admin.display(description="Profit")
     def display_profit(self, obj):
-        val = obj.profit or 0
-        return f"KSh {val:,.2f}"
+        try:
+            val = (obj.total_amount or 0) - (obj.total_cost or 0)
+            return f"KSh {val:,.2f}"
+        except Exception:
+            return "KSh 0.00"
 
     @admin.display(description="Is Paid", ordering="is_paid")
     def status_icon(self, obj):
-        method = (obj.payment_method or "").strip().upper()
-        balance_due = (obj.total_amount or 0) - (obj.amount_paid or 0)
+        try:
+            method = (obj.payment_method or "").strip().upper()
+            balance_due = (obj.total_amount or 0) - (obj.amount_paid or 0)
 
-        if method in ["SPLIT", "SPLIT PAYMENT"]:
-            if balance_due > 0 or not obj.is_paid:
-                return mark_safe('<span style="color: #888888; font-weight: bold;">&#10004;</span>')
-            return mark_safe('<span style="color: #28a745; font-weight: bold;">&#10004;</span>')
+            if method in ["SPLIT", "SPLIT PAYMENT"]:
+                if balance_due > 0 or not obj.is_paid:
+                    return mark_safe('<span style="color: #888888; font-weight: bold;">&#10004;</span>')
+                return mark_safe('<span style="color: #28a745; font-weight: bold;">&#10004;</span>')
 
-        if obj.is_paid or balance_due <= 0:
-            return mark_safe('<span style="color: #28a745; font-weight: bold;">&#10004;</span>')
+            if obj.is_paid or balance_due <= 0:
+                return mark_safe('<span style="color: #28a745; font-weight: bold;">&#10004;</span>')
 
-        return mark_safe('<span style="color: #dc3545; font-weight: bold;">&#10008;</span>')
+            return mark_safe('<span style="color: #dc3545; font-weight: bold;">&#10008;</span>')
+        except Exception:
+            return mark_safe('<span style="color: #888888;">?</span>')
 
     @admin.action(description="Delete selected sale transactions safely")
     def delete_sales_safely(self, request, queryset):
@@ -735,20 +749,17 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
         receipt_numbers = list(queryset.exclude(receipt_number__isnull=True).values_list("receipt_number", flat=True))
 
         with transaction.atomic():
-            # 1. Clean up associated StockMovements
             StockMovement.objects.filter(reference_id__in=sale_ids, movement_type=StockMovement.MovementType.SALE).delete()
             StockMovement.objects.filter(reference__in=[f"SALE-{sid}" for sid in sale_ids]).delete()
             if receipt_numbers:
                 StockMovement.objects.filter(reference__in=[f"SALE-{r}" for r in receipt_numbers]).delete()
                 StockMovement.objects.filter(reference__in=receipt_numbers).delete()
 
-            # 2. Delete all related back-references before main model deletion
             CreditRepayment.objects.filter(transaction_id__in=sale_ids).delete()
             SalePayment.objects.filter(transaction_id__in=sale_ids).delete()
             Sale.objects.filter(transaction_id__in=sale_ids).delete()
             SaleItem.objects.filter(transaction_id__in=sale_ids).delete()
 
-            # 3. Direct QuerySet delete on SaleTransaction
             deleted_count, _ = SaleTransaction.objects.filter(id__in=sale_ids).delete()
 
         self.message_user(request, f"Successfully deleted {deleted_count} sale transaction record(s).")
