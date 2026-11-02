@@ -1,18 +1,16 @@
 import os
 from django.core.asgi import get_asgi_application
 
-# Ensure this matches your actual Django project package name
+# 1. Update this to match your exact settings package
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'myproject.settings')
 
-# Initialize Django ASGI application early to ensure AppRegistry is populated
-# before importing code that may use Django models/settings.
 django_asgi_app = get_asgi_application()
 
 from channels.auth import AuthMiddlewareStack
 from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.security.websocket import AllowedHostsOriginValidator
 
-import analytics.routing  # Import your WebSocket routing module
+import analytics.routing
 
 application = ProtocolTypeRouter({
     "http": django_asgi_app,
