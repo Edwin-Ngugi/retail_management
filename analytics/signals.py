@@ -111,35 +111,32 @@ def pending_approval_analytics_update(sender, instance, **kwargs):
 @receiver(post_delete, sender="stocks.SaleItem")
 def remove_stock_movement_on_sale_item_delete(sender, instance, **kwargs):
     """
-    Removes the associated StockMovement and restores item stock quantity 
-    in BranchItemPricing when a line item is removed.
+    Removes the associated StockMovement when a SaleItem line item is deleted.
+    Deleting the outbound SALE movement automatically restores remaining_stock
+    without modifying opening_stock.
     """
     transaction_id = getattr(instance, "transaction_id", None)
     item_id = getattr(instance, "item_id", None)
-    quantity = getattr(instance, "quantity_sold", None) or getattr(instance, "quantity", 0)
 
     if transaction_id and item_id:
         StockMovement = apps.get_model("stocks", "StockMovement")
         
-        # 1. Delete associated stock movement
+        # 1. Delete associated stock movement (this automatically restores calculated remaining_stock)
         StockMovement.objects.filter(
             item_id=item_id,
             movement_type=StockMovement.MovementType.SALE,
             reference_id=transaction_id,
         ).delete()
 
-        # 2. Add deleted quantity back to BranchItemPricing remaining_stock
-        BranchItemPricing = apps.get_model("stocks", "BranchItemPricing")
-        branch_id = getattr(instance.transaction, "branch_id", None)
-
-        if branch_id:
-            pricing = BranchItemPricing.objects.filter(
-                item_id=item_id, 
-                branch_id=branch_id
-            ).first()
-            if pricing and hasattr(pricing, "remaining_stock"):
-                pricing.remaining_stock = Decimal(str(pricing.remaining_stock or 0)) + Decimal(str(quantity))
-                pricing.save(update_fields=["remaining_stock"])
+        # 2. Recalculate WAC safely
+        try:
+            recalculate_wac_sales_cost = apps.get_model("stocks", "BranchItemPricing")
+            branch_id = getattr(instance.transaction, "branch_id", None)
+            if branch_id:
+                from stocks.models import recalculate_wac_sales_cost
+                recalculate_wac_sales_cost(instance.transaction.branch, instance.item)
+        except Exception as e:
+            print(f"Error recalculating WAC on SaleItem delete: {e}")
 
 
 @receiver([post_save, post_delete], sender="stocks.Expense")

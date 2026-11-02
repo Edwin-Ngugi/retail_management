@@ -1,79 +1,71 @@
 import os
+import sys
 import django
-from decimal import Decimal
-from django.db import transaction
 
-# Initialize Django environment
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'my.settings')  # Adjust if settings module differs
+# 1. Add project root directory to Python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# 2. Point to your Django settings module
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+
+# 3. Initialize Django setup
 django.setup()
 
-from stocks.models import Purchase, PurchaseOrder, PurchaseOrderItem
+# 4. Imports after django.setup()
+from django.db import transaction
+from stocks.models import (
+    SaleTransaction,
+    SaleItem,
+    SalePayment,
+    Sale,
+    CreditRepayment,
+    StockMovement,
+)
 
-@transaction.atomic
-def create_parent_purchase_orders():
-    # -------------------------------------------------------------------------
-    # 1. Migrate Group 1 (PO-93 to PO-105) -> PO-20261002-BATCH01
-    # -------------------------------------------------------------------------
-    group1_po_num = "PO-20261002-BATCH01"
-    purchases_g1 = Purchase.objects.filter(id__in=range(93, 106))
 
-    if purchases_g1.exists():
-        first_p = purchases_g1.first()
-        po1, created = PurchaseOrder.objects.get_or_create(
-            po_number=group1_po_num,
-            defaults={
-                'branch': first_p.branch,
-                'supplier': first_p.supplier,
-                'supplier_name': first_p.supplier_name or (first_p.supplier.name if first_p.supplier else "Direct Supplier"),
-                'payment_method': first_p.payment_method,
-                'purchase_date': first_p.purchase_date,
-                'created_by': first_p.created_by,
-            }
-        )
+def run_deletion():
+    # Exact Primary Keys matching your output:
+    target_ids = [1261, 1262]
 
-        for p in purchases_g1:
-            PurchaseOrderItem.objects.get_or_create(
-                purchase_order=po1,
-                item=p.item,
-                defaults={
-                    'quantity': p.quantity,
-                    'unit_cost_price': p.unit_cost_price,
-                }
-            )
-        po1.recalculate_totals()
-        print(f"✅ Group 1 created in PurchaseOrder table: '{group1_po_num}' (Total: KSh {po1.total_amount}).")
+    sales = SaleTransaction.objects.filter(id__in=target_ids)
 
-    # -------------------------------------------------------------------------
-    # 2. Migrate Group 2 (PO-84 to PO-92) -> PO-20261001-BATCH02
-    # -------------------------------------------------------------------------
-    group2_po_num = "PO-20261001-BATCH02"
-    purchases_g2 = Purchase.objects.filter(id__in=range(84, 93))
+    if not sales.exists():
+        print("No matching transactions found for IDs:", target_ids)
+        return
 
-    if purchases_g2.exists():
-        first_p = purchases_g2.first()
-        po2, created = PurchaseOrder.objects.get_or_create(
-            po_number=group2_po_num,
-            defaults={
-                'branch': first_p.branch,
-                'supplier': first_p.supplier,
-                'supplier_name': first_p.supplier_name or (first_p.supplier.name if first_p.supplier else "Direct Supplier"),
-                'payment_method': first_p.payment_method,
-                'purchase_date': first_p.purchase_date,
-                'created_by': first_p.created_by,
-            }
-        )
+    found_list = list(sales.values("id", "receipt_number"))
+    print(f"Found {len(found_list)} transaction(s) to delete: {found_list}")
 
-        for p in purchases_g2:
-            PurchaseOrderItem.objects.get_or_create(
-                purchase_order=po2,
-                item=p.item,
-                defaults={
-                    'quantity': p.quantity,
-                    'unit_cost_price': p.unit_cost_price,
-                }
-            )
-        po2.recalculate_totals()
-        print(f"✅ Group 2 created in PurchaseOrder table: '{group2_po_num}' (Total: KSh {po2.total_amount}).")
+    sale_ids = [item["id"] for item in found_list]
+    receipt_nos = [item["receipt_number"] for item in found_list if item["receipt_number"]]
+
+    with transaction.atomic():
+        # 1. Clean up Stock Movements
+        StockMovement.objects.filter(
+            reference_id__in=sale_ids,
+            movement_type=StockMovement.MovementType.SALE,
+        ).delete()
+        StockMovement.objects.filter(
+            reference__in=[f"SALE-{sid}" for sid in sale_ids]
+        ).delete()
+
+        if receipt_nos:
+            StockMovement.objects.filter(
+                reference__in=[f"SALE-{r}" for r in receipt_nos]
+            ).delete()
+            StockMovement.objects.filter(reference__in=receipt_nos).delete()
+
+        # 2. Direct QuerySet deletions on dependent models
+        CreditRepayment.objects.filter(transaction_id__in=sale_ids).delete()
+        SalePayment.objects.filter(transaction_id__in=sale_ids).delete()
+        Sale.objects.filter(transaction_id__in=sale_ids).delete()
+        SaleItem.objects.filter(transaction_id__in=sale_ids).delete()
+
+        # 3. Direct QuerySet deletion on SaleTransaction parent records
+        deleted_count, _ = SaleTransaction.objects.filter(id__in=sale_ids).delete()
+
+    print(f"\nSUCCESS: Deleted {deleted_count} sale transaction(s) and all dependent records!")
+
 
 if __name__ == "__main__":
-    create_parent_purchase_orders()
+    run_deletion()
