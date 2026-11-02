@@ -1451,26 +1451,27 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
         payment_method = _normalize_payment_method(validated_data.get("payment_method", "CASH"))
         validated_data["payment_method"] = payment_method
 
-        # Resolve Customer (Debtor vs Walk-in)
+        # 1. Resolve Customer & Preserve UI Customer Name Input
         customer_input = validated_data.pop("customer", None)
+        customer_name_from_ui = validated_data.get("customer_name")
         retailer = getattr(branch, "retailer", None)
         customer_obj = _resolve_customer(customer_input, retailer=retailer)
 
         if payment_method == "CREDIT":
             if not customer_obj:
-                cust_name = validated_data.get("customer_name") or "Walk-in Debtor"
+                cust_name = customer_name_from_ui or "Walk-in Debtor"
                 customer_obj, _ = Customer.objects.get_or_create(
                     retailer=retailer,
                     name=cust_name,
                     defaults={"phone_number": validated_data.get("customer_phone") or ""}
                 )
             validated_data["customer"] = customer_obj
-            validated_data["customer_name"] = customer_obj.name
+            validated_data["customer_name"] = customer_name_from_ui or customer_obj.name
             validated_data["customer_phone"] = customer_obj.phone_number or ""
         else:
             validated_data["customer"] = customer_obj
             validated_data["customer_name"] = (
-                validated_data.get("customer_name")
+                customer_name_from_ui
                 or (customer_obj.name if customer_obj else "Walk-in Customer")
             )
 
@@ -1480,18 +1481,24 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
         if user and "created_by" not in validated_data:
             validated_data["created_by"] = user
 
-        if not validated_data.get("receipt_number"):
-            validated_data["receipt_number"] = generate_document_number(
-                is_credit=(payment_method == "CREDIT")
-            )
+        # 2. Preserve UI-supplied Invoice Number / Receipt Number
+        custom_invoice_no = validated_data.get("invoice_number") or validated_data.get("receipt_number")
+        if custom_invoice_no and str(custom_invoice_no).strip():
+            validated_data["invoice_number"] = str(custom_invoice_no).strip()
+            validated_data["receipt_number"] = str(custom_invoice_no).strip()
+        else:
+            generated_no = generate_document_number(is_credit=(payment_method == "CREDIT"))
+            validated_data["receipt_number"] = generated_no
+            if not validated_data.get("invoice_number"):
+                validated_data["invoice_number"] = generated_no
 
         try:
-            # 1. Instantiate SaleTransaction Header
+            # 3. Instantiate SaleTransaction Header
             transaction_obj = SaleTransaction.objects.create(**validated_data)
 
             computed_total = ZERO
 
-            # 2. Process Line Items (SaleItem.save() handles StockMovement & WAC automatically)
+            # 4. Process Line Items (SaleItem.save() handles StockMovement & WAC automatically)
             for item_data in items_data:
                 item_id = item_data.get("item")
                 item = Item.objects.filter(pk=item_id).first() if isinstance(item_id, int) else item_id
@@ -1521,7 +1528,7 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
                     pricing.remaining_stock = max(0, pricing.remaining_stock - int(qty_sold))
                     pricing.save(update_fields=["remaining_stock"])
 
-            # 3. Always recalculate total_amount directly from computed items to prevent data inflation
+            # 5. Always recalculate total_amount directly from computed items to prevent data inflation
             transaction_obj.total_amount = computed_total
 
             if payment_method == "CREDIT":
@@ -1533,7 +1540,7 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
 
             transaction_obj.save(update_fields=["total_amount", "amount_paid", "is_paid"])
 
-            # 4. Handle Split Payments
+            # 6. Handle Split Payments
             if payment_method == "SPLIT" and payments_data:
                 paid_sum = ZERO
                 for p_data in payments_data:
