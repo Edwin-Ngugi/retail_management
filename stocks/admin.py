@@ -1007,7 +1007,7 @@ class SupplierPaymentAdmin(TenantAwareModelAdmin):
         "purchase__supplier_name",
     )
     ordering = ("-created_at",)
-from .models import PurchaseOrder, PurchaseOrderItem
+
 
 class PurchaseOrderItemInline(admin.TabularInline):
     model = PurchaseOrderItem
@@ -1219,14 +1219,15 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
         receipt_numbers = list(queryset.exclude(receipt_number__isnull=True).values_list("receipt_number", flat=True))
 
         with transaction.atomic():
-            # 1. Clean up StockMovements using direct QuerySet delete (bypasses model delete signals)
+            # Clean up StockMovements using direct QuerySet delete (bypasses model delete signals)
             StockMovement.objects.filter(reference_id__in=sale_ids, movement_type=StockMovement.MovementType.SALE).delete()
             StockMovement.objects.filter(reference__in=[f"SALE-{sid}" for sid in sale_ids]).delete()
             if receipt_numbers:
                 StockMovement.objects.filter(reference__in=[f"SALE-{r}" for r in receipt_numbers]).delete()
                 StockMovement.objects.filter(reference__in=receipt_numbers).delete()
 
-            # 2. Direct QuerySet delete on child models
+            # Direct QuerySet delete on child/dependent models to prevent foreign key errors
+            CreditRepayment.objects.filter(transaction_id__in=sale_ids).delete()
             SaleItem.objects.filter(transaction_id__in=sale_ids).delete()
             
             # Delete split payments if model exists
@@ -1236,10 +1237,10 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
             except (ImportError, AttributeError):
                 pass
 
-            # 3. Direct QuerySet delete on SaleTransaction
+            # Direct QuerySet delete on SaleTransaction
             deleted_count, _ = SaleTransaction.objects.filter(id__in=sale_ids).delete()
 
-        self.message_user(request, f"Successfully deleted {deleted_count} sale transaction records.")
+        self.message_user(request, f"Successfully deleted {deleted_count} sale transaction record(s).")
 
     def get_actions(self, request):
         actions = super().get_actions(request)
@@ -1255,7 +1256,15 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
                 StockMovement.objects.filter(reference=f"SALE-{obj.receipt_number}").delete()
                 StockMovement.objects.filter(reference=obj.receipt_number).delete()
 
+            CreditRepayment.objects.filter(transaction=obj).delete()
             SaleItem.objects.filter(transaction=obj).delete()
+            
+            try:
+                from stocks.models import SalePayment
+                SalePayment.objects.filter(transaction=obj).delete()
+            except (ImportError, AttributeError):
+                pass
+
             SaleTransaction.objects.filter(pk=obj.pk).delete()
 
     def delete_queryset(self, request, queryset):
