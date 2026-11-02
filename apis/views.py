@@ -8557,98 +8557,90 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     # 1. PROFIT & LOSS REPORT (/management-reports/profit-loss/)
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='profit-loss')
-    def profit_report(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+        def profit_report(self, request):
+            try:
+                branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # -----------------------------------------------------------------
-            # 1. ACCRUAL REVENUE AGGREGATION (CASH + CREDIT SALES ISSUED)
-            # -----------------------------------------------------------------
-            # Include ALL SaleTransactions created during the period (Cash, Credit, Split)
-            sales_qs = SaleTransaction.objects.filter(
-                sale_date__date__gte=start_date,
-                sale_date__date__lte=end_date
-            )
+                # 1. ACCRUAL REVENUE AGGREGATION (CASH + CREDIT SALES ISSUED)
+                sales_qs = SaleTransaction.objects.filter(
+                    sale_date__date__gte=start_date,
+                    sale_date__date__lte=end_date
+                )
 
-            # Exclude supplier repayments from operating expenses
-            expenses_qs = Expense.objects.filter(
-                date__gte=start_date,
-                date__lte=end_date
-            ).exclude(
-                description__icontains='Supplier Repayment'
-            )
+                expenses_qs = Expense.objects.filter(
+                    date__gte=start_date,
+                    date__lte=end_date
+                ).exclude(
+                    description__icontains='Supplier Repayment'
+                )
 
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
+                if branch_obj:
+                    sales_qs = sales_qs.filter(branch=branch_obj)
+                    expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-            # Total Sales Revenue (Accrual basis: includes both Cash and Credit sales issued in date range)
-            revenue = sales_qs.aggregate(
-                total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
-            )['total']
+                revenue = sales_qs.aggregate(
+                    total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
+                )['total']
 
-            # NOTE: CreditRepayment is intentionally EXCLUDED here to prevent double-counting.
-            # Repayments only impact Cash Flow, not Profit & Loss.
+                # 2. COST OF GOODS SOLD (COGS)
+                items_qs = SaleItem.objects.filter(
+                    transaction__in=sales_qs
+                ).select_related('item', 'transaction')
 
-            # -----------------------------------------------------------------
-            # 2. COST OF GOODS SOLD (COGS) & OPERATING EXPENSES
-            # -----------------------------------------------------------------
-            # Query ALL sale line items linked to the period's sales transactions
-            items_qs = SaleItem.objects.filter(
-                transaction__in=sales_qs
-            ).select_related('item', 'transaction')
+                cogs_expr = ExpressionWrapper(
+                    F('quantity_sold') * F('unit_cost_price'),
+                    output_field=DecimalField(max_digits=12, decimal_places=2)
+                )
+                
+                direct_cogs = items_qs.filter(unit_cost_price__gt=0).aggregate(
+                    total=Coalesce(Sum(cogs_expr), ZERO, output_field=DecimalField())
+                )['total']
 
-            # Expression for direct item unit_cost_price calculation
-            cogs_expr = ExpressionWrapper(
-                F('quantity_sold') * F('unit_cost_price'),
-                output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-            
-            # Calculate COGS for items with valid unit_cost_price > 0
-            direct_cogs = items_qs.filter(unit_cost_price__gt=0).aggregate(
-                total=Coalesce(Sum(cogs_expr), ZERO, output_field=DecimalField())
-            )['total']
+                cogs = direct_cogs
 
-            cogs = direct_cogs
+                zero_cost_items = items_qs.filter(Q(unit_cost_price=0) | Q(unit_cost_price__isnull=True))
 
-            # Fallback for line items saved with 0.00 unit_cost_price (look up current BranchItemPricing cost)
-            zero_cost_items = items_qs.filter(Q(unit_cost_price=0) | Q(unit_cost_price__isnull=True))
+                for line in zero_cost_items:
+                    b_id = line.transaction.branch_id
+                    pricing = BranchItemPricing.objects.filter(branch_id=b_id, item=line.item).first()
+                    cost_unit = pricing.unit_cost_price if (pricing and pricing.unit_cost_price > 0) else ZERO
+                    cogs += Decimal(str(line.quantity_sold or 0)) * Decimal(str(cost_unit))
 
-            for line in zero_cost_items:
-                b_id = line.transaction.branch_id
-                pricing = BranchItemPricing.objects.filter(branch_id=b_id, item=line.item).first()
-                cost_unit = pricing.unit_cost_price if (pricing and pricing.unit_cost_price > 0) else ZERO
-                cogs += Decimal(str(line.quantity_sold or 0)) * Decimal(str(cost_unit))
+                gross_profit = revenue - cogs
+                
+                operating_expenses = expenses_qs.aggregate(
+                    total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+                )['total']
 
-            gross_profit = revenue - cogs
-            
-            # Pure Operating Expenses (OpEx only, excluding supplier repayments)
-            operating_expenses = expenses_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
+                operating_profit = gross_profit - operating_expenses
 
-            operating_profit = gross_profit - operating_expenses
+                finance_costs_and_tax = ZERO
+                net_profit = operating_profit - finance_costs_and_tax
 
-            finance_costs_and_tax = ZERO
-            net_profit = operating_profit - finance_costs_and_tax
+                return Response({
+                    "period": start_date.strftime('%B %Y') if start_date.month == end_date.month else f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
+                    "revenue": float(quantize_money(revenue)),
+                    "cogs": float(quantize_money(cogs)),
+                    "gross_profit": float(quantize_money(gross_profit)),
+                    "operating_expenses": float(quantize_money(operating_expenses)),
+                    "operating_profit": float(quantize_money(operating_profit)),
+                    "finance_costs_and_tax": float(quantize_money(finance_costs_and_tax)),
+                    "net_profit": float(quantize_money(net_profit)),
+                }, status=status.HTTP_200_OK)
 
+            except Exception as e:
+                logger.exception("Profit Report Error")
+                return Response({
+                    "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
+                    "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
+                }, status=status.HTTP_200_OK)
+
+        except Exception:
+            logger.exception("Profit Report Error")
             return Response({
-                "period": start_date.strftime('%B %Y') if start_date.month == end_date.month else f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
-                "revenue": float(quantize_money(revenue)),
-                "cogs": float(quantize_money(cogs)),
-                "gross_profit": float(quantize_money(gross_profit)),
-                "operating_expenses": float(quantize_money(operating_expenses)),
-                "operating_profit": float(quantize_money(operating_profit)),
-                "finance_costs_and_tax": float(quantize_money(finance_costs_and_tax)),
-                "net_profit": float(quantize_money(net_profit)),
+                "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
+                "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
             }, status=status.HTTP_200_OK)
-
-    except Exception:
-        logger.exception("Profit Report Error")
-        return Response({
-            "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
-            "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
-        }, status=status.HTTP_200_OK)
 
     # =========================================================================
     # 2. CASH FLOW REPORT (/management-reports/cash-flow/)
