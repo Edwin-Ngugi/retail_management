@@ -8562,13 +8562,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
             # -----------------------------------------------------------------
-            # 1. CASH-BASIS REVENUE AGGREGATION
+            # 1. TOTAL REVENUE AGGREGATION (INCLUDES CASH, CREDIT & REPAYMENTS)
             # -----------------------------------------------------------------
+            # Fetch all sales transactions regardless of payment type (Cash, Credit, Split, etc.)
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__date__gte=start_date,
                 sale_date__date__lte=end_date
-            ).exclude(
-                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
 
             repayments_qs = CreditRepayment.objects.filter(
@@ -8594,24 +8593,19 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # A) Find all transactions that have split entries
             split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
 
-            # B) Single-Method Transactions (Excludes any sale present in SalePayment table or marked SPLIT)
+            # B) Single-Method Transactions (Includes CASH, CREDIT, PAYBILL, etc., excludes SPLIT)
             non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
             
             single_sales_revenue = non_split_sales.aggregate(
                 total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
             )['total']
 
-            # C) Split Payments (Excludes CREDIT, routes PAYBILL/BANK, MPESA/SEND_MONEY/TILL, and CASH)
-            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs).exclude(method='CREDIT')
+            # C) Split Payments (Includes CREDIT, PAYBILL, BANK, CASH, MPESA, SEND_MONEY, TILL)
+            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs)
             
             split_payments_revenue = split_payments_qs.aggregate(
                 total=Coalesce(
-                    Sum(
-                        'amount',
-                        filter=Q(method__icontains='PAYBILL') | 
-                               Q(method__icontains='BANK') | 
-                               Q(method__in=['CASH', 'MPESA', 'SEND_MONEY', 'TILL'])
-                    ),
+                    Sum('amount'),
                     ZERO,
                     output_field=DecimalField()
                 )
@@ -8622,26 +8616,38 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
 
+            # Total Recognized Revenue
             revenue = single_sales_revenue + split_payments_revenue + repayments_revenue
 
             # -----------------------------------------------------------------
-            # 2. COST OF GOODS SOLD & OPERATING EXPENSES
+            # 2. COST OF GOODS SOLD (COGS) & OPERATING EXPENSES
             # -----------------------------------------------------------------
+            # Query ALL sale line items within period (including Credit Sales)
             items_qs = SaleItem.objects.filter(
-                transaction__sale_date__date__gte=start_date,
-                transaction__sale_date__date__lte=end_date
-            ).exclude(
-                Q(transaction__payment_method='CREDIT') | Q(transaction__receipt_number__startswith='INV')
-            )
+                transaction__in=sales_qs
+            ).select_related('item', 'transaction')
 
-            if branch_obj:
-                items_qs = items_qs.filter(transaction__branch=branch_obj)
-
+            # Expression for direct item unit_cost_price calculation
             cogs_expr = ExpressionWrapper(
                 F('quantity_sold') * F('unit_cost_price'),
                 output_field=DecimalField(max_digits=12, decimal_places=2)
             )
-            cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO, output_field=DecimalField()))['total']
+            
+            # Calculate COGS for items with valid unit_cost_price > 0
+            direct_cogs = items_qs.filter(unit_cost_price__gt=0).aggregate(
+                total=Coalesce(Sum(cogs_expr), ZERO, output_field=DecimalField())
+            )['total']
+
+            cogs = direct_cogs
+
+            # Fallback for line items saved with 0.00 unit_cost_price (look up current BranchItemPricing cost)
+            zero_cost_items = items_qs.filter(Q(unit_cost_price=0) | Q(unit_cost_price__isnull=True))
+
+            for line in zero_cost_items:
+                b_id = line.transaction.branch_id
+                pricing = BranchItemPricing.objects.filter(branch_id=b_id, item=line.item).first()
+                cost_unit = pricing.unit_cost_price if (pricing and pricing.unit_cost_price > 0) else ZERO
+                cogs += Decimal(str(line.quantity_sold or 0)) * Decimal(str(cost_unit))
 
             gross_profit = revenue - cogs
             
