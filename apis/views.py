@@ -6829,25 +6829,23 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # 2. FINANCIAL PERFORMANCE METRICS
             # -----------------------------------------------------------------
-            total_sales = sales_qs.aggregate(
-                total=Coalesce(Sum('total_amount'), ZERO)
-            )['total'] or ZERO
+            sales_agg = sales_qs.aggregate(total=Sum('total_amount'))
+            total_sales = quantize_money(sales_agg['total'] or ZERO)
 
-            cogs = SaleItem.objects.filter(
+            cogs_agg = SaleItem.objects.filter(
                 transaction__in=sales_qs
             ).aggregate(
-                total=Coalesce(
-                    Sum(
-                        ExpressionWrapper(
-                            F('quantity_sold') * F('unit_cost_price'),
-                            output_field=models.DecimalField(max_digits=12, decimal_places=2)
-                        )
-                    ),
-                    ZERO
+                total=Sum(
+                    ExpressionWrapper(
+                        F('quantity_sold') * F('unit_cost_price'),
+                        output_field=models.DecimalField(max_digits=12, decimal_places=2)
+                    )
                 )
-            )['total'] or ZERO
+            )
+            cogs = quantize_money(cogs_agg['total'] or ZERO)
 
-            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total'] or ZERO
+            expenses_agg = expenses_qs.aggregate(total=Sum('amount'))
+            operating_expenses = quantize_money(expenses_agg['total'] or ZERO)
 
             gross_profit = total_sales - cogs
             net_profit = gross_profit - operating_expenses
@@ -6958,16 +6956,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             for c_sale in all_credit_sales.prefetch_related("split_payments"):
                 gross_credit_issued += get_sale_credit_amt(c_sale, all_credit_ids)
 
-            # Lifetime total recovered customer credit repayments
-            total_recovered_lifetime = base_credit_repay_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO)
-            )['total'] or ZERO
+            # Lifetime cumulative recovered receivables across all dates
+            repay_agg_lifetime = base_credit_repay_qs.aggregate(total=Sum('amount'))
+            total_recovered_lifetime = quantize_money(repay_agg_lifetime['total'] or ZERO)
 
-            all_repayments_to_date = base_credit_repay_qs.filter(
+            repay_agg_to_date = base_credit_repay_qs.filter(
                 Q(date__lte=end_date) | Q(created_at__lte=end_dt)
-            ).aggregate(
-                total=Coalesce(Sum('amount'), ZERO)
-            )['total'] or ZERO
+            ).aggregate(total=Sum('amount'))
+            all_repayments_to_date = quantize_money(repay_agg_to_date['total'] or ZERO)
 
             total_customer_debtors = max(ZERO, gross_credit_issued - all_repayments_to_date)
 
@@ -7012,15 +7008,15 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # 5. PURCHASES & OUTFLOWS
             # -----------------------------------------------------------------
-            direct_purchases = purchases_qs.exclude(
+            dir_purch_agg = purchases_qs.exclude(
                 payment_method='CREDIT'
             ).filter(
                 supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
+            ).aggregate(total=Sum('amount_paid'))
+            direct_purchases = quantize_money(dir_purch_agg['total'] or ZERO)
 
-            supplier_repayments = supplier_payments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO)
-            )['total'] or ZERO
+            supp_pmt_agg = supplier_payments_qs.aggregate(total=Sum('amount'))
+            supplier_repayments = quantize_money(supp_pmt_agg['total'] or ZERO)
 
             purchases_total = direct_purchases + supplier_repayments
             available_funds = actual_cash_receipts - operating_expenses - purchases_total
@@ -7030,30 +7026,30 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             trajectory_data = []
 
-            # Group sales for chart rendering
-            daily_sales = sales_qs.annotate(
-                period_key=TruncDate('sale_date')
-            ).values('period_key').annotate(
-                day_sales=Coalesce(Sum('total_amount'), ZERO)
-            ).order_by('period_key')
+            # Python-level safe grouping to avoid database function import errors
+            sales_by_date = {}
+            for sale in sales_qs:
+                s_date = getattr(sale, 'sale_date', None)
+                if s_date:
+                    d_key = s_date.strftime('%b %d') if hasattr(s_date, 'strftime') else str(s_date)[:10]
+                    sales_by_date[d_key] = sales_by_date.get(d_key, ZERO) + quantize_money(sale.total_amount or ZERO)
 
-            if daily_sales.exists():
-                for item in daily_sales:
-                    if item['period_key']:
-                        day_s = item['day_sales'] or ZERO
-                        ratio = (day_s / total_sales) if total_sales > ZERO else Decimal('0.00')
-                        day_cogs = quantize_money(cogs * ratio)
-                        day_net = quantize_money(net_profit * ratio)
-                        
-                        trajectory_data.append({
-                            "date": item['period_key'].strftime('%b %d'),
-                            "total_sales": float(day_s),
-                            "cogs": float(day_cogs),
-                            "net_profit": float(day_net)
-                        })
+            if sales_by_date:
+                for date_str, day_s in sales_by_date.items():
+                    ratio = (day_s / total_sales) if total_sales > ZERO else ZERO
+                    day_cogs = quantize_money(cogs * ratio)
+                    day_net = quantize_money(net_profit * ratio)
+                    
+                    trajectory_data.append({
+                        "date": date_str,
+                        "total_sales": float(day_s),
+                        "cogs": float(day_cogs),
+                        "net_profit": float(day_net)
+                    })
             else:
+                formatted_label = start_date.strftime('%b %d') if hasattr(start_date, 'strftime') else str(start_date)
                 trajectory_data.append({
-                    "date": start_date.strftime('%b %d') if hasattr(start_date, 'strftime') else str(start_date),
+                    "date": formatted_label,
                     "total_sales": float(total_sales),
                     "cogs": float(cogs),
                     "net_profit": float(net_profit)
