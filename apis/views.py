@@ -6736,7 +6736,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
 
-            # --- Internal Inline Helpers to prevent AttributeError ---
+            # --- Internal Inline Helpers ---
             def extract_split_payments(sale_obj):
                 relation = getattr(sale_obj, "split_payments", None) or getattr(sale_obj, "payments", None)
                 if relation is not None:
@@ -6831,7 +6831,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             total_sales = sales_qs.aggregate(
                 total=Coalesce(Sum('total_amount'), ZERO)
-            )['total']
+            )['total'] or ZERO
 
             cogs = SaleItem.objects.filter(
                 transaction__in=sales_qs
@@ -6845,9 +6845,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     ),
                     ZERO
                 )
-            )['total']
+            )['total'] or ZERO
 
-            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total'] or ZERO
 
             gross_profit = total_sales - cogs
             net_profit = gross_profit - operating_expenses
@@ -6938,7 +6938,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 other_total
             )
 
-            # Receivables calculation (Cumulative Recovered Receivables)
+            # Receivables Calculation (Cumulative Lifetime Recovered Receivables)
             st_credit_filter = (
                 Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) |
                 Q(payment_method='Credit') |
@@ -6958,14 +6958,16 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             for c_sale in all_credit_sales.prefetch_related("split_payments"):
                 gross_credit_issued += get_sale_credit_amt(c_sale, all_credit_ids)
 
-            # Cumulative Repayments Log (Lifetime Recovered Receivables)
+            # Lifetime total recovered customer credit repayments
             total_recovered_lifetime = base_credit_repay_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO)
-            )['total']
+            )['total'] or ZERO
 
-            all_repayments_to_date = base_credit_repay_qs.filter(date__lte=end_date).aggregate(
+            all_repayments_to_date = base_credit_repay_qs.filter(
+                Q(date__lte=end_date) | Q(created_at__lte=end_dt)
+            ).aggregate(
                 total=Coalesce(Sum('amount'), ZERO)
-            )['total']
+            )['total'] or ZERO
 
             total_customer_debtors = max(ZERO, gross_credit_issued - all_repayments_to_date)
 
@@ -7014,44 +7016,72 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 payment_method='CREDIT'
             ).filter(
                 supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total'] or ZERO
 
             supplier_repayments = supplier_payments_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO)
-            )['total']
+            )['total'] or ZERO
 
             purchases_total = direct_purchases + supplier_repayments
             available_funds = actual_cash_receipts - operating_expenses - purchases_total
 
             # -----------------------------------------------------------------
-            # 6. DYNAMIC TRAJECTORY GENERATION BY PERIOD TYPE
+            # 6. SAFE TRAJECTORY COMPUTATION
             # -----------------------------------------------------------------
             trajectory_data = []
-            tz = timezone.get_current_timezone()
+
+            # Group sales for chart rendering
+            daily_sales = sales_qs.annotate(
+                period_key=TruncDate('sale_date')
+            ).values('period_key').annotate(
+                day_sales=Coalesce(Sum('total_amount'), ZERO)
+            ).order_by('period_key')
+
+            if daily_sales.exists():
+                for item in daily_sales:
+                    if item['period_key']:
+                        day_s = item['day_sales'] or ZERO
+                        ratio = (day_s / total_sales) if total_sales > ZERO else Decimal('0.00')
+                        day_cogs = quantize_money(cogs * ratio)
+                        day_net = quantize_money(net_profit * ratio)
+                        
+                        trajectory_data.append({
+                            "date": item['period_key'].strftime('%b %d'),
+                            "total_sales": float(day_s),
+                            "cogs": float(day_cogs),
+                            "net_profit": float(day_net)
+                        })
+            else:
+                trajectory_data.append({
+                    "date": start_date.strftime('%b %d') if hasattr(start_date, 'strftime') else str(start_date),
+                    "total_sales": float(total_sales),
+                    "cogs": float(cogs),
+                    "net_profit": float(net_profit)
+                })
 
             # Construct Payload Response
             response_payload = {
                 "profitability": {
-                    "total_sales": total_sales,
+                    "total_sales": float(total_sales),
                     "total_sales_formatted": f"KSh {total_sales:,.2f}",
-                    "cogs": cogs,
+                    "cogs": float(cogs),
                     "cogs_formatted": f"KSh {cogs:,.2f}",
-                    "gross_profit": gross_profit,
+                    "gross_profit": float(gross_profit),
                     "gross_profit_formatted": f"KSh {gross_profit:,.2f}",
-                    "operating_expenses": operating_expenses,
+                    "operating_expenses": float(operating_expenses),
                     "operating_expenses_formatted": f"KSh {operating_expenses:,.2f}",
-                    "net_profit": net_profit,
+                    "net_profit": float(net_profit),
                     "net_profit_formatted": f"KSh {net_profit:,.2f}",
                 },
                 "debtors": {
-                    "total_customer_debts": total_customer_debtors,
+                    "total_customer_debts": float(total_customer_debtors),
                     "total_customer_debts_formatted": f"KSh {total_customer_debtors:,.2f}",
-                    "total_recovered": total_recovered_lifetime,
+                    "total_recovered": float(total_recovered_lifetime),
                     "total_recovered_formatted": f"KSh {total_recovered_lifetime:,.2f}",
                     "unpaid_count": base_sales_qs.filter(st_credit_filter, balance_due__gt=ZERO).count(),
                 },
                 "inventory": {
-                    "total_stock_value": total_stock_value,
+                    "total_stock_value": float(total_stock_value),
                     "total_stock_value_formatted": f"KSh {total_stock_value:,.2f}",
                     "product_skus": total_cataloged_skus,
                     "low_stock_items": low_stock_count,
@@ -7059,13 +7089,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "active_skus": active_skus_count,
                 },
                 "cash_flow": {
-                    "receipts": actual_cash_receipts,
+                    "receipts": float(actual_cash_receipts),
                     "receipts_formatted": f"KSh {actual_cash_receipts:,.2f}",
-                    "payments": operating_expenses,
+                    "payments": float(operating_expenses),
                     "payments_formatted": f"KSh {operating_expenses:,.2f}",
-                    "purchases": purchases_total,
+                    "purchases": float(purchases_total),
                     "purchases_formatted": f"KSh {purchases_total:,.2f}",
-                    "total_available_funds": available_funds,
+                    "total_available_funds": float(available_funds),
                     "total_available_funds_formatted": f"KSh {available_funds:,.2f}",
                 },
                 "trajectory": trajectory_data,
@@ -7076,164 +7106,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         except Exception as e:
             logger.error(f"Error in dashboard_cards view: {str(e)}", exc_info=True)
             return Response(
-                {"detail": "Failed to calculate dashboard card metrics."},
+                {"detail": f"Failed to calculate dashboard card metrics: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
-            def append_trajectory_point(label, full_date, sales_qs_for_bucket,
-                                        expenses_qs_for_bucket, bucket_type):
-                bucket_sales = sales_qs_for_bucket.aggregate(
-                    sales=Coalesce(Sum('total_amount'), ZERO)
-                )['sales']
-
-                bucket_cogs = SaleItem.objects.filter(
-                    transaction__in=sales_qs_for_bucket
-                ).aggregate(
-                    cogs=Coalesce(
-                        Sum(
-                            ExpressionWrapper(
-                                F('quantity_sold') * F('unit_cost_price'),
-                                output_field=models.DecimalField(max_digits=12, decimal_places=2)
-                            )
-                        ),
-                        ZERO
-                    )
-                )['cogs']
-
-                bucket_expenses = expenses_qs_for_bucket.aggregate(tot=Coalesce(Sum('amount'), ZERO))['tot']
-
-                trajectory_data.append({
-                    "date": label,
-                    "full_date": full_date.isoformat(),
-                    "bucket_type": bucket_type,
-                    "total_sales": float(quantize_money(bucket_sales)),
-                    "cogs": float(quantize_money(bucket_cogs)),
-                    "net_profit": float(quantize_money((bucket_sales - bucket_cogs) - bucket_expenses)),
-                })
-
-            if period_type == "year":
-                target_year = start_date.year
-
-                for month_number in range(1, 13):
-                    month_start_date = date(target_year, month_number, 1)
-                    _, last_day = calendar.monthrange(target_year, month_number)
-                    month_end_date = date(target_year, month_number, last_day)
-
-                    month_start_dt = timezone.make_aware(
-                        datetime.combine(month_start_date, time.min), tz
-                    )
-                    month_end_dt = timezone.make_aware(
-                        datetime.combine(month_end_date, time.max), tz
-                    )
-
-                    month_sales = base_sales_qs.filter(
-                        sale_date__range=(month_start_dt, month_end_dt)
-                    )
-                    month_expenses = base_expenses_qs.filter(
-                        Q(date__range=(month_start_date, month_end_date))
-                        | Q(created_at__range=(month_start_dt, month_end_dt))
-                    )
-
-                    append_trajectory_point(
-                        month_start_date.strftime("%b"),
-                        month_start_date,
-                        month_sales,
-                        month_expenses,
-                        "month",
-                    )
-
-            else:
-                current_day = start_date
-
-                while current_day <= end_date:
-                    day_start_dt = timezone.make_aware(
-                        datetime.combine(current_day, time.min), tz
-                    )
-                    day_end_dt = timezone.make_aware(
-                        datetime.combine(current_day, time.max), tz
-                    )
-
-                    day_sales = base_sales_qs.filter(
-                        sale_date__range=(day_start_dt, day_end_dt)
-                    )
-                    day_expenses = base_expenses_qs.filter(
-                        Q(date=current_day)
-                        | Q(created_at__range=(day_start_dt, day_end_dt))
-                    )
-
-                    if period_type == "weekly":
-                        label = current_day.strftime("%a")
-                    elif period_type == "month":
-                        label = str(current_day.day)
-                    else:
-                        label = current_day.strftime("%d %b")
-
-                    append_trajectory_point(
-                        label,
-                        current_day,
-                        day_sales,
-                        day_expenses,
-                        "day",
-                    )
-                    current_day += timedelta(days=1)
-
-            return Response({
-                "profitability": {
-                    "total_sales": float(quantize_money(total_sales)),
-                    "total_sales_formatted": self._format_currency(total_sales),
-                    "cogs": float(quantize_money(cogs)),
-                    "cogs_formatted": self._format_currency(cogs),
-                    "gross_profit": float(quantize_money(gross_profit)),
-                    "gross_profit_formatted": self._format_currency(gross_profit),
-                    "net_profit": float(quantize_money(net_profit)),
-                    "net_profit_formatted": self._format_currency(net_profit),
-                },
-                "debtors": {
-                    "total_customer_debts": float(quantize_money(total_customer_debtors)),
-                    "total_customer_debts_formatted": self._format_currency(total_customer_debtors),
-                },
-                "inventory": {
-                    "total_stock_value": float(quantize_money(total_stock_value)),
-                    "total_stock_value_formatted": self._format_currency(total_stock_value),
-                    "product_skus": total_cataloged_skus,
-                    "active_skus": active_skus_count,
-                    "low_stock_items": low_stock_count,
-                    "out_of_stock_items": out_of_stock_count,
-                },
-                "cash_flow": {
-                    "receipts": float(quantize_money(actual_cash_receipts)),
-                    "receipts_formatted": self._format_currency(actual_cash_receipts),
-                    "cash_payments": float(quantize_money(cash_total)),
-                    "cash_payments_formatted": self._format_currency(cash_total),
-                    "paybill_payments": float(quantize_money(paybill_total)),
-                    "paybill_payments_formatted": self._format_currency(paybill_total),
-                    "send_money_payments": float(quantize_money(send_money_total)),
-                    "send_money_payments_formatted": self._format_currency(send_money_total),
-                    "mpesa_std_payments": float(quantize_money(mpesa_std_total)),
-                    "mpesa_std_payments_formatted": self._format_currency(mpesa_std_total),
-                    "bank_payments": float(quantize_money(bank_total)),
-                    "bank_payments_formatted": self._format_currency(bank_total),
-                    "customer_repayments": float(quantize_money(period_credit_repayments_total)),
-                    "customer_repayments_formatted": self._format_currency(period_credit_repayments_total),
-                    "payments": float(quantize_money(operating_expenses)),
-                    "payments_formatted": self._format_currency(operating_expenses),
-                    "purchases": float(quantize_money(purchases_total)),
-                    "purchases_formatted": self._format_currency(purchases_total),
-                    "total_available_funds": float(quantize_money(available_funds)),
-                    "total_available_funds_formatted": self._format_currency(available_funds),
-                },
-                "trajectory": trajectory_data
-            }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            logger.exception("Dashboard Cards Error: %s", e)
-            return Response({
-                "profitability": {"total_sales": 0.0, "total_sales_formatted": "KSh 0.00", "cogs": 0.0, "cogs_formatted": "KSh 0.00", "gross_profit": 0.0, "gross_profit_formatted": "KSh 0.00", "net_profit": 0.0, "net_profit_formatted": "KSh 0.00"},
-                "debtors": {"total_customer_debts": 0.0, "total_customer_debts_formatted": "KSh 0.00"},
-                "inventory": {"total_stock_value": 0.0, "total_stock_value_formatted": "KSh 0.00", "product_skus": 0, "low_stock_items": 0, "out_of_stock_items": 0},
-                "cash_flow": {"receipts_formatted": "KSh 0.00", "payments_formatted": "KSh 0.00", "purchases_formatted": "KSh 0.00", "total_available_funds_formatted": "KSh 0.00"},
-                "trajectory": []
-            }, status=status.HTTP_200_OK)
 
 
     @action(detail=False, methods=['get'], url_path='sales-register')
