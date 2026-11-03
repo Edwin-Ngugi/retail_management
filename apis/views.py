@@ -2977,6 +2977,36 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+
+class SupplierPaymentViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        purchase_id = request.data.get("purchase")
+        amount = Decimal(str(request.data.get("amount", 0)))
+        payment_method = request.data.get("payment_method", "CASH")
+        notes = request.data.get("notes", "")
+
+        try:
+            with transaction.atomic():
+                purchase = Purchase.objects.select_for_update().get(id=purchase_id)
+                purchase.amount_paid = Decimal(str(getattr(purchase, "amount_paid", 0))) + amount
+                purchase.save()
+
+                # Record an expense entry for ledger reconciliation
+                Expense.objects.create(
+                    branch=purchase.branch,
+                    title=f"Supplier Repayment: {purchase.item.name}",
+                    amount=amount,
+                    payment_method=payment_method,
+                    description=notes,
+                    date=timezone.localdate(),
+                )
+
+                return Response({"message": "Supplier payment recorded successfully"}, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
 # EXPENSE
 
 
