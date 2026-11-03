@@ -9808,6 +9808,230 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             logger.exception("Export Balance Sheet PDF Error")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @action(detail=False, methods=['get'], url_path='export-cash-book-pdf')
+    def export_cash_book_pdf(self, request):
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+
+            # -----------------------------------------------------------------
+            # 1. FETCH & AGGREGATE CASHBOOK LEDGER ENTRIES
+            # -----------------------------------------------------------------
+            sales_qs = SaleTransaction.objects.filter(
+                Q(sale_date__range=(start_dt, end_dt)) | Q(sale_date__date__range=(start_date, end_date))
+            )
+            repayments_qs = CreditRepayment.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            expenses_qs = Expense.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            purchases_qs = Purchase.objects.filter(
+                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            )
+            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+
+            entries = []
+
+            # Inflows: Cash/Liquid Sales
+            for sale in sales_qs:
+                bd = getattr(sale, 'liquid_payments_breakdown', {})
+                inflow_amt = bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO) + bd.get('SEND_MONEY', ZERO)
+                if inflow_amt > ZERO:
+                    entries.append({
+                        'ref': sale.receipt_number or f"SALE-{sale.id}",
+                        'desc': f"Customer Sale ({sale.payment_method or 'LIQUID'})",
+                        'type': 'INFLOW',
+                        'inflow': float(inflow_amt),
+                        'outflow': 0.0
+                    })
+
+            # Inflows: Debt Repayments
+            for rep in repayments_qs:
+                amt = float(rep.amount or 0)
+                if amt > 0:
+                    cust_name = rep.customer.name if getattr(rep, 'customer', None) else "Customer"
+                    entries.append({
+                        'ref': f"REP-{rep.id}",
+                        'desc': f"Credit Debt Recovery — {cust_name}",
+                        'type': 'INFLOW',
+                        'inflow': amt,
+                        'outflow': 0.0
+                    })
+
+            # Outflows: Operating Expenses
+            for exp in expenses_qs:
+                amt = float(exp.amount or 0)
+                if amt > 0:
+                    entries.append({
+                        'ref': f"EXP-{exp.id}",
+                        'desc': f"Operating Expense — {exp.description or exp.category}",
+                        'type': 'OUTFLOW',
+                        'inflow': 0.0,
+                        'outflow': amt
+                    })
+
+            # Outflows: Direct Purchases
+            for pur in purchases_qs.exclude(payment_method='CREDIT').filter(supplier_payments__isnull=True):
+                amt = float(pur.amount_paid or 0)
+                if amt > 0:
+                    supp_name = pur.supplier.name if getattr(pur, 'supplier', None) else "Supplier"
+                    entries.append({
+                        'ref': f"PUR-{pur.id}",
+                        'desc': f"Direct Stock Purchase — {supp_name}",
+                        'type': 'OUTFLOW',
+                        'inflow': 0.0,
+                        'outflow': amt
+                    })
+
+            # Outflows: Supplier Repayments
+            for sp in supplier_payments_qs:
+                amt = float(sp.amount or 0)
+                if amt > 0:
+                    entries.append({
+                        'ref': f"SUPP-{sp.id}",
+                        'desc': "Supplier Account Settlement",
+                        'type': 'OUTFLOW',
+                        'inflow': 0.0,
+                        'outflow': amt
+                    })
+
+            tot_inflow = sum(e['inflow'] for e in entries)
+            tot_outflow = sum(e['outflow'] for e in entries)
+            net_position = tot_inflow - tot_outflow
+
+            # Helper function for PDF currency formatting
+            def fmt_pdf_curr(val):
+                num = float(val or 0)
+                if num < 0:
+                    return f"(KSh {abs(num):,.2f})"
+                return f"KSh {num:,.2f}"
+
+            # -----------------------------------------------------------------
+            # 2. REPORTLAB PDF SETUP
+            # -----------------------------------------------------------------
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                rightMargin=30,
+                leftMargin=30,
+                topMargin=30,
+                bottomMargin=30
+            )
+
+            styles = getSampleStyleSheet()
+
+            company_style = ParagraphStyle(
+                'CbCompanyHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=16,
+                leading=20,
+                textColor=colors.HexColor('#004D40'),
+                alignment=1,
+                spaceAfter=3
+            )
+
+            subtitle_style = ParagraphStyle(
+                'CbSubHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=9,
+                leading=13,
+                textColor=colors.HexColor('#475569'),
+                alignment=1,
+                spaceAfter=12
+            )
+
+            table_header_style = ParagraphStyle(
+                'CbTh',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=8,
+                textColor=colors.HexColor('#0F172A')
+            )
+
+            cell_style = ParagraphStyle(
+                'CbTd',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=8,
+                textColor=colors.HexColor('#1E293B')
+            )
+
+            branch_name = branch_obj.name if branch_obj else "All Branches"
+            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}"
+
+            elements = []
+
+            logo_element = _get_pdf_logo_element()
+            if logo_element:
+                elements.append(logo_element)
+                elements.append(Spacer(1, 6))
+
+            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
+            elements.append(Paragraph(f"<b>CASHBOOK LEDGER & LIQUIDITY REPORT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
+            elements.append(Spacer(1, 8))
+
+            # Table Header
+            table_data = [[
+                Paragraph("Ref Code", table_header_style),
+                Paragraph("Description", table_header_style),
+                Paragraph("Type", table_header_style),
+                Paragraph("Inflow (KSh)", table_header_style),
+                Paragraph("Outflow (KSh)", table_header_style)
+            ]]
+
+            for e in entries:
+                table_data.append([
+                    Paragraph(e['ref'], cell_style),
+                    Paragraph(e['desc'], cell_style),
+                    Paragraph(e['type'], cell_style),
+                    fmt_pdf_curr(e['inflow']) if e['inflow'] > 0 else "-",
+                    fmt_pdf_curr(e['outflow']) if e['outflow'] > 0 else "-"
+                ])
+
+            # Summary Totals Row
+            table_data.append([
+                Paragraph("<b>TOTALS</b>", table_header_style),
+                Paragraph(f"<b>Net Cash Position: {fmt_pdf_curr(net_position)}</b>", table_header_style),
+                "",
+                Paragraph(f"<b>{fmt_pdf_curr(tot_inflow)}</b>", table_header_style),
+                Paragraph(f"<b>{fmt_pdf_curr(tot_outflow)}</b>", table_header_style)
+            ])
+
+            table = Table(table_data, colWidths=[80, 240, 60, 85, 85])
+            table.setStyle(TableStyle([
+                ('ALIGN', (3, 0), (-1, -1), 'RIGHT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 5),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#E6FFFA')),
+                ('LINEABOVE', (0, -1), (-1, -1), 1.5, colors.HexColor('#004D40')),
+            ]))
+
+            elements.append(table)
+            doc.build(elements)
+            buffer.seek(0)
+
+            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="Cashbook_Ledger_{branch_name}.pdf"'
+            return response
+
+        except Exception as e:
+            logger.exception("Export Cash Book PDF Error")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 # ============================================================
 # USER PERMISSION VIEWSET
 # ============================================================
@@ -10759,4 +10983,4 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
         except Exception as e:
             logger.exception("Error generating detailed sales analysis report")
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)           
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)                  
