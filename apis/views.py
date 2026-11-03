@@ -10344,7 +10344,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def _normalize_payment_method(self, method_name):
-        """Standardizes raw payment channel strings to clean upper-case keys."""
+        """Standardizes raw payment channel strings to clean distinct keys."""
         if not method_name:
             return "UNKNOWN"
 
@@ -10359,30 +10359,20 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
             return "PAYBILL"
 
-        if any(
-            k in clean
-            for k in [
-                "SEND_MONEY",
-                "SENDMONEY",
-                "TILL",
-                "BUY_GOODS",
-                "BUYGOODS",
-                "P2P",
-            ]
-        ):
+        if any(k in clean for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "BUYGOODS", "P2P"]):
             return "SEND_MONEY"
+
+        if any(k in clean for k in ["BANK", "EFT", "TRANSFER"]):
+            return "BANK_TRANSFER"
+
+        if any(k in clean for k in ["MPESA", "M_PESA", "MOBILE"]):
+            return "MPESA"
 
         if "CASH" in clean:
             return "CASH"
 
-        if "CREDIT" in clean or "DEBT" in clean or "ON_ACCOUNT" in clean:
+        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT"]):
             return "CREDIT"
-
-        if "BANK" in clean or "EFT" in clean or "TRANSFER" in clean:
-            return "BANK_TRANSFER"
-
-        if "MPESA" in clean or "M_PESA" in clean or "MOBILE" in clean:
-            return "MPESA"
 
         if "SPLIT" in clean:
             return "SPLIT"
@@ -10391,14 +10381,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
     def _extract_sp_method(self, sp):
         """Safely inspects split payment instances across all possible field names."""
-        for attr in [
-            "method",
-            "payment_method",
-            "payment_mode",
-            "channel",
-            "mode",
-            "type",
-        ]:
+        for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
             val = getattr(sp, attr, None)
             if val:
                 return val
@@ -10526,7 +10509,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             mpesa_std_total = ZERO
             bank_total = ZERO
             other_total = ZERO
-            credit_sales_exposure = ZERO
+            gross_credit_sales = ZERO
             period_credit_repayments_total = ZERO
 
             transaction_count = sales_qs.count()
@@ -10555,12 +10538,12 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         elif sp_method == "BANK_TRANSFER":
                             bank_total += sp_amount
                         elif sp_method == "CREDIT":
-                            credit_sales_exposure += sp_amount
+                            gross_credit_sales += sp_amount
                         else:
                             other_total += sp_amount
                 else:
                     if method == "CREDIT":
-                        credit_sales_exposure += sale_amt
+                        gross_credit_sales += sale_amt
                     elif method == "CASH":
                         cash_total += sale_amt
                     elif method == "PAYBILL":
@@ -10574,27 +10557,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     else:
                         other_total += sale_amt
 
-            # 2. PROCESS DEBT REPAYMENTS AND ROUTE CASH INFLOWS
+            # 2. TRACK DEBT REPAYMENTS FOR THE DAY
             for rep in repayment_qs.select_related("customer", "transaction"):
                 rep_amt = quantize_money(rep.amount or ZERO)
-                if rep_amt <= ZERO:
-                    continue
+                if rep_amt > ZERO:
+                    period_credit_repayments_total += rep_amt
 
-                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
-                period_credit_repayments_total += rep_amt
-
-                if rep_method == "CASH":
-                    cash_total += rep_amt
-                elif rep_method == "PAYBILL":
-                    paybill_total += rep_amt
-                elif rep_method == "SEND_MONEY":
-                    send_money_total += rep_amt
-                elif rep_method == "BANK_TRANSFER":
-                    bank_total += rep_amt
-                elif rep_method == "MPESA":
-                    mpesa_std_total += rep_amt
-                else:
-                    other_total += rep_amt
+            # Calculate net remaining credit balance after daily repayments
+            net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
             # 3. PROCESS LINE ITEMS FOR REVENUE, COGS, AND PROFIT MARGINS
             total_gross_revenue = ZERO
@@ -10705,21 +10675,20 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "avg_basket_value": float(avg_basket_value),
                 "avg_items_per_basket": avg_items_per_basket,
                 "total_units_sold": float(total_units_sold),
-                "credit_sales_exposure": float(quantize_money(credit_sales_exposure)),
+                "credit_sales_exposure": float(quantize_money(net_credit_balance)),
                 "total_credit_repayments": float(quantize_money(period_credit_repayments_total)),
                 "returned_orders_count": returns_qs.count()
             }
 
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
-            # Map accumulators into output dictionary structure
             channel_map = {
                 "CASH": cash_total,
                 "PAYBILL": paybill_total,
                 "SEND_MONEY": send_money_total,
                 "MPESA": mpesa_std_total,
                 "BANK_TRANSFER": bank_total,
-                "CREDIT": credit_sales_exposure,
+                "CREDIT": net_credit_balance,
                 "OTHER": other_total,
             }
 
