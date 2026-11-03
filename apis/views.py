@@ -2874,19 +2874,43 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
             raw_date = data.get("sale_date") or data.get("date")
             parsed_date = self._normalize_sale_date(raw_date)
 
-            customer_name = data.get("customer_name") or ("Walk-in Customer" if normalized_pm != "CREDIT" else "")
+            # 3. Resolve Customer Object or Name
+            customer_id = data.get("customer") or data.get("customer_id")
+            customer_obj = None
+            if customer_id and str(customer_id).isdigit():
+                customer_obj = Customer.objects.filter(pk=int(customer_id)).first()
 
-            # 3. Process Sale via Transaction Atomic Block
+            customer_name = (
+                data.get("customer_name") 
+                or (customer_obj.name if customer_obj else "")
+                or ("Walk-in Customer" if normalized_pm != "CREDIT" else "")
+            )
+
+            # 4. Capture Custom Invoice / Receipt Code ONLY for Credit Sales
+            custom_receipt = None
+            if normalized_pm == "CREDIT":
+                raw_custom = data.get("receipt_number") or data.get("invoice_number") or data.get("receipt")
+                if raw_custom and str(raw_custom).strip():
+                    custom_receipt = str(raw_custom).strip()
+
+            # 5. Process Sale via Transaction Atomic Block
             with transaction.atomic():
-                sale = SaleTransaction.objects.create(
-                    branch=branch_obj,
-                    customer_name=customer_name,
-                    payment_method=normalized_pm,
-                    sale_date=parsed_date,
-                    total_amount=Decimal("0.00"),
-                    amount_paid=Decimal(str(data.get("amount_paid") or "0.00")),
-                    created_by=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
-                )
+                create_kwargs = {
+                    "branch": branch_obj,
+                    "customer": customer_obj,
+                    "customer_name": customer_name,
+                    "payment_method": normalized_pm,
+                    "sale_date": parsed_date,
+                    "total_amount": Decimal("0.00"),
+                    "amount_paid": Decimal(str(data.get("amount_paid") or "0.00")),
+                    "created_by": request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
+                }
+
+                # Explicitly set user-entered invoice code for Credit Sales
+                if custom_receipt:
+                    create_kwargs["receipt_number"] = custom_receipt
+
+                sale = SaleTransaction.objects.create(**create_kwargs)
 
                 calculated_total = Decimal("0.00")
 
@@ -2911,7 +2935,6 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                     line_total = qty * (retail_price - discount)
                     calculated_total += line_total
 
-                    # Creating SaleItem automatically triggers stock deduction/movement signal
                     SaleItem.objects.create(
                         transaction=sale,
                         item=item_obj,
@@ -2926,7 +2949,7 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                     sale.amount_paid = calculated_total
                 sale.save()
 
-            # 4. Broadcast Real-time WebSocket Analytics Event
+            # 6. Broadcast Real-time WebSocket Event
             channel_layer = get_channel_layer()
             if channel_layer:
                 try:
@@ -2953,36 +2976,6 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 {"error": f"Failed to record sale: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-
-
-class SupplierPaymentViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.AllowAny]
-
-    def create(self, request, *args, **kwargs):
-        purchase_id = request.data.get("purchase")
-        amount = Decimal(str(request.data.get("amount", 0)))
-        payment_method = request.data.get("payment_method", "CASH")
-        notes = request.data.get("notes", "")
-
-        try:
-            with transaction.atomic():
-                purchase = Purchase.objects.select_for_update().get(id=purchase_id)
-                purchase.amount_paid = Decimal(str(getattr(purchase, "amount_paid", 0))) + amount
-                purchase.save()
-
-                # Record an expense entry for ledger reconciliation
-                Expense.objects.create(
-                    branch=purchase.branch,
-                    title=f"Supplier Repayment: {purchase.item.name}",
-                    amount=amount,
-                    payment_method=payment_method,
-                    description=notes,
-                    date=timezone.localdate(),
-                )
-
-                return Response({"message": "Supplier payment recorded successfully"}, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 # EXPENSE
 
