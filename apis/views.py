@@ -10402,18 +10402,60 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
     def _get_branch_and_dates(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
+        period_type = (request.query_params.get("period_type") or request.query_params.get("period") or "").lower()
+        selected_date_str = request.query_params.get("selectedDate") or request.query_params.get("date")
+        year_param = request.query_params.get("year")
+        month_param = request.query_params.get("month")
+
         start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
         end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
 
         start_date = None
         end_date = None
 
-        if start_param and end_param:
-            try:
-                start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
-                end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
-            except ValueError:
-                pass
+        today = timezone.now().date()
+
+        # Handle Period-based filtering (Day, Week, Month, Year)
+        if period_type in ["day", "daily"]:
+            ref_date = today
+            if selected_date_str:
+                try:
+                    ref_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            start_date = ref_date
+            end_date = ref_date
+
+        elif period_type in ["week", "weekly"]:
+            ref_date = today
+            if selected_date_str:
+                try:
+                    ref_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            start_date = ref_date - timedelta(days=ref_date.weekday())  # Monday
+            end_date = start_date + timedelta(days=6)  # Sunday
+
+        elif period_type in ["month", "monthly"]:
+            y = int(year_param) if year_param and str(year_param).isdigit() else today.year
+            m = int(month_param) if month_param and str(month_param).isdigit() else today.month
+            start_date = date(y, m, 1)
+            last_day = calendar.monthrange(y, m)[1]
+            end_date = date(y, m, last_day)
+
+        elif period_type in ["year", "yearly"]:
+            y = int(year_param) if year_param and str(year_param).isdigit() else today.year
+            start_date = date(y, 1, 1)
+            end_date = date(y, 12, 31)
+
+        # Fallback to direct start_date/end_date params
+        if not start_date or not end_date:
+            if start_param and end_param:
+                try:
+                    start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
+                    end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
 
         tz = timezone.get_current_timezone()
         start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
@@ -10557,13 +10599,12 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     else:
                         other_total += sale_amt
 
-            # 2. TRACK DEBT REPAYMENTS FOR THE DAY
+            # 2. TRACK DEBT REPAYMENTS FOR THE PERIOD
             for rep in repayment_qs.select_related("customer", "transaction"):
                 rep_amt = quantize_money(rep.amount or ZERO)
                 if rep_amt > ZERO:
                     period_credit_repayments_total += rep_amt
 
-            # Calculate net remaining credit balance after daily repayments
             net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
             # 3. PROCESS LINE ITEMS FOR REVENUE, COGS, AND PROFIT MARGINS
@@ -10664,6 +10705,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 slow_movers = sorted(sorted_by_velocity[10:], key=lambda x: (x["units_sold"], x["gross_revenue"]))[:10]
 
             summary_payload = {
+                "start_date": str(start_date) if start_date else None,
+                "end_date": str(end_date) if end_date else None,
                 "gross_revenue": float(quantize_money(total_gross_revenue)),
                 "net_revenue": float(quantize_money(net_revenue)),
                 "total_cogs": float(quantize_money(total_cogs)),
