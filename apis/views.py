@@ -11226,15 +11226,16 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DIRECT FETCH & GROUPING OF SPLIT PAYMENTS (GUARANTEED NO MISSES)
+            # 1. FETCH & MAP SPLIT PAYMENTS (GUARANTEED NO MISSES)
             # -----------------------------------------------------------------
-            # Fetch all SalePayment child rows associated with the filtered transactions
             split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs)
             
-            # Group split payments by transaction_id in memory
-            split_payments_map = collections.defaultdict(list)
+            # Map child SalePayment entries by transaction ID in-memory without collections dependency
+            split_payments_map = {}
             for sp in split_payments_qs:
                 if sp.transaction_id:
+                    if sp.transaction_id not in split_payments_map:
+                        split_payments_map[sp.transaction_id] = []
                     split_payments_map[sp.transaction_id].append(sp)
 
             sales_with_payments = sales_qs.select_related("customer", "branch")
@@ -11243,12 +11244,11 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
                 main_method = self._normalize_payment_method(getattr(sale, "payment_method", None))
                 
-                # Check directly in our grouped split payments map
+                # Retrieve mapped split payment records
                 split_records = split_payments_map.get(sale.id, [])
 
                 if main_method == "SPLIT" or len(split_records) > 0:
                     for sp in split_records:
-                        # Extract raw method from SalePayment.method
                         raw_sp_method = str(getattr(sp, "method", "") or "").upper()
                         sp_method = self._normalize_payment_method(raw_sp_method)
                         sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
@@ -11303,7 +11303,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
             # -----------------------------------------------------------------
-            # 3. SALE ITEMS AGGREGATION & DAILY TRENDS
+            # 3. SALE ITEMS AGGREGATION & DAILY TRENDS (In-Memory Lookup)
             # -----------------------------------------------------------------
             total_gross_revenue = ZERO
             total_cogs = ZERO
@@ -11311,7 +11311,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             total_units_sold = ZERO
             products_map = {}
             daily_map = {}
-            transaction_items_map = collections.defaultdict(list)
+            transaction_items_map = {}
 
             for line in sale_items_qs:
                 qty = Decimal(str(line.quantity_sold or 0))
@@ -11332,6 +11332,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 total_discounts += line_disc_total
                 total_units_sold += qty
 
+                # Product Performance
                 i_id = line.item_id
                 name = line.item.name if line.item else f"Item #{i_id}"
                 if i_id not in products_map:
@@ -11348,6 +11349,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 products_map[i_id]["cogs"] += line_cost
                 products_map[i_id]["discounts"] += line_disc_total
 
+                # Daily Trends
                 sale_dt = line.transaction.sale_date if line.transaction else None
                 day_str = sale_dt.strftime('%Y-%m-%d') if hasattr(sale_dt, 'strftime') else str(sale_dt)[:10] if sale_dt else "Unknown"
                 if day_str not in daily_map:
@@ -11355,22 +11357,19 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 daily_map[day_str]["revenue"] += line_rev
                 daily_map[day_str]["cogs"] += line_cost
 
+                # Group line items by transaction in memory
                 if line.transaction_id:
-                    q_flt = float(qty)
-                    p_flt = float(price)
-                    d_flt = float(disc)
-                    rev_flt = float(line_rev)
-                    cogs_flt = float(line_cost)
-                    prof_flt = rev_flt - cogs_flt
-
+                    if line.transaction_id not in transaction_items_map:
+                        transaction_items_map[line.transaction_id] = []
+                    
                     transaction_items_map[line.transaction_id].append({
                         "item_name": name,
-                        "quantity": q_flt,
-                        "unit_price": p_flt,
-                        "discount": d_flt,
-                        "line_revenue": rev_flt,
-                        "line_cogs": cogs_flt,
-                        "line_profit": prof_flt
+                        "quantity": float(qty),
+                        "unit_price": float(price),
+                        "discount": float(disc),
+                        "line_revenue": float(line_rev),
+                        "line_cogs": float(line_cost),
+                        "line_profit": float(line_rev - line_cost)
                     })
 
             daily_trends = []
