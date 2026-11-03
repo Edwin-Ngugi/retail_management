@@ -10,6 +10,10 @@ from datetime import date, datetime, time, timedelta
 import os
 from django.conf import settings
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 import io
 from django.http import HttpResponse
 from reportlab.lib.pagesizes import letter
@@ -10586,6 +10590,70 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             logger.exception("Error fetching suppliers list")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+def generate_pdf_trend_chart(daily_trends):
+    """Generates a PNG byte stream of Revenue vs COGS vs Profit."""
+    if not daily_trends:
+        return None
+
+    dates = [d['date'] for d in daily_trends]
+    revenues = [d['revenue'] for d in daily_trends]
+    cogs = [d['cogs'] for d in daily_trends]
+    profits = [d['profit'] for d in daily_trends]
+
+    x = range(len(dates))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(7, 2.6), dpi=150)
+    ax.bar([i - width for i in x], revenues, width=width, label='Gross Revenue', color='#0D9488')
+    ax.bar(x, cogs, width=width, label='COGS', color='#D97706')
+    ax.bar([i + width for i in x], profits, width=width, label='Gross Profit', color='#059669')
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(dates, rotation=25, ha='right', fontsize=7)
+    ax.tick_params(axis='y', labelsize=7)
+    ax.legend(fontsize=7, loc='upper left')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+
+    img_buf = io.BytesIO()
+    plt.savefig(img_buf, format='png', transparent=False, facecolor='white')
+    plt.close(fig)
+    img_buf.seek(0)
+    return Image(img_buf, width=520, height=190)
+
+
+def generate_pdf_pie_chart(payment_breakdown):
+    """Generates a PNG byte stream of Payment Channels distribution."""
+    if not payment_breakdown:
+        return None
+
+    labels = [p['method'] for p in payment_breakdown]
+    sizes = [p['amount'] for p in payment_breakdown]
+    colors_list = ['#0D9488', '#2563EB', '#D97706', '#059669', '#7C3AED', '#DB2777', '#475569']
+
+    fig, ax = plt.subplots(figsize=(4.5, 2.6), dpi=150)
+    wedges, texts, autotexts = ax.pie(
+        sizes,
+        labels=labels,
+        autopct='%1.1f%%',
+        colors=colors_list[:len(sizes)],
+        textprops={'fontsize': 7},
+        startangle=140
+    )
+    for autotext in autotexts:
+        autotext.set_color('white')
+        autotext.set_weight('bold')
+
+    plt.tight_layout()
+
+    img_buf = io.BytesIO()
+    plt.savefig(img_buf, format='png', transparent=False, facecolor='white')
+    plt.close(fig)
+    img_buf.seek(0)
+    return Image(img_buf, width=320, height=185)
+
+
 class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
@@ -10626,7 +10694,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         return clean
 
     def _extract_sp_method(self, sp):
-        """Safely inspects split payment instances across all possible field names."""
         for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
             val = getattr(sp, attr, None)
             if val:
@@ -10634,7 +10701,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         return None
 
     def _get_split_payments(self, sale):
-        """Safely fetches split payment objects regardless of related_name naming."""
         for rel_attr in ["split_payments", "payments", "payment_breakdown", "splits", "sale_payments"]:
             relation = getattr(sale, rel_attr, None)
             if relation is not None:
@@ -10661,7 +10727,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
         today = timezone.now().date()
 
-        # Handle Period-based filtering (Day, Week, Month, Year)
         if period_type in ["day", "daily"]:
             ref_date = today
             if selected_date_str:
@@ -10800,7 +10865,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             transaction_count = sales_qs.count()
 
-            # 1. PROCESS SALES & SPLIT PAYMENTS
             sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
 
             for sale in sales_with_payments:
@@ -10843,7 +10907,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     else:
                         other_total += sale_amt
 
-            # 2. TRACK DEBT REPAYMENTS FOR THE PERIOD & PREPARE LIST
             repayments_list = []
             for rep in repayment_qs.select_related("customer", "transaction"):
                 rep_amt = quantize_money(rep.amount or ZERO)
@@ -10860,7 +10923,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
-            # 3. PROCESS LINE ITEMS FOR REVENUE, COGS, AND PROFIT MARGINS
             total_gross_revenue = ZERO
             total_cogs = ZERO
             total_discounts = ZERO
@@ -10999,7 +11061,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 for k, v in channel_map.items()
             }
 
-            # 4. EXTRACT INDIVIDUAL SALE TRANSACTIONS WITH LINE ITEMS
             transactions_list = []
             for sale in sales_with_payments:
                 items_data = []
@@ -11099,7 +11160,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 fontName='Helvetica-Bold',
                 fontSize=15,
                 leading=18,
-                textColor=colors.HexColor('#004D40'),
+                textColor=colors.HexColor('#0F766E'),
                 alignment=1,
                 spaceAfter=3
             )
@@ -11141,12 +11202,28 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 textColor=colors.HexColor('#1E293B')
             )
 
+            tx_header_white = ParagraphStyle(
+                'SaTxHeaderWhite',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=8,
+                textColor=colors.white
+            )
+
+            tx_cell_white = ParagraphStyle(
+                'SaTxCellWhite',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=8,
+                textColor=colors.white
+            )
+
             item_header_style = ParagraphStyle(
                 'SaItemTh',
                 parent=styles['Normal'],
                 fontName='Helvetica-Bold',
                 fontSize=7,
-                textColor=colors.HexColor('#334155')
+                textColor=colors.HexColor('#0F766E')
             )
 
             item_cell_style = ParagraphStyle(
@@ -11159,7 +11236,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             elements = []
 
-            # 1. Header Logo & Title
+            # 1. Header Title
             report_title_suffix = "DETAILED TRANSACTIONS REPORT" if export_type == "detailed" else "EXECUTIVE SUMMARY REPORT"
             elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
             elements.append(Paragraph(f"<b>SALES ANALYSIS ({report_title_suffix}) — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
@@ -11183,8 +11260,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
                 ('TOPPADDING', (0, 0), (-1, -1), 4),
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-                ('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#E6FFFA')),
-                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#F0FDFA')),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#CCFBF1')),
             ]))
             elements.append(sum_table)
             elements.append(Spacer(1, 10))
@@ -11199,9 +11276,31 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     elements.append(Spacer(1, 2))
                 elements.append(Spacer(1, 10))
 
-            # 4. Financial Velocity Breakdown Table (Daily/Period Trends)
+            # 4. GRAPHICAL CHARTS GENERATION & EMBEDDING
+            trend_img = generate_pdf_trend_chart(daily_trends)
+            pie_img = generate_pdf_pie_chart(payment_breakdown)
+
+            if trend_img or pie_img:
+                elements.append(Paragraph("<b>VISUAL ANALYTICS & DISTRIBUTION CHARTS</b>", section_heading))
+                if trend_img and pie_img:
+                    # Place side-by-side or stacked cleanly
+                    chart_table = Table([[trend_img], [pie_img]], colWidths=[552])
+                    chart_table.setStyle(TableStyle([
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ('TOPPADDING', (0, 0), (-1, -1), 4),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                    ]))
+                    elements.append(chart_table)
+                elif trend_img:
+                    elements.append(trend_img)
+                elif pie_img:
+                    elements.append(pie_img)
+                elements.append(Spacer(1, 10))
+
+            # 5. Period Trends Table Data
             if daily_trends:
-                elements.append(Paragraph("<b>PERIOD TRENDS (REVENUE vs COGS vs PROFIT)</b>", section_heading))
+                elements.append(Paragraph("<b>PERIOD TRENDS BREAKDOWN</b>", section_heading))
                 trend_data = [[
                     Paragraph("Date", tbl_header),
                     Paragraph("Gross Revenue", tbl_header),
@@ -11226,7 +11325,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(trend_table)
                 elements.append(Spacer(1, 10))
 
-            # 5. Fast-Moving & Slow-Moving Products
+            # 6. Fast & Slow Movers Tables
             if fast_movers:
                 elements.append(Paragraph("<b>FAST-MOVING PRODUCTS (TOP PERFORMERS)</b>", section_heading))
                 fm_data = [[
@@ -11279,7 +11378,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(sm_table)
                 elements.append(Spacer(1, 10))
 
-            # 6. TRANSACTIONS LEDGER (ORGANIZED SUMMARY vs DETAILED MODE)
+            # 7. TRANSACTIONS LEDGER
             if transactions:
                 elements.append(Paragraph(f"<b>TRANSACTIONS LEDGER ({report_title_suffix})</b>", section_heading))
                 
@@ -11310,21 +11409,19 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     elements.append(tx_table)
                     elements.append(Spacer(1, 10))
                 else:
-                    # Detailed Mode: Clean structural cards per sale with clear line items
                     for tx in transactions:
                         tx_elements = []
                         tx_summary_data = [[
-                            Paragraph(f"<b>Receipt: {tx.get('receipt_number')}</b>", tbl_header),
-                            Paragraph(f"Date: {tx.get('sale_date')}", tbl_cell),
-                            Paragraph(f"Cust: {tx.get('customer_name')}", tbl_cell),
-                            Paragraph(f"Method: {tx.get('payment_method')}", tbl_cell),
-                            Paragraph(f"<b>Total: {fmt_pdf_curr(tx.get('total_amount'))}</b>", tbl_header)
+                            Paragraph(f"<b>Receipt: {tx.get('receipt_number')}</b>", tx_header_white),
+                            Paragraph(f"Date: {tx.get('sale_date')}", tx_cell_white),
+                            Paragraph(f"Cust: {tx.get('customer_name')}", tx_cell_white),
+                            Paragraph(f"Method: {tx.get('payment_method')}", tx_cell_white),
+                            Paragraph(f"<b>Total: {fmt_pdf_curr(tx.get('total_amount'))}</b>", tx_header_white)
                         ]]
                         tx_sum_table = Table(tx_summary_data, colWidths=[110, 112, 130, 90, 110])
                         tx_sum_table.setStyle(TableStyle([
                             ('ALIGN', (4, 0), (4, -1), 'RIGHT'),
-                            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#004D40')),
-                            ('TEXTCOLOR', (0, 0), (-1, -1), colors.white),
+                            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0F766E')),
                             ('TOPPADDING', (0, 0), (-1, -1), 4),
                             ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
                         ]))
@@ -11354,8 +11451,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                                 ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
                                 ('TOPPADDING', (0, 0), (-1, -1), 3),
                                 ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-                                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E6FFFA')),
-                                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
+                                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F0FDFA')),
+                                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CCFBF1')),
                             ]))
                             tx_elements.append(item_table)
                         
@@ -11363,7 +11460,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         elements.append(KeepTogether(tx_elements))
                     elements.append(Spacer(1, 10))
 
-            # 7. CREDIT REPAYMENTS COLLECTED TABLE (PDF)
+            # 8. Credit Repayments Ledger
             if repayments_list:
                 elements.append(Paragraph("<b>CREDIT REPAYMENTS COLLECTED LEDGER</b>", section_heading))
                 rep_data = [[
@@ -11392,7 +11489,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(rep_table)
                 elements.append(Spacer(1, 10))
 
-            # 8. RESOLVED PAYMENT CHANNEL DISTRIBUTION
+            # 9. Payment Channel Distribution
             if payment_breakdown:
                 elements.append(Paragraph("<b>RESOLVED PAYMENT CHANNEL DISTRIBUTION</b>", section_heading))
                 pm_data = [[
@@ -11424,4 +11521,4 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
         except Exception as e:
             logger.exception("Export Sales Analysis PDF Error")
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)                     
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)                    
