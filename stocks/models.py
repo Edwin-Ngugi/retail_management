@@ -1924,6 +1924,7 @@ class SaleTransaction(models.Model):
     def save(self, *args, **kwargs):
         is_credit = (self.payment_method == self.PaymentMethod.CREDIT)
 
+        # 1. Resolve Default Debtor/Customer if missing
         if is_credit and not self.customer:
             retailer_user = self.created_by
 
@@ -1951,9 +1952,20 @@ class SaleTransaction(models.Model):
         if not is_credit and not self.customer_name:
             self.customer_name = "Walk-in Customer"
 
-        if not self.receipt_number:
-            self.receipt_number = generate_document_number(is_credit=is_credit)
+        # 2. Preserve Custom Invoice / Receipt Number Input
+        inv_no = (self.invoice_number or "").strip()
+        rec_no = (self.receipt_number or "").strip()
 
+        if inv_no or rec_no:
+            selected_no = inv_no or rec_no
+            self.invoice_number = selected_no
+            self.receipt_number = selected_no
+        else:
+            generated_no = generate_document_number(is_credit=is_credit)
+            self.receipt_number = generated_no
+            self.invoice_number = generated_no
+
+        # 3. Calculate Due Date for Credit Sales
         if is_credit and not self.due_date and self.sale_date:
             base_date = (
                 self.sale_date.date()
