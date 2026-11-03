@@ -10528,7 +10528,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             products_map = {}
             daily_map = {}
 
-            # Channel Totals Tracking (Matching FinancialReportViewSet breakdown keys)
+            # Explicit channel tracking matching FinancialReportViewSet
             channel_totals = {
                 "CASH": ZERO,
                 "MPESA": ZERO,
@@ -10542,37 +10542,36 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
             credit_sales_exposure = ZERO
 
-            # 1. PROCESS SALES & SPLIT PAYMENTS
+            # 1. PROCESS DIRECT SALES & SPLIT PAYMENTS (Accrual basis for initial transactions)
             for sale in sales_qs:
                 method = self._normalize_payment_method(getattr(sale, "payment_method", None))
                 split_records = self._get_split_payments(sale)
-                sale_amt = Decimal(str(getattr(sale, "total_amount", 0) or 0))
+                sale_amt = quantize_money(getattr(sale, "total_amount", 0) or 0)
 
                 if method == "SPLIT" or split_records:
                     for sp in split_records:
                         sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
                         sp_amount = quantize_money(getattr(sp, "amount", 0) or 0)
 
-                        if sp_method in channel_totals:
+                        if sp_method == "CREDIT":
+                            credit_sales_exposure += sp_amount
+                            channel_totals["CREDIT"] += sp_amount
+                        elif sp_method in channel_totals:
                             channel_totals[sp_method] += sp_amount
                         else:
                             channel_totals["OTHER"] += sp_amount
-
-                        if sp_method == "CREDIT":
-                            credit_sales_exposure += sp_amount
                 else:
-                    amt = quantize_money(getattr(sale, "amount_paid", None) or sale_amt)
-
                     if method == "CREDIT":
                         channel_totals["CREDIT"] += sale_amt
                         credit_sales_exposure += sale_amt
-                    elif method in channel_totals:
-                        channel_totals[method] += amt
                     else:
-                        channel_totals["OTHER"] += amt
+                        # For direct cash/M-Pesa sales, record full total_amount to avoid partial repayment collisions
+                        if method in channel_totals:
+                            channel_totals[method] += sale_amt
+                        else:
+                            channel_totals["OTHER"] += sale_amt
 
-            # 2. PROCESS CREDIT REPAYMENTS & ROUTE TO RESPECTIVE CHANNELS
-            # (Matches Section 10 of FinancialReportViewSet)
+            # 2. PROCESS DEBT REPAYMENTS (Cash collections for credit accounts)
             period_credit_repayments_total = ZERO
 
             for rep in repayment_qs.select_related("customer", "transaction"):
@@ -10580,22 +10579,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 if rep_amt <= ZERO:
                     continue
 
-                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
+                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", "CASH"))
                 period_credit_repayments_total += rep_amt
 
-                # Route cash inflows into liquid channels
-                if rep_method == "CASH":
-                    channel_totals["CASH"] += rep_amt
-                elif rep_method == "PAYBILL":
-                    channel_totals["PAYBILL"] += rep_amt
-                elif rep_method == "SEND_MONEY":
-                    channel_totals["SEND_MONEY"] += rep_amt
-                elif rep_method == "BANK_TRANSFER":
-                    channel_totals["BANK_TRANSFER"] += rep_amt
-                elif rep_method == "MPESA":
-                    channel_totals["MPESA"] += rep_amt
+                # Route debt collections into liquid payment channels
+                if rep_method in channel_totals and rep_method != "CREDIT":
+                    channel_totals[rep_method] += rep_amt
                 else:
-                    channel_totals["OTHER"] += rep_amt
+                    channel_totals["CASH"] += rep_amt
 
             # 3. PROCESS LINE ITEMS FOR REVENUE, COGS, PROFIT, AND DAILY TRENDS
             for line in sale_items_qs:
