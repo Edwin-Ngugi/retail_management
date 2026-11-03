@@ -6956,7 +6956,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             for c_sale in all_credit_sales.prefetch_related("split_payments"):
                 gross_credit_issued += get_sale_credit_amt(c_sale, all_credit_ids)
 
-            # Lifetime cumulative recovered receivables across all dates
+            # Lifetime total recovered customer credit repayments
             repay_agg_lifetime = base_credit_repay_qs.aggregate(total=Sum('amount'))
             total_recovered_lifetime = quantize_money(repay_agg_lifetime['total'] or ZERO)
 
@@ -6966,6 +6966,12 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             all_repayments_to_date = quantize_money(repay_agg_to_date['total'] or ZERO)
 
             total_customer_debtors = max(ZERO, gross_credit_issued - all_repayments_to_date)
+
+            # Safely count unpaid credit transactions without using field lookups on properties
+            unpaid_invoices_count = base_sales_qs.filter(
+                st_credit_filter,
+                is_paid=False
+            ).distinct().count()
 
             # -----------------------------------------------------------------
             # 4. INVENTORY & SKUS
@@ -7026,7 +7032,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             trajectory_data = []
 
-            # Python-level safe grouping to avoid database function import errors
             sales_by_date = {}
             for sale in sales_qs:
                 s_date = getattr(sale, 'sale_date', None)
@@ -7074,7 +7079,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "total_customer_debts_formatted": f"KSh {total_customer_debtors:,.2f}",
                     "total_recovered": float(total_recovered_lifetime),
                     "total_recovered_formatted": f"KSh {total_recovered_lifetime:,.2f}",
-                    "unpaid_count": base_sales_qs.filter(st_credit_filter, balance_due__gt=ZERO).count(),
+                    "unpaid_count": unpaid_invoices_count,
                 },
                 "inventory": {
                     "total_stock_value": float(total_stock_value),
