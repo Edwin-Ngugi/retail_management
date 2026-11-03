@@ -10842,11 +10842,20 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     else:
                         other_total += sale_amt
 
-            # 2. TRACK DEBT REPAYMENTS FOR THE PERIOD
+            # 2. TRACK DEBT REPAYMENTS FOR THE PERIOD & PREPARE LIST
+            repayments_list = []
             for rep in repayment_qs.select_related("customer", "transaction"):
                 rep_amt = quantize_money(rep.amount or ZERO)
                 if rep_amt > ZERO:
                     period_credit_repayments_total += rep_amt
+                    repayments_list.append({
+                        "id": rep.id,
+                        "date": rep.date.strftime("%Y-%m-%d") if hasattr(rep.date, "strftime") else str(rep.date),
+                        "customer_name": rep.customer.name if getattr(rep, "customer", None) else "Credit Customer",
+                        "reference_number": getattr(rep, "reference_number", None) or getattr(rep, "receipt_number", None) or "-",
+                        "payment_method": self._normalize_payment_method(getattr(rep, "payment_method", "CASH")),
+                        "amount": float(rep_amt)
+                    })
 
             net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
@@ -11033,7 +11042,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "top_performers": fast_movers,
                 "slow_movers": slow_movers,
                 "insights": insights,
-                "transactions": transactions_list
+                "transactions": transactions_list,
+                "credit_repayments_list": repayments_list,
+                "repayments": repayments_list
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -11055,8 +11066,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             fast_movers = data.get("fast_movers", [])
             slow_movers = data.get("slow_movers", [])
             transactions = data.get("transactions", [])
+            repayments_list = data.get("credit_repayments_list", [])
 
-            # Get mode parameter: 'detailed' vs 'summary'
             export_type = (request.query_params.get("export_type") or request.query_params.get("type") or "summary").lower()
 
             branch_obj, start_date, end_date, _, _ = self._get_branch_and_dates(request)
@@ -11134,7 +11145,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 parent=styles['Normal'],
                 fontName='Helvetica-Bold',
                 fontSize=7,
-                textColor=colors.HexColor('#475569')
+                textColor=colors.HexColor('#334155')
             )
 
             item_cell_style = ParagraphStyle(
@@ -11142,7 +11153,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 parent=styles['Normal'],
                 fontName='Helvetica',
                 fontSize=7,
-                textColor=colors.HexColor('#334155')
+                textColor=colors.HexColor('#1E293B')
             )
 
             elements = []
@@ -11163,6 +11174,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 [Paragraph("Total Orders Processed", tbl_cell), f"{summary.get('transaction_count', 0)} Txns"],
                 [Paragraph("Average Basket Value", tbl_cell), fmt_pdf_curr(summary.get("avg_basket_value"))],
                 [Paragraph("Credit Sales Exposure", tbl_cell), fmt_pdf_curr(summary.get("credit_sales_exposure"))],
+                [Paragraph("Credit Repayments Collected", tbl_cell), fmt_pdf_curr(summary.get("total_credit_repayments"))],
             ]
 
             sum_table = Table(summary_data, colWidths=[350, 202])
@@ -11266,12 +11278,11 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(sm_table)
                 elements.append(Spacer(1, 10))
 
-            # 6. TRANSACTIONS LEDGER (SUMMARY vs DETAILED MODE)
+            # 6. TRANSACTIONS LEDGER (ORGANIZED SUMMARY vs DETAILED MODE)
             if transactions:
                 elements.append(Paragraph(f"<b>TRANSACTIONS LEDGER ({report_title_suffix})</b>", section_heading))
                 
                 if export_type == "summary":
-                    # Summary PDF Mode: Output main sale rows without line item details
                     tx_data = [[
                         Paragraph("Receipt No", tbl_header),
                         Paragraph("Date / Time", tbl_header),
@@ -11298,8 +11309,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     elements.append(tx_table)
                     elements.append(Spacer(1, 10))
                 else:
-                    # Detailed PDF Mode: Render each transaction followed by its itemized table
+                    # Detailed Mode: Clean structural cards per sale with clear line items
                     for tx in transactions:
+                        tx_elements = []
                         tx_summary_data = [[
                             Paragraph(f"<b>Receipt: {tx.get('receipt_number')}</b>", tbl_header),
                             Paragraph(f"Date: {tx.get('sale_date')}", tbl_cell),
@@ -11310,18 +11322,17 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         tx_sum_table = Table(tx_summary_data, colWidths=[110, 112, 130, 90, 110])
                         tx_sum_table.setStyle(TableStyle([
                             ('ALIGN', (4, 0), (4, -1), 'RIGHT'),
-                            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F8FAFC')),
+                            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#004D40')),
+                            ('TEXTCOLOR', (0, 0), (-1, -1), colors.white),
                             ('TOPPADDING', (0, 0), (-1, -1), 4),
                             ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-                            ('LINEBELOW', (0, 0), (-1, -1), 1, colors.HexColor('#CBD5E1')),
                         ]))
-                        elements.append(tx_sum_table)
+                        tx_elements.append(tx_sum_table)
 
-                        # Render itemized lines for detailed report
                         items = tx.get("items", [])
                         if items:
                             item_table_data = [[
-                                Paragraph("Item Name", item_header_style),
+                                Paragraph("Product / Item Name", item_header_style),
                                 Paragraph("Qty", item_header_style),
                                 Paragraph("Unit Price", item_header_style),
                                 Paragraph("Discount", item_header_style),
@@ -11340,16 +11351,47 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                             item_table = Table(item_table_data, colWidths=[182, 40, 80, 70, 90, 90])
                             item_table.setStyle(TableStyle([
                                 ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-                                ('TOPPADDING', (0, 0), (-1, -1), 2),
-                                ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
-                                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
-                                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#F1F5F9')),
+                                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E6FFFA')),
+                                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
                             ]))
-                            elements.append(item_table)
-                        elements.append(Spacer(1, 6))
+                            tx_elements.append(item_table)
+                        
+                        tx_elements.append(Spacer(1, 6))
+                        elements.append(KeepTogether(tx_elements))
                     elements.append(Spacer(1, 10))
 
-            # 7. Resolved Payment Channel Distribution
+            # 7. CREDIT REPAYMENTS COLLECTED TABLE (PDF)
+            if repayments_list:
+                elements.append(Paragraph("<b>CREDIT REPAYMENTS COLLECTED LEDGER</b>", section_heading))
+                rep_data = [[
+                    Paragraph("Date", tbl_header),
+                    Paragraph("Customer", tbl_header),
+                    Paragraph("Ref / Receipt", tbl_header),
+                    Paragraph("Payment Method", tbl_header),
+                    Paragraph("Amount Collected", tbl_header)
+                ]]
+                for rep in repayments_list:
+                    rep_data.append([
+                        Paragraph(str(rep.get("date")), tbl_cell),
+                        Paragraph(str(rep.get("customer_name")), tbl_cell),
+                        Paragraph(str(rep.get("reference_number")), tbl_cell),
+                        Paragraph(str(rep.get("payment_method")), tbl_cell),
+                        fmt_pdf_curr(rep.get("amount"))
+                    ])
+                rep_table = Table(rep_data, colWidths=[90, 152, 110, 100, 100])
+                rep_table.setStyle(TableStyle([
+                    ('ALIGN', (4, 0), (4, -1), 'RIGHT'),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
+                    ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ]))
+                elements.append(rep_table)
+                elements.append(Spacer(1, 10))
+
+            # 8. RESOLVED PAYMENT CHANNEL DISTRIBUTION
             if payment_breakdown:
                 elements.append(Paragraph("<b>RESOLVED PAYMENT CHANNEL DISTRIBUTION</b>", section_heading))
                 pm_data = [[
