@@ -10417,27 +10417,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     pass
         return []
 
-    def _is_credit_sale(self, sale, credit_transaction_ids=None):
-        """Determines if a sale is a credit invoice matching FinancialReportViewSet rules."""
-        method = self._normalize_payment_method(getattr(sale, "payment_method", None))
-
-        if method == "CREDIT" or getattr(sale, "is_invoice", False):
-            return True
-
-        sale_id = getattr(sale, "pk", None)
-        if credit_transaction_ids is not None and sale_id in credit_transaction_ids:
-            return True
-
-        balance_due = getattr(sale, "balance_due", None)
-        if balance_due is not None:
-            try:
-                if Decimal(str(balance_due or ZERO)) > ZERO:
-                    return True
-            except Exception:
-                pass
-
-        return False
-
     def _get_branch_and_dates(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
         start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
@@ -10540,13 +10519,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
 
-            # Identify all credit transaction IDs (matching FinancialReportViewSet logic)
-            credit_transaction_ids = set(
-                CreditRepayment.objects.exclude(transaction_id=None)
-                .values_list("transaction_id", flat=True)
-                .distinct()
-            )
-
             # Channel tracking accumulators
             cash_total = ZERO
             paybill_total = ZERO
@@ -10559,19 +10531,18 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             transaction_count = sales_qs.count()
 
-            # 1. PROCESS SALES & SPLIT PAYMENTS (Exact FinancialReportViewSet algorithm)
+            # 1. PROCESS SALES & SPLIT PAYMENTS
             sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
 
             for sale in sales_with_payments:
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
                 method = self._normalize_payment_method(sale.payment_method)
                 split_records = self._get_split_payments(sale)
-                is_credit = self._is_credit_sale(sale, credit_transaction_ids)
 
-                if method == "SPLIT" or split_records:
+                if method == "SPLIT" or (split_records and len(split_records) > 0):
                     for sp in split_records:
                         sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
-                        sp_amount = quantize_money(sp.amount or ZERO)
+                        sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
 
                         if sp_method == "CASH":
                             cash_total += sp_amount
@@ -10588,7 +10559,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         else:
                             other_total += sp_amount
                 else:
-                    if is_credit:
+                    if method == "CREDIT":
                         credit_sales_exposure += sale_amt
                     elif method == "CASH":
                         cash_total += sale_amt
@@ -10600,8 +10571,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         mpesa_std_total += sale_amt
                     elif method == "BANK_TRANSFER":
                         bank_total += sale_amt
-                    elif method == "CREDIT":
-                        credit_sales_exposure += sale_amt
                     else:
                         other_total += sale_amt
 
