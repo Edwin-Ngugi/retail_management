@@ -10417,6 +10417,27 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     pass
         return []
 
+    def _is_credit_sale(self, sale, credit_transaction_ids=None):
+        """Determines if a sale is a credit invoice matching FinancialReportViewSet rules."""
+        method = self._normalize_payment_method(getattr(sale, "payment_method", None))
+
+        if method == "CREDIT" or getattr(sale, "is_invoice", False):
+            return True
+
+        sale_id = getattr(sale, "pk", None)
+        if credit_transaction_ids is not None and sale_id in credit_transaction_ids:
+            return True
+
+        balance_due = getattr(sale, "balance_due", None)
+        if balance_due is not None:
+            try:
+                if Decimal(str(balance_due or ZERO)) > ZERO:
+                    return True
+            except Exception:
+                pass
+
+        return False
+
     def _get_branch_and_dates(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
         start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
