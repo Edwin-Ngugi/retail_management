@@ -10235,30 +10235,131 @@ def to_decimal(val):
     except Exception:
         return ZERO
 
+def generate_pdf_vendor_chart(suppliers_data):
+    """Generates a PNG byte stream of Top Vendor Spend Allocation."""
+    if not suppliers_data:
+        return None
+
+    top_sups = suppliers_data[:5]
+    names = [(s.get('supplier_name') or 'Vendor')[:15] for s in top_sups]
+    spends = [float(s.get('total_spend', 0)) for s in top_sups]
+
+    if not any(spends):
+        return None
+
+    x = range(len(names))
+    fig, ax = plt.subplots(figsize=(7, 2.6), dpi=150)
+    ax.bar(x, spends, width=0.4, color='#0D9488', label='Total Spend')
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(names, rotation=20, ha='right', fontsize=7)
+    ax.tick_params(axis='y', labelsize=7)
+    ax.legend(fontsize=7, loc='upper right')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+
+    img_buf = io.BytesIO()
+    plt.savefig(img_buf, format='png', transparent=False, facecolor='white')
+    plt.close(fig)
+    img_buf.seek(0)
+    return Image(img_buf, width=520, height=190)
+
+
+def generate_pdf_payables_pie(summary):
+    """Generates a PNG byte stream of Settlement & Payables Ratio."""
+    paid = float(summary.get('total_paid_suppliers', 0))
+    payable = float(summary.get('outstanding_payables', 0))
+
+    if paid <= 0 and payable <= 0:
+        return None
+
+    labels = ['Disbursed Payments', 'Outstanding Payables']
+    sizes = [paid, payable]
+    colors_list = ['#0D9488', '#F59E0B']
+
+    fig, ax = plt.subplots(figsize=(4.5, 2.6), dpi=150)
+    wedges, texts, autotexts = ax.pie(
+        sizes,
+        labels=labels,
+        autopct='%1.1f%%',
+        colors=colors_list,
+        textprops={'fontsize': 7},
+        startangle=140
+    )
+    for autotext in autotexts:
+        autotext.set_color('white')
+        autotext.set_weight('bold')
+
+    plt.tight_layout()
+
+    img_buf = io.BytesIO()
+    plt.savefig(img_buf, format='png', transparent=False, facecolor='white')
+    plt.close(fig)
+    img_buf.seek(0)
+    return Image(img_buf, width=320, height=185)
+
+
 class PurchaseAnalyticsViewSet(viewsets.ViewSet):
     """
     Dedicated ViewSet for Procurement, Purchase Orders, Goods Received Notes (GRN),
-    Supplier Invoices, Payments, and Accounts Payable Analytics.
+    Supplier Invoices, Payments, Accounts Payable Analytics, and PDF Exports.
     """
     permission_classes = [permissions.AllowAny]
 
     def _get_filters(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
+        period_type = (request.query_params.get("period_type") or request.query_params.get("period") or "").lower()
+        selected_date_str = request.query_params.get("selectedDate") or request.query_params.get("date")
+        year_param = request.query_params.get("year")
+        month_param = request.query_params.get("month")
+
         start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
         end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
 
-        start_date, end_date = None, None
-        if start_param:
-            try:
-                start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
-            except ValueError:
-                pass
+        start_date = None
+        end_date = None
+        today = timezone.now().date()
 
-        if end_param:
-            try:
-                end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
-            except ValueError:
-                pass
+        if period_type in ["day", "daily"]:
+            ref_date = today
+            if selected_date_str:
+                try:
+                    ref_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            start_date = ref_date
+            end_date = ref_date
+
+        elif period_type in ["week", "weekly"]:
+            ref_date = today
+            if selected_date_str:
+                try:
+                    ref_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            start_date = ref_date - timedelta(days=ref_date.weekday())
+            end_date = start_date + timedelta(days=6)
+
+        elif period_type in ["month", "monthly"]:
+            y = int(year_param) if year_param and str(year_param).isdigit() else today.year
+            m = int(month_param) if month_param and str(month_param).isdigit() else today.month
+            start_date = date(y, m, 1)
+            last_day = calendar.monthrange(y, m)[1]
+            end_date = date(y, m, last_day)
+
+        elif period_type in ["year", "yearly"]:
+            y = int(year_param) if year_param and str(year_param).isdigit() else today.year
+            start_date = date(y, 1, 1)
+            end_date = date(y, 12, 31)
+
+        if not start_date or not end_date:
+            if start_param and end_param:
+                try:
+                    start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
+                    end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
 
         tz = timezone.get_current_timezone()
         start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
@@ -10275,7 +10376,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
         return branch_obj, start_date, end_date, start_dt, end_dt
 
     # --------------------------------------------------------------------------
-    # 1. /management-analytics/purchases-overview/
+    # 1. /purchases-analytics/purchases-overview/
     # --------------------------------------------------------------------------
     @action(detail=False, methods=['get'], url_path='purchases-overview')
     def purchases_overview(self, request):
@@ -10296,26 +10397,23 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
 
             po_count = po_qs.count()
 
-            # Primary: Aggregate directly from PurchaseOrder header records
             if po_count > 0:
                 total_procurement_spend = ZERO
                 total_paid_suppliers = ZERO
 
                 for po in po_qs:
-                    po_total = to_decimal(po.total_amount)
+                    po_total = to_decimal(getattr(po, 'total_amount', 0))
                     total_procurement_spend += po_total
 
-                    # Check if non-credit purchase method or amount_paid recorded
                     if getattr(po, 'payment_method', 'CASH') != 'CREDIT':
                         total_paid_suppliers += po_total
                     else:
-                        total_paid_suppliers += to_decimal(po.amount_paid)
+                        total_paid_suppliers += to_decimal(getattr(po, 'amount_paid', 0))
 
                 po_items = PurchaseOrderItem.objects.filter(purchase_order__in=po_qs)
                 total_units_purchased = to_decimal(po_items.aggregate(total=Sum('quantity'))['total'])
                 orders_count = po_count
             else:
-                # Fallback to direct Purchase entries
                 purchases_qs = Purchase.objects.all()
                 if branch_obj:
                     purchases_qs = purchases_qs.filter(branch=branch_obj)
@@ -10327,8 +10425,8 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                 total_units_purchased = ZERO
 
                 for p in purchases_qs:
-                    p_qty = to_decimal(p.quantity)
-                    p_cost = to_decimal(p.unit_cost_price)
+                    p_qty = to_decimal(getattr(p, 'quantity', 0))
+                    p_cost = to_decimal(getattr(p, 'unit_cost_price', 0))
                     p_total = p_qty * p_cost
 
                     total_procurement_spend += p_total
@@ -10337,7 +10435,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                     if getattr(p, 'payment_method', 'CASH') != 'CREDIT':
                         total_paid_suppliers += p_total
                     else:
-                        total_paid_suppliers += to_decimal(p.amount_paid)
+                        total_paid_suppliers += to_decimal(getattr(p, 'amount_paid', 0))
 
                 orders_count = purchases_qs.count()
 
@@ -10359,13 +10457,12 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # --------------------------------------------------------------------------
-    # 2. /management-analytics/purchase-orders/
+    # 2. /purchases-analytics/purchase-orders/
     # --------------------------------------------------------------------------
     @action(detail=False, methods=['get'], url_path='purchase-orders')
     def purchase_orders(self, request):
         try:
             branch_obj, _, _, start_dt, end_dt = self._get_filters(request)
-            
             po_qs = PurchaseOrder.objects.select_related('supplier', 'branch').prefetch_related('items__item')
 
             if branch_obj:
@@ -10377,10 +10474,23 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
 
             if po_qs.exists():
                 for po in po_qs.order_by('-created_at'):
-                    supplier_name = po.supplier_name or (po.supplier.name if po.supplier else "N/A")
+                    supplier_name = getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "N/A")
                     items_list = list(po.items.all())
-                    
-                    total_qty = sum(to_decimal(item.quantity) for item in items_list)
+
+                    items_data = []
+                    total_qty = ZERO
+                    for item in items_list:
+                        q = to_decimal(getattr(item, 'quantity', 0))
+                        c = to_decimal(getattr(item, 'unit_cost_price', 0))
+                        tot = q * c
+                        total_qty += q
+                        items_data.append({
+                            "item_name": item.item.name if item.item else "Restock Item",
+                            "quantity": float(q),
+                            "unit_cost": float(quantize_money(c)),
+                            "total_cost": float(quantize_money(tot))
+                        })
+
                     item_names = ", ".join(
                         [item.item.name for item in items_list if item.item]
                     ) or "Multiple Items"
@@ -10392,8 +10502,9 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                         "supplier_name": supplier_name,
                         "item_name": item_names,
                         "quantity": float(total_qty),
-                        "total_cost": float(quantize_money(to_decimal(po.total_amount))),
+                        "total_cost": float(quantize_money(to_decimal(getattr(po, 'total_amount', 0)))),
                         "payment_method": getattr(po, 'payment_method', 'CASH'),
+                        "items": items_data
                     })
             else:
                 purchases_qs = Purchase.objects.select_related('supplier', 'item', 'branch')
@@ -10403,11 +10514,11 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                     purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
 
                 for p in purchases_qs.order_by('-purchase_date'):
-                    supplier_name = p.supplier_name or (p.supplier.name if p.supplier else "N/A")
+                    supplier_name = getattr(p, 'supplier_name', None) or (p.supplier.name if p.supplier else "N/A")
                     item_name = p.item.name if p.item else f"Item #{p.item_id}"
-                    
-                    qty_dec = to_decimal(p.quantity)
-                    cost_dec = to_decimal(p.unit_cost_price)
+
+                    qty_dec = to_decimal(getattr(p, 'quantity', 0))
+                    cost_dec = to_decimal(getattr(p, 'unit_cost_price', 0))
                     total_cost = quantize_money(qty_dec * cost_dec)
 
                     results.append({
@@ -10419,6 +10530,12 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                         "quantity": float(qty_dec),
                         "total_cost": float(total_cost),
                         "payment_method": getattr(p, 'payment_method', 'CASH'),
+                        "items": [{
+                            "item_name": item_name,
+                            "quantity": float(qty_dec),
+                            "unit_cost": float(quantize_money(cost_dec)),
+                            "total_cost": float(total_cost)
+                        }]
                     })
 
             return Response(results, status=status.HTTP_200_OK)
@@ -10428,7 +10545,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # --------------------------------------------------------------------------
-    # 3. /management-analytics/goods-received/
+    # 3. /purchases-analytics/goods-received/
     # --------------------------------------------------------------------------
     @action(detail=False, methods=['get'], url_path='goods-received')
     def goods_received(self, request):
@@ -10446,10 +10563,10 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                 results.append({
                     "id": po.id,
                     "grn_number": f"GRN-{po.id}",
-                    "po_number": po.po_number or f"PO-{po.id}",
-                    "supplier_name": po.supplier_name or (po.supplier.name if po.supplier else "N/A"),
+                    "po_number": getattr(po, 'po_number', f"PO-{po.id}"),
+                    "supplier_name": getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "N/A"),
                     "received_date": po.created_at.strftime('%Y-%m-%d') if po.created_at else "",
-                    "notes": f"Goods received for Order #{po.po_number}",
+                    "notes": f"Goods received for Order #{getattr(po, 'po_number', po.id)}",
                 })
 
             return Response(results, status=status.HTTP_200_OK)
@@ -10459,7 +10576,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # --------------------------------------------------------------------------
-    # 4. /management-analytics/supplier-invoices/
+    # 4. /purchases-analytics/supplier-invoices/
     # --------------------------------------------------------------------------
     @action(detail=False, methods=['get'], url_path='supplier-invoices')
     def supplier_invoices(self, request):
@@ -10474,12 +10591,14 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
 
             results = []
             for po in po_qs.order_by('-created_at'):
-                is_paid = (getattr(po, 'payment_method', 'CASH') != 'CREDIT') or (to_decimal(po.amount_paid) >= to_decimal(po.total_amount))
+                tot_amt = to_decimal(getattr(po, 'total_amount', 0))
+                amt_paid = to_decimal(getattr(po, 'amount_paid', 0))
+                is_paid = (getattr(po, 'payment_method', 'CASH') != 'CREDIT') or (amt_paid >= tot_amt)
                 results.append({
                     "id": po.id,
                     "invoice_number": f"INV-{po.id}",
-                    "supplier_name": po.supplier_name or (po.supplier.name if po.supplier else "N/A"),
-                    "total_cost": float(quantize_money(to_decimal(po.total_amount))),
+                    "supplier_name": getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "N/A"),
+                    "total_cost": float(quantize_money(tot_amt)),
                     "invoice_date": po.created_at.strftime('%Y-%m-%d') if po.created_at else "",
                     "due_date": "",
                     "is_paid": is_paid
@@ -10492,7 +10611,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # --------------------------------------------------------------------------
-    # 5. /management-analytics/supplier-payments/
+    # 5. /purchases-analytics/supplier-payments/
     # --------------------------------------------------------------------------
     @action(detail=False, methods=['get'], url_path='supplier-payments')
     def supplier_payments(self, request):
@@ -10508,8 +10627,8 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             results = []
             for pay in pay_qs.order_by('-created_at'):
                 p = pay.purchase
-                supplier_name = p.supplier_name or (p.supplier.name if p and p.supplier else "N/A") if p else "N/A"
-                
+                supplier_name = getattr(p, 'supplier_name', None) or (p.supplier.name if p and p.supplier else "N/A") if p else "N/A"
+
                 results.append({
                     "id": pay.id,
                     "payment_ref": f"PAY-{pay.id}",
@@ -10526,7 +10645,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # --------------------------------------------------------------------------
-    # 6. /management-analytics/suppliers-list/
+    # 6. /purchases-analytics/suppliers-list/
     # --------------------------------------------------------------------------
     @action(detail=False, methods=['get'], url_path='suppliers-list')
     def suppliers_list(self, request):
@@ -10550,26 +10669,26 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
 
                 if po_count > 0:
                     for po in po_qs:
-                        po_total = to_decimal(po.total_amount)
+                        po_total = to_decimal(getattr(po, 'total_amount', 0))
                         total_spend += po_total
                         if getattr(po, 'payment_method', 'CASH') != 'CREDIT':
                             total_paid += po_total
                         else:
-                            total_paid += to_decimal(po.amount_paid)
+                            total_paid += to_decimal(getattr(po, 'amount_paid', 0))
                 else:
                     purchases_qs = Purchase.objects.filter(Q(supplier=sup) | Q(supplier_name__iexact=sup.name))
                     if branch_obj:
                         purchases_qs = purchases_qs.filter(branch=branch_obj)
                     if start_dt and end_dt:
                         purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
-                    
+
                     for p in purchases_qs:
-                        p_total = to_decimal(p.quantity) * to_decimal(p.unit_cost_price)
+                        p_total = to_decimal(getattr(p, 'quantity', 0)) * to_decimal(getattr(p, 'unit_cost_price', 0))
                         total_spend += p_total
                         if getattr(p, 'payment_method', 'CASH') != 'CREDIT':
                             total_paid += p_total
                         else:
-                            total_paid += to_decimal(p.amount_paid)
+                            total_paid += to_decimal(getattr(p, 'amount_paid', 0))
 
                     po_count = purchases_qs.count()
 
@@ -10590,6 +10709,290 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             logger.exception("Error fetching suppliers list")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    # --------------------------------------------------------------------------
+    # 7. /purchases-analytics/export-purchases-pdf/
+    # --------------------------------------------------------------------------
+    @action(detail=False, methods=['get'], url_path='export-purchases-pdf')
+    def export_purchases_pdf(self, request):
+        try:
+            overview_res = self.purchases_overview(request)
+            orders_res = self.purchase_orders(request)
+            suppliers_res = self.suppliers_list(request)
+
+            summary = overview_res.data.get("summary", {}) if overview_res.status_code == 200 else {}
+            orders = orders_res.data if orders_res.status_code == 200 else []
+            suppliers = suppliers_res.data if suppliers_res.status_code == 200 else []
+
+            export_type = (request.query_params.get("export_type") or request.query_params.get("type") or "summary").lower()
+            branch_obj, start_date, end_date, _, _ = self._get_filters(request)
+            branch_name = branch_obj.name if branch_obj else "All Branches"
+            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}" if start_date and end_date else "All Time"
+
+            def fmt_pdf_curr(val):
+                num = float(val or 0)
+                if num < 0:
+                    return f"(KSh {abs(num):,.2f})"
+                return f"KSh {num:,.2f}"
+
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                rightMargin=30,
+                leftMargin=30,
+                topMargin=30,
+                bottomMargin=30
+            )
+
+            styles = getSampleStyleSheet()
+
+            company_style = ParagraphStyle(
+                'PurCompanyHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=15,
+                leading=18,
+                textColor=colors.HexColor('#0F766E'),
+                alignment=1,
+                spaceAfter=3
+            )
+
+            subtitle_style = ParagraphStyle(
+                'PurSubHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=9,
+                leading=12,
+                textColor=colors.HexColor('#475569'),
+                alignment=1,
+                spaceAfter=10
+            )
+
+            section_heading = ParagraphStyle(
+                'PurSectionHead',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=10,
+                leading=14,
+                textColor=colors.HexColor('#0F172A'),
+                spaceAfter=6
+            )
+
+            tbl_header = ParagraphStyle(
+                'PurTh',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=8,
+                textColor=colors.HexColor('#0F172A')
+            )
+
+            tbl_cell = ParagraphStyle(
+                'PurTd',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=8,
+                textColor=colors.HexColor('#1E293B')
+            )
+
+            po_header_white = ParagraphStyle(
+                'PurPoHeaderWhite',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=8,
+                textColor=colors.white
+            )
+
+            po_cell_white = ParagraphStyle(
+                'PurPoCellWhite',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=8,
+                textColor=colors.white
+            )
+
+            item_header_style = ParagraphStyle(
+                'PurItemTh',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=7,
+                textColor=colors.HexColor('#0F766E')
+            )
+
+            item_cell_style = ParagraphStyle(
+                'PurItemTd',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=7,
+                textColor=colors.HexColor('#1E293B')
+            )
+
+            elements = []
+
+            # 1. Header Title
+            report_title_suffix = "DETAILED RESTOCK REPORT" if export_type == "detailed" else "EXECUTIVE SUMMARY REPORT"
+            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
+            elements.append(Paragraph(f"<b>PROCUREMENT AUDIT ({report_title_suffix}) — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
+            elements.append(Spacer(1, 6))
+
+            # 2. Executive Indicators KPI Table
+            elements.append(Paragraph("<b>EXECUTIVE PROCUREMENT INDICATORS</b>", section_heading))
+            summary_data = [
+                [Paragraph("Total Procurement Spend", tbl_header), fmt_pdf_curr(summary.get("total_procurement_spend"))],
+                [Paragraph("Total Disbursed to Suppliers", tbl_cell), fmt_pdf_curr(summary.get("total_paid_suppliers"))],
+                [Paragraph("Outstanding Payables", tbl_header), fmt_pdf_curr(summary.get("outstanding_payables"))],
+                [Paragraph("Purchase Orders Issued", tbl_cell), f"{summary.get('purchase_orders_count', 0)} Orders"],
+                [Paragraph("Total Restocked Units", tbl_cell), f"{summary.get('total_units_purchased', 0)} Units"],
+                [Paragraph("Supplier Returns Count", tbl_cell), f"{summary.get('supplier_returns_count', 0)} Returns"],
+            ]
+
+            sum_table = Table(summary_data, colWidths=[350, 202])
+            sum_table.setStyle(TableStyle([
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F0FDFA')),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#CCFBF1')),
+            ]))
+            elements.append(sum_table)
+            elements.append(Spacer(1, 10))
+
+            # 3. GRAPHICAL CHARTS GENERATION & EMBEDDING
+            vendor_img = generate_pdf_vendor_chart(suppliers)
+            payables_img = generate_pdf_payables_pie(summary)
+
+            if vendor_img or payables_img:
+                elements.append(Paragraph("<b>PROCUREMENT ANALYTICS & PAYABLES CHARTS</b>", section_heading))
+                if vendor_img and payables_img:
+                    chart_table = Table([[vendor_img], [payables_img]], colWidths=[552])
+                    chart_table.setStyle(TableStyle([
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                        ('TOPPADDING', (0, 0), (-1, -1), 4),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                    ]))
+                    elements.append(chart_table)
+                elif vendor_img:
+                    elements.append(vendor_img)
+                elif payables_img:
+                    elements.append(payables_img)
+                elements.append(Spacer(1, 10))
+
+            # 4. PURCHASE ORDERS LEDGER (SUMMARY vs DETAILED MODE)
+            if orders:
+                elements.append(Paragraph(f"<b>PURCHASE ORDERS LEDGER ({report_title_suffix})</b>", section_heading))
+
+                if export_type == "summary":
+                    po_table_data = [[
+                        Paragraph("PO Ref", tbl_header),
+                        Paragraph("Date", tbl_header),
+                        Paragraph("Supplier", tbl_header),
+                        Paragraph("Terms", tbl_header),
+                        Paragraph("Total Cost", tbl_header)
+                    ]]
+                    for po in orders:
+                        po_table_data.append([
+                            Paragraph(str(po.get("po_number")), tbl_cell),
+                            Paragraph(str(po.get("purchase_date")), tbl_cell),
+                            Paragraph(str(po.get("supplier_name")), tbl_cell),
+                            Paragraph(str(po.get("payment_method")), tbl_cell),
+                            fmt_pdf_curr(po.get("total_cost"))
+                        ])
+                    po_table = Table(po_table_data, colWidths=[100, 112, 140, 90, 110])
+                    po_table.setStyle(TableStyle([
+                        ('ALIGN', (4, 0), (4, -1), 'RIGHT'),
+                        ('TOPPADDING', (0, 0), (-1, -1), 4),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
+                        ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                    ]))
+                    elements.append(po_table)
+                    elements.append(Spacer(1, 10))
+                else:
+                    # Detailed Mode: Render order headers followed by itemized restock lines
+                    for po in orders:
+                        po_elements = []
+                        po_summary_data = [[
+                            Paragraph(f"<b>PO Ref: {po.get('po_number')}</b>", po_header_white),
+                            Paragraph(f"Date: {po.get('purchase_date')}", po_cell_white),
+                            Paragraph(f"Supplier: {po.get('supplier_name')}", po_cell_white),
+                            Paragraph(f"Terms: {po.get('payment_method')}", po_cell_white),
+                            Paragraph(f"<b>Total: {fmt_pdf_curr(po.get('total_cost'))}</b>", po_header_white)
+                        ]]
+                        po_sum_table = Table(po_summary_data, colWidths=[110, 112, 130, 90, 110])
+                        po_sum_table.setStyle(TableStyle([
+                            ('ALIGN', (4, 0), (4, -1), 'RIGHT'),
+                            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0F766E')),
+                            ('TOPPADDING', (0, 0), (-1, -1), 4),
+                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                        ]))
+                        po_elements.append(po_sum_table)
+
+                        items = po.get("items", [])
+                        if items:
+                            item_table_data = [[
+                                Paragraph("Restock Product Name", item_header_style),
+                                Paragraph("Qty Restocked", item_header_style),
+                                Paragraph("Unit Cost Price", item_header_style),
+                                Paragraph("Subtotal Cost", item_header_style)
+                            ]]
+                            for it in items:
+                                item_table_data.append([
+                                    Paragraph(str(it.get("item_name")), item_cell_style),
+                                    Paragraph(str(it.get("quantity")), item_cell_style),
+                                    fmt_pdf_curr(it.get("unit_cost")),
+                                    fmt_pdf_curr(it.get("total_cost"))
+                                ])
+                            item_table = Table(item_table_data, colWidths=[242, 100, 100, 110])
+                            item_table.setStyle(TableStyle([
+                                ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F0FDFA')),
+                                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CCFBF1')),
+                            ]))
+                            po_elements.append(item_table)
+
+                        po_elements.append(Spacer(1, 6))
+                        elements.append(KeepTogether(po_elements))
+                    elements.append(Spacer(1, 10))
+
+            # 5. VENDOR DIRECTORY & OUTSTANDING PAYABLES TABLE
+            if suppliers:
+                elements.append(Paragraph("<b>VENDOR DIRECTORY & OUTSTANDING PAYABLES LEDGER</b>", section_heading))
+                sup_data = [[
+                    Paragraph("Supplier Name", tbl_header),
+                    Paragraph("Orders Count", tbl_header),
+                    Paragraph("Lifetime Restock Spend", tbl_header),
+                    Paragraph("Outstanding Payable", tbl_header)
+                ]]
+                for sup in suppliers:
+                    sup_data.append([
+                        Paragraph(str(sup.get("supplier_name")), tbl_cell),
+                        Paragraph(str(sup.get("total_purchases_count")), tbl_cell),
+                        fmt_pdf_curr(sup.get("total_spend")),
+                        fmt_pdf_curr(sup.get("outstanding_balance"))
+                    ])
+                sup_table = Table(sup_data, colWidths=[200, 100, 126, 126])
+                sup_table.setStyle(TableStyle([
+                    ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
+                    ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ]))
+                elements.append(sup_table)
+
+            doc.build(elements)
+            buffer.seek(0)
+
+            filename_prefix = "Detailed_Procurement" if export_type == "detailed" else "Summary_Procurement"
+            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="{filename_prefix}_Report_{branch_name}.pdf"'
+            return response
+
+        except Exception as e:
+            logger.exception("Export Purchases PDF Error")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 def generate_pdf_trend_chart(daily_trends):
     """Generates a PNG byte stream of Revenue vs COGS vs Profit."""
     if not daily_trends:
