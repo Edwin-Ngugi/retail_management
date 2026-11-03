@@ -9814,99 +9814,122 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
             # -----------------------------------------------------------------
-            # 1. FETCH & AGGREGATE CASHBOOK LEDGER ENTRIES
+            # 1. BASE QUERYSETS FOR PERIOD & BRANCH
             # -----------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(
-                Q(sale_date__range=(start_dt, end_dt)) | Q(sale_date__date__range=(start_date, end_date))
-            )
-            repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+            sales_qs = SaleTransaction.objects.all()
+            repayment_qs = CreditRepayment.objects.all()
+            expenses_qs = Expense.objects.all()
+            purchases_qs = Purchase.objects.all()
+
+            if start_dt and end_dt:
+                sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
+            if start_date and end_date:
+                repayment_qs = repayment_qs.filter(date__range=(start_date, end_date))
+                expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
+                purchases_qs = purchases_qs.filter(purchase_date__range=(start_date, end_date))
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                repayment_qs = repayment_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+                )
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
 
-            entries = []
+            # -----------------------------------------------------------------
+            # 2. AGGREGATE CHANNEL TOTALS (MATCHING UI SUMMARY)
+            # -----------------------------------------------------------------
+            cash_total = ZERO
+            paybill_total = ZERO
+            send_money_total = ZERO
 
-            # Inflows: Cash/Liquid Sales
-            for sale in sales_qs:
-                bd = getattr(sale, 'liquid_payments_breakdown', {})
-                inflow_amt = bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO) + bd.get('SEND_MONEY', ZERO)
-                if inflow_amt > ZERO:
-                    entries.append({
-                        'ref': sale.receipt_number or f"SALE-{sale.id}",
-                        'desc': f"Customer Sale ({sale.payment_method or 'LIQUID'})",
-                        'type': 'INFLOW',
-                        'inflow': float(inflow_amt),
-                        'outflow': 0.0
-                    })
+            # Aggregate sales channels
+            sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
+            for sale in sales_with_payments:
+                sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
+                method = self._normalize_payment_method(getattr(sale, "payment_method", None))
+                split_records = self._get_split_payments(sale)
 
-            # Inflows: Debt Repayments
-            for rep in repayments_qs:
-                amt = float(rep.amount or 0)
-                if amt > 0:
-                    cust_name = rep.customer.name if getattr(rep, 'customer', None) else "Customer"
-                    entries.append({
-                        'ref': f"REP-{rep.id}",
-                        'desc': f"Credit Debt Recovery — {cust_name}",
-                        'type': 'INFLOW',
-                        'inflow': amt,
-                        'outflow': 0.0
-                    })
+                if method == "SPLIT" or (split_records and len(split_records) > 0):
+                    for sp in split_records:
+                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
+                        sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
+                        if sp_method == "CASH":
+                            cash_total += sp_amount
+                        elif sp_method == "PAYBILL":
+                            paybill_total += sp_amount
+                        elif sp_method == "SEND_MONEY" or sp_method == "MPESA":
+                            send_money_total += sp_amount
+                else:
+                    if method == "CASH":
+                        cash_total += sale_amt
+                    elif method == "PAYBILL":
+                        paybill_total += sale_amt
+                    elif method == "SEND_MONEY" or method == "MPESA":
+                        send_money_total += sale_amt
 
-            # Outflows: Operating Expenses
-            for exp in expenses_qs:
-                amt = float(exp.amount or 0)
-                if amt > 0:
-                    entries.append({
-                        'ref': f"EXP-{exp.id}",
-                        'desc': f"Operating Expense — {exp.description or exp.category}",
-                        'type': 'OUTFLOW',
-                        'inflow': 0.0,
-                        'outflow': amt
-                    })
+            # Aggregate debt repayments into cash flow channels
+            for rep in repayment_qs:
+                rep_amt = quantize_money(rep.amount or ZERO)
+                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
+                if rep_method == "PAYBILL":
+                    paybill_total += rep_amt
+                elif rep_method in ["SEND_MONEY", "MPESA"]:
+                    send_money_total += rep_amt
+                else:
+                    cash_total += rep_amt
 
-            # Outflows: Direct Purchases
-            for pur in purchases_qs.exclude(payment_method='CREDIT').filter(supplier_payments__isnull=True):
-                amt = float(pur.amount_paid or 0)
-                if amt > 0:
-                    supp_name = pur.supplier.name if getattr(pur, 'supplier', None) else "Supplier"
-                    entries.append({
-                        'ref': f"PUR-{pur.id}",
-                        'desc': f"Direct Stock Purchase — {supp_name}",
-                        'type': 'OUTFLOW',
-                        'inflow': 0.0,
-                        'outflow': amt
-                    })
+            # Aggregate total purchases and operating expenses
+            tot_purchases = purchases_qs.aggregate(
+                total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField())
+            )['total']
 
-            # Outflows: Supplier Repayments
-            for sp in supplier_payments_qs:
-                amt = float(sp.amount or 0)
-                if amt > 0:
-                    entries.append({
-                        'ref': f"SUPP-{sp.id}",
-                        'desc': "Supplier Account Settlement",
-                        'type': 'OUTFLOW',
-                        'inflow': 0.0,
-                        'outflow': amt
-                    })
+            tot_expenses = expenses_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
+
+            entries = [
+                {
+                    'ref': 'SUM-CASH',
+                    'desc': 'Total Cash Collections & Repayments',
+                    'type': 'INFLOW',
+                    'inflow': float(cash_total),
+                    'outflow': 0.0
+                },
+                {
+                    'ref': 'SUM-PAYBILL',
+                    'desc': 'Total Paybill Collections',
+                    'type': 'INFLOW',
+                    'inflow': float(paybill_total),
+                    'outflow': 0.0
+                },
+                {
+                    'ref': 'SUM-SENDMONEY',
+                    'desc': 'Total Send Money / M-Pesa Collections',
+                    'type': 'INFLOW',
+                    'inflow': float(send_money_total),
+                    'outflow': 0.0
+                },
+                {
+                    'ref': 'SUM-PURCHASES',
+                    'desc': 'Total Cost of Goods Purchased & Supplier Outflows',
+                    'type': 'OUTFLOW',
+                    'inflow': 0.0,
+                    'outflow': float(tot_purchases)
+                },
+                {
+                    'ref': 'SUM-EXPENSES',
+                    'desc': 'Total Operating Expenses',
+                    'type': 'OUTFLOW',
+                    'inflow': 0.0,
+                    'outflow': float(tot_expenses)
+                }
+            ]
 
             tot_inflow = sum(e['inflow'] for e in entries)
             tot_outflow = sum(e['outflow'] for e in entries)
             net_position = tot_inflow - tot_outflow
 
-            # Helper function for PDF currency formatting
             def fmt_pdf_curr(val):
                 num = float(val or 0)
                 if num < 0:
@@ -9914,7 +9937,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 return f"KSh {num:,.2f}"
 
             # -----------------------------------------------------------------
-            # 2. REPORTLAB PDF SETUP
+            # 3. REPORTLAB PDF BUILD
             # -----------------------------------------------------------------
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(
@@ -9977,13 +10000,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 elements.append(Spacer(1, 6))
 
             elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
-            elements.append(Paragraph(f"<b>CASHBOOK LEDGER & LIQUIDITY REPORT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
+            elements.append(Paragraph(f"<b>CASHBOOK AGGREGATION & LIQUIDITY REPORT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
             elements.append(Spacer(1, 8))
 
-            # Table Header
             table_data = [[
                 Paragraph("Ref Code", table_header_style),
-                Paragraph("Description", table_header_style),
+                Paragraph("Channel / Category Description", table_header_style),
                 Paragraph("Type", table_header_style),
                 Paragraph("Inflow (KSh)", table_header_style),
                 Paragraph("Outflow (KSh)", table_header_style)
@@ -9998,7 +10020,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     fmt_pdf_curr(e['outflow']) if e['outflow'] > 0 else "-"
                 ])
 
-            # Summary Totals Row
             table_data.append([
                 Paragraph("<b>TOTALS</b>", table_header_style),
                 Paragraph(f"<b>Net Cash Position: {fmt_pdf_curr(net_position)}</b>", table_header_style),
@@ -10007,13 +10028,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 Paragraph(f"<b>{fmt_pdf_curr(tot_outflow)}</b>", table_header_style)
             ])
 
-            table = Table(table_data, colWidths=[80, 240, 60, 85, 85])
+            table = Table(table_data, colWidths=[90, 230, 60, 85, 85])
             table.setStyle(TableStyle([
                 ('ALIGN', (3, 0), (-1, -1), 'RIGHT'),
                 ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                 ('FONTSIZE', (0, 0), (-1, -1), 8),
-                ('TOPPADDING', (0, 0), (-1, -1), 5),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
                 ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
                 ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#E6FFFA')),
@@ -10025,7 +10046,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             buffer.seek(0)
 
             response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="Cashbook_Ledger_{branch_name}.pdf"'
+            response['Content-Disposition'] = f'attachment; filename="Cashbook_Summary_{branch_name}.pdf"'
             return response
 
         except Exception as e:
