@@ -10675,7 +10675,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "avg_basket_value": float(avg_basket_value),
                 "avg_items_per_basket": avg_items_per_basket,
                 "total_units_sold": float(total_units_sold),
-                "credit_sales_exposure": float(quantize_money(net_credit_balance)),
+                "credit_sales_exposure": float(quantize_money(gross_credit_sales)),
+                "net_credit_exposure": float(quantize_money(net_credit_balance)),
                 "total_credit_repayments": float(quantize_money(period_credit_repayments_total)),
                 "returned_orders_count": returns_qs.count()
             }
@@ -10688,7 +10689,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "SEND_MONEY": send_money_total,
                 "MPESA": mpesa_std_total,
                 "BANK_TRANSFER": bank_total,
-                "CREDIT": net_credit_balance,
+                "CREDIT": gross_credit_sales,
                 "OTHER": other_total,
             }
 
