@@ -10502,15 +10502,22 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
             sales_qs = SaleTransaction.objects.all()
             returns_qs = CustomerReturn.objects.all()
+            repayment_qs = CreditRepayment.objects.all()
 
+            # Date Range Filtering
             if start_dt and end_dt:
                 sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
             if start_date and end_date:
                 returns_qs = returns_qs.filter(date__range=(start_date, end_date))
+                repayment_qs = repayment_qs.filter(date__range=(start_date, end_date))
 
+            # Branch Scope Filtering
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 returns_qs = returns_qs.filter(branch=branch_obj)
+                repayment_qs = repayment_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+                )
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
 
@@ -10521,7 +10528,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             products_map = {}
             daily_map = {}
 
-            # Channel Totals Tracking
+            # Channel Totals Tracking (Matching FinancialReportViewSet breakdown keys)
             channel_totals = {
                 "CASH": ZERO,
                 "MPESA": ZERO,
@@ -10535,11 +10542,10 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
             credit_sales_exposure = ZERO
 
-            # 1. PROCESS SALES & SPLIT PAYMENTS (Direct logic match from FinancialReportViewSet)
+            # 1. PROCESS SALES & SPLIT PAYMENTS
             for sale in sales_qs:
                 method = self._normalize_payment_method(getattr(sale, "payment_method", None))
                 split_records = self._get_split_payments(sale)
-
                 sale_amt = Decimal(str(getattr(sale, "total_amount", 0) or 0))
 
                 if method == "SPLIT" or split_records:
@@ -10565,7 +10571,33 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     else:
                         channel_totals["OTHER"] += amt
 
-            # 2. PROCESS LINE ITEMS FOR REVENUE, COGS, PROFIT, AND DAILY TRENDS
+            # 2. PROCESS CREDIT REPAYMENTS & ROUTE TO RESPECTIVE CHANNELS
+            # (Matches Section 10 of FinancialReportViewSet)
+            period_credit_repayments_total = ZERO
+
+            for rep in repayment_qs.select_related("customer", "transaction"):
+                rep_amt = quantize_money(rep.amount or ZERO)
+                if rep_amt <= ZERO:
+                    continue
+
+                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
+                period_credit_repayments_total += rep_amt
+
+                # Route cash inflows into liquid channels
+                if rep_method == "CASH":
+                    channel_totals["CASH"] += rep_amt
+                elif rep_method == "PAYBILL":
+                    channel_totals["PAYBILL"] += rep_amt
+                elif rep_method == "SEND_MONEY":
+                    channel_totals["SEND_MONEY"] += rep_amt
+                elif rep_method == "BANK_TRANSFER":
+                    channel_totals["BANK_TRANSFER"] += rep_amt
+                elif rep_method == "MPESA":
+                    channel_totals["MPESA"] += rep_amt
+                else:
+                    channel_totals["OTHER"] += rep_amt
+
+            # 3. PROCESS LINE ITEMS FOR REVENUE, COGS, PROFIT, AND DAILY TRENDS
             for line in sale_items_qs:
                 qty = Decimal(str(line.quantity_sold or 0))
                 price = Decimal(str(line.unit_selling_price or 0))
@@ -10610,7 +10642,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 daily_map[day_str]["revenue"] += line_rev
                 daily_map[day_str]["cogs"] += line_cost
 
-            # Format Daily Trends with explicit revenue, cogs, profit keys
+            # Format Daily Trends
             daily_trends = []
             for k, v in sorted(daily_map.items()):
                 if k == "Unknown":
@@ -10632,7 +10664,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             avg_basket_value = quantize_money(total_gross_revenue / transaction_count) if transaction_count > 0 else ZERO
             avg_items_per_basket = round(float(total_units_sold / transaction_count), 2) if transaction_count > 0 else 0.0
 
-            # Fast / Slow Movers Velocity Analysis
+            # Velocity Analysis (Fast / Slow Movers)
             performers = []
             for v in products_map.values():
                 rev_val = v["gross_revenue"]
@@ -10680,18 +10712,17 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "avg_items_per_basket": avg_items_per_basket,
                 "total_units_sold": float(total_units_sold),
                 "credit_sales_exposure": float(quantize_money(credit_sales_exposure)),
+                "total_credit_repayments": float(quantize_money(period_credit_repayments_total)),
                 "returned_orders_count": returns_qs.count()
             }
 
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
-            # Array Breakdown (for Table component)
             payment_breakdown = [
                 {"method": k, "amount": float(quantize_money(v))}
                 for k, v in channel_totals.items() if v > ZERO and k != "SPLIT"
             ]
 
-            # Object Breakdown (for Financial report component)
             payment_channel_breakdown = {
                 k.lower(): float(quantize_money(v))
                 for k, v in channel_totals.items()
