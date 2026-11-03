@@ -9,6 +9,7 @@ from decimal import Decimal
 from datetime import date, datetime, time, timedelta
 import os
 from django.conf import settings
+import collections
 from collections import defaultdict
 
 import matplotlib
