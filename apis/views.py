@@ -6938,7 +6938,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 other_total
             )
 
-            # Receivables calculation
+            # Receivables calculation (Cumulative Recovered Receivables)
             st_credit_filter = (
                 Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) |
                 Q(payment_method='Credit') |
@@ -6957,6 +6957,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             for c_sale in all_credit_sales.prefetch_related("split_payments"):
                 gross_credit_issued += get_sale_credit_amt(c_sale, all_credit_ids)
+
+            # Cumulative Repayments Log (Lifetime Recovered Receivables)
+            total_recovered_lifetime = base_credit_repay_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO)
+            )['total']
 
             all_repayments_to_date = base_credit_repay_qs.filter(date__lte=end_date).aggregate(
                 total=Coalesce(Sum('amount'), ZERO)
@@ -7023,6 +7028,57 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             trajectory_data = []
             tz = timezone.get_current_timezone()
+
+            # Construct Payload Response
+            response_payload = {
+                "profitability": {
+                    "total_sales": total_sales,
+                    "total_sales_formatted": f"KSh {total_sales:,.2f}",
+                    "cogs": cogs,
+                    "cogs_formatted": f"KSh {cogs:,.2f}",
+                    "gross_profit": gross_profit,
+                    "gross_profit_formatted": f"KSh {gross_profit:,.2f}",
+                    "operating_expenses": operating_expenses,
+                    "operating_expenses_formatted": f"KSh {operating_expenses:,.2f}",
+                    "net_profit": net_profit,
+                    "net_profit_formatted": f"KSh {net_profit:,.2f}",
+                },
+                "debtors": {
+                    "total_customer_debts": total_customer_debtors,
+                    "total_customer_debts_formatted": f"KSh {total_customer_debtors:,.2f}",
+                    "total_recovered": total_recovered_lifetime,
+                    "total_recovered_formatted": f"KSh {total_recovered_lifetime:,.2f}",
+                    "unpaid_count": base_sales_qs.filter(st_credit_filter, balance_due__gt=ZERO).count(),
+                },
+                "inventory": {
+                    "total_stock_value": total_stock_value,
+                    "total_stock_value_formatted": f"KSh {total_stock_value:,.2f}",
+                    "product_skus": total_cataloged_skus,
+                    "low_stock_items": low_stock_count,
+                    "out_of_stock_items": out_of_stock_count,
+                    "active_skus": active_skus_count,
+                },
+                "cash_flow": {
+                    "receipts": actual_cash_receipts,
+                    "receipts_formatted": f"KSh {actual_cash_receipts:,.2f}",
+                    "payments": operating_expenses,
+                    "payments_formatted": f"KSh {operating_expenses:,.2f}",
+                    "purchases": purchases_total,
+                    "purchases_formatted": f"KSh {purchases_total:,.2f}",
+                    "total_available_funds": available_funds,
+                    "total_available_funds_formatted": f"KSh {available_funds:,.2f}",
+                },
+                "trajectory": trajectory_data,
+            }
+
+            return Response(response_payload, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"Error in dashboard_cards view: {str(e)}", exc_info=True)
+            return Response(
+                {"detail": "Failed to calculate dashboard card metrics."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
             def append_trajectory_point(label, full_date, sales_qs_for_bucket,
                                         expenses_qs_for_bucket, bucket_type):
