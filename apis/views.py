@@ -8635,12 +8635,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
                 }, status=status.HTTP_200_OK)
 
-        except Exception:
-            logger.exception("Profit Report Error")
-            return Response({
-                "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
-                "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
-            }, status=status.HTTP_200_OK)
 
     # =========================================================================
     # 2. CASH FLOW REPORT (/management-reports/cash-flow/)
