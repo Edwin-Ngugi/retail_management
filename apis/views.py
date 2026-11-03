@@ -11223,16 +11223,23 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             transaction_count = sales_qs.count()
 
+            # Prefetch split payments relation matching SalePayment related_name
             sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
 
+            # -----------------------------------------------------------------
+            # 1. PROCESS PAYMENT CHANNELS & SPLIT BREAKDOWNS
+            # -----------------------------------------------------------------
             for sale in sales_with_payments:
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
-                method = self._normalize_payment_method(sale.payment_method)
+                method = self._normalize_payment_method(getattr(sale, "payment_method", None))
+                
+                # Fetch split payment records from prefetched manager
                 split_records = self._get_split_payments(sale)
 
                 if method == "SPLIT" or (split_records and len(split_records) > 0):
                     for sp in split_records:
-                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
+                        raw_sp_method = self._extract_sp_method(sp)
+                        sp_method = self._normalize_payment_method(raw_sp_method)
                         sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
 
                         if sp_method == "CASH":
@@ -11265,6 +11272,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     else:
                         other_total += sale_amt
 
+            # -----------------------------------------------------------------
+            # 2. CREDIT REPAYMENTS LEDGER
+            # -----------------------------------------------------------------
             repayments_list = []
             for rep in repayment_qs.select_related("customer", "transaction"):
                 rep_amt = quantize_money(rep.amount or ZERO)
@@ -11281,12 +11291,16 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
+            # -----------------------------------------------------------------
+            # 3. SALE ITEMS AGGREGATION & DAILY TRENDS (Optimized In-Memory)
+            # -----------------------------------------------------------------
             total_gross_revenue = ZERO
             total_cogs = ZERO
             total_discounts = ZERO
             total_units_sold = ZERO
             products_map = {}
             daily_map = {}
+            transaction_items_map = defaultdict(list)
 
             for line in sale_items_qs:
                 qty = Decimal(str(line.quantity_sold or 0))
@@ -11307,6 +11321,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 total_discounts += line_disc_total
                 total_units_sold += qty
 
+                # Product Performance Map
                 i_id = line.item_id
                 name = line.item.name if line.item else f"Item #{i_id}"
                 if i_id not in products_map:
@@ -11323,12 +11338,32 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 products_map[i_id]["cogs"] += line_cost
                 products_map[i_id]["discounts"] += line_disc_total
 
+                # Daily Trends Map
                 sale_dt = line.transaction.sale_date if line.transaction else None
                 day_str = sale_dt.strftime('%Y-%m-%d') if hasattr(sale_dt, 'strftime') else str(sale_dt)[:10] if sale_dt else "Unknown"
                 if day_str not in daily_map:
                     daily_map[day_str] = {"date": day_str, "revenue": ZERO, "cogs": ZERO}
                 daily_map[day_str]["revenue"] += line_rev
                 daily_map[day_str]["cogs"] += line_cost
+
+                # Group line items per transaction in memory (prevents N+1 DB queries)
+                if line.transaction_id:
+                    q_flt = float(qty)
+                    p_flt = float(price)
+                    d_flt = float(disc)
+                    rev_flt = float(line_rev)
+                    cogs_flt = float(line_cost)
+                    prof_flt = rev_flt - cogs_flt
+
+                    transaction_items_map[line.transaction_id].append({
+                        "item_name": name,
+                        "quantity": q_flt,
+                        "unit_price": p_flt,
+                        "discount": d_flt,
+                        "line_revenue": rev_flt,
+                        "line_cogs": cogs_flt,
+                        "line_profit": prof_flt
+                    })
 
             daily_trends = []
             for k, v in sorted(daily_map.items()):
@@ -11344,6 +11379,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     "profit": max(0.0, profit_val)
                 })
 
+            # -----------------------------------------------------------------
+            # 4. FINANCIAL KPI CALCULATIONS & PRODUCT VELOCITY
+            # -----------------------------------------------------------------
             gross_profit = total_gross_revenue - total_cogs
             net_revenue = total_gross_revenue - total_discounts
             profit_margin_pct = float((gross_profit / total_gross_revenue * Decimal("100.0")) if total_gross_revenue > ZERO else ZERO)
@@ -11419,29 +11457,12 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 for k, v in channel_map.items()
             }
 
+            # -----------------------------------------------------------------
+            # 5. CONSTRUCT DETAILED TRANSACTIONS LIST
+            # -----------------------------------------------------------------
             transactions_list = []
             for sale in sales_with_payments:
-                items_data = []
-                for line in sale_items_qs.filter(transaction=sale):
-                    q = float(line.quantity_sold or 0)
-                    p = float(line.unit_selling_price or 0)
-                    d = float(line.discount_per_item or 0)
-                    u_cost = line.unit_cost_price
-                    if not u_cost and line.item:
-                        u_cost = getattr(line.item, 'cost_price', ZERO)
-                    c = float(u_cost or 0)
-                    rev = q * (p - d)
-                    cogs = q * c
-                    prof = rev - cogs
-                    items_data.append({
-                        "item_name": line.item.name if line.item else f"Item #{line.item_id}",
-                        "quantity": q,
-                        "unit_price": p,
-                        "discount": d,
-                        "line_revenue": rev,
-                        "line_cogs": cogs,
-                        "line_profit": prof
-                    })
+                items_data = transaction_items_map.get(sale.id, [])
 
                 transactions_list.append({
                     "id": sale.id,
