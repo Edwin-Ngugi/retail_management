@@ -11224,22 +11224,31 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             transaction_count = sales_qs.count()
 
-            # Prefetch split payments relation matching SalePayment related_name
-            sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
+            # -----------------------------------------------------------------
+            # 1. DIRECT FETCH & GROUPING OF SPLIT PAYMENTS (GUARANTEED NO MISSES)
+            # -----------------------------------------------------------------
+            # Fetch all SalePayment child rows associated with the filtered transactions
+            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs)
+            
+            # Group split payments by transaction_id in memory
+            split_payments_map = collections.defaultdict(list)
+            for sp in split_payments_qs:
+                if sp.transaction_id:
+                    split_payments_map[sp.transaction_id].append(sp)
 
-            # -----------------------------------------------------------------
-            # 1. PROCESS PAYMENT CHANNELS & SPLIT BREAKDOWNS
-            # -----------------------------------------------------------------
+            sales_with_payments = sales_qs.select_related("customer", "branch")
+
             for sale in sales_with_payments:
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
-                method = self._normalize_payment_method(getattr(sale, "payment_method", None))
+                main_method = self._normalize_payment_method(getattr(sale, "payment_method", None))
                 
-                # Fetch split payment records from prefetched manager
-                split_records = self._get_split_payments(sale)
+                # Check directly in our grouped split payments map
+                split_records = split_payments_map.get(sale.id, [])
 
-                if method == "SPLIT" or (split_records and len(split_records) > 0):
+                if main_method == "SPLIT" or len(split_records) > 0:
                     for sp in split_records:
-                        raw_sp_method = self._extract_sp_method(sp)
+                        # Extract raw method from SalePayment.method
+                        raw_sp_method = str(getattr(sp, "method", "") or "").upper()
                         sp_method = self._normalize_payment_method(raw_sp_method)
                         sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
 
@@ -11258,17 +11267,17 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         else:
                             other_total += sp_amount
                 else:
-                    if method == "CREDIT":
+                    if main_method == "CREDIT":
                         gross_credit_sales += sale_amt
-                    elif method == "CASH":
+                    elif main_method == "CASH":
                         cash_total += sale_amt
-                    elif method == "PAYBILL":
+                    elif main_method == "PAYBILL":
                         paybill_total += sale_amt
-                    elif method == "SEND_MONEY":
+                    elif main_method == "SEND_MONEY":
                         send_money_total += sale_amt
-                    elif method == "MPESA":
+                    elif main_method == "MPESA":
                         mpesa_std_total += sale_amt
-                    elif method == "BANK_TRANSFER":
+                    elif main_method == "BANK_TRANSFER":
                         bank_total += sale_amt
                     else:
                         other_total += sale_amt
@@ -11293,7 +11302,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
             # -----------------------------------------------------------------
-            # 3. SALE ITEMS AGGREGATION & DAILY TRENDS (Optimized In-Memory)
+            # 3. SALE ITEMS AGGREGATION & DAILY TRENDS
             # -----------------------------------------------------------------
             total_gross_revenue = ZERO
             total_cogs = ZERO
@@ -11301,7 +11310,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             total_units_sold = ZERO
             products_map = {}
             daily_map = {}
-            transaction_items_map = defaultdict(list)
+            transaction_items_map = collections.defaultdict(list)
 
             for line in sale_items_qs:
                 qty = Decimal(str(line.quantity_sold or 0))
@@ -11322,7 +11331,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 total_discounts += line_disc_total
                 total_units_sold += qty
 
-                # Product Performance Map
                 i_id = line.item_id
                 name = line.item.name if line.item else f"Item #{i_id}"
                 if i_id not in products_map:
@@ -11339,7 +11347,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 products_map[i_id]["cogs"] += line_cost
                 products_map[i_id]["discounts"] += line_disc_total
 
-                # Daily Trends Map
                 sale_dt = line.transaction.sale_date if line.transaction else None
                 day_str = sale_dt.strftime('%Y-%m-%d') if hasattr(sale_dt, 'strftime') else str(sale_dt)[:10] if sale_dt else "Unknown"
                 if day_str not in daily_map:
@@ -11347,7 +11354,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 daily_map[day_str]["revenue"] += line_rev
                 daily_map[day_str]["cogs"] += line_cost
 
-                # Group line items per transaction in memory (prevents N+1 DB queries)
                 if line.transaction_id:
                     q_flt = float(qty)
                     p_flt = float(price)
@@ -11380,9 +11386,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     "profit": max(0.0, profit_val)
                 })
 
-            # -----------------------------------------------------------------
-            # 4. FINANCIAL KPI CALCULATIONS & PRODUCT VELOCITY
-            # -----------------------------------------------------------------
             gross_profit = total_gross_revenue - total_cogs
             net_revenue = total_gross_revenue - total_discounts
             profit_margin_pct = float((gross_profit / total_gross_revenue * Decimal("100.0")) if total_gross_revenue > ZERO else ZERO)
@@ -11458,9 +11461,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 for k, v in channel_map.items()
             }
 
-            # -----------------------------------------------------------------
-            # 5. CONSTRUCT DETAILED TRANSACTIONS LIST
-            # -----------------------------------------------------------------
             transactions_list = []
             for sale in sales_with_payments:
                 items_data = transaction_items_map.get(sale.id, [])
