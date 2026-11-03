@@ -13,8 +13,8 @@ from django.conf import settings
 import io
 from django.http import HttpResponse
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
 from reportlab.lib import colors
 from rest_framework import permissions, status, viewsets
 from rest_framework.response import Response
@@ -24,6 +24,7 @@ from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
+
 
 from django.contrib.auth import authenticate, get_user_model
 from django.core.exceptions import FieldError, ValidationError as DjangoValidationError
