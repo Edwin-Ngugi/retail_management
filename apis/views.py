@@ -11004,4 +11004,193 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
         except Exception as e:
             logger.exception("Error generating detailed sales analysis report")
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)                  
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], url_path='export-sales-analysis-pdf')
+    def export_sales_analysis_pdf(self, request):
+        try:
+            # Re-use existing analysis computation
+            report_response = self.detailed_report(request)
+            if report_response.status_code != 200:
+                return report_response
+
+            data = report_response.data
+            summary = data.get("summary", {})
+            insights = data.get("insights", [])
+            payment_breakdown = data.get("payment_breakdown", [])
+            fast_movers = data.get("fast_movers", [])
+
+            branch_obj, start_date, end_date, _, _ = self._get_branch_and_dates(request)
+            branch_name = branch_obj.name if branch_obj else "All Branches"
+            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}" if start_date and end_date else "All Time"
+
+            def fmt_pdf_curr(val):
+                num = float(val or 0)
+                if num < 0:
+                    return f"(KSh {abs(num):,.2f})"
+                return f"KSh {num:,.2f}"
+
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=letter,
+                rightMargin=36,
+                leftMargin=36,
+                topMargin=36,
+                bottomMargin=36
+            )
+
+            styles = getSampleStyleSheet()
+
+            company_style = ParagraphStyle(
+                'SaCompanyHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=16,
+                leading=20,
+                textColor=colors.HexColor('#004D40'),
+                alignment=1,
+                spaceAfter=3
+            )
+
+            subtitle_style = ParagraphStyle(
+                'SaSubHeader',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=9,
+                leading=13,
+                textColor=colors.HexColor('#475569'),
+                alignment=1,
+                spaceAfter=12
+            )
+
+            section_heading = ParagraphStyle(
+                'SaSectionHead',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=10,
+                leading=14,
+                textColor=colors.HexColor('#0F172A'),
+                spaceAfter=6
+            )
+
+            tbl_header = ParagraphStyle(
+                'SaTh',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=8,
+                textColor=colors.HexColor('#0F172A')
+            )
+
+            tbl_cell = ParagraphStyle(
+                'SaTd',
+                parent=styles['Normal'],
+                fontName='Helvetica',
+                fontSize=8,
+                textColor=colors.HexColor('#1E293B')
+            )
+
+            elements = []
+
+            # Header Logo & Title
+            logo_element = _get_pdf_logo_element()
+            if logo_element:
+                elements.append(logo_element)
+                elements.append(Spacer(1, 6))
+
+            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
+            elements.append(Paragraph(f"<b>DETAILED SALES & MARGIN ANALYSIS — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
+            elements.append(Spacer(1, 8))
+
+            # 1. Financial KPI Summary Table
+            elements.append(Paragraph("<b>FINANCIAL SUMMARY</b>", section_heading))
+            summary_data = [
+                [Paragraph("Gross Revenue", tbl_header), fmt_pdf_curr(summary.get("gross_revenue"))],
+                [Paragraph("Cost of Goods Sold (COGS)", tbl_cell), fmt_pdf_curr(summary.get("total_cogs"))],
+                [Paragraph("Gross Profit", tbl_header), fmt_pdf_curr(summary.get("gross_profit"))],
+                [Paragraph("Profit Margin Rate", tbl_header), f"{summary.get('profit_margin_percent', 0)}%"],
+                [Paragraph("Total Orders Processed", tbl_cell), f"{summary.get('transaction_count', 0)} Txns"],
+                [Paragraph("Average Basket Value", tbl_cell), fmt_pdf_curr(summary.get("avg_basket_value"))],
+                [Paragraph("Credit Sales Exposure", tbl_cell), fmt_pdf_curr(summary.get("credit_sales_exposure"))],
+            ]
+
+            sum_table = Table(summary_data, colWidths=[340, 200])
+            sum_table.setStyle(TableStyle([
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('TOPPADDING', (0, 0), (-1, -1), 5),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#E6FFFA')),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+            ]))
+            elements.append(sum_table)
+            elements.append(Spacer(1, 12))
+
+            # 2. Strategic Insights Section
+            if insights:
+                elements.append(Paragraph("<b>EXECUTIVE INSIGHTS & NOTES</b>", section_heading))
+                for note in insights:
+                    title = note.get("title", "Note")
+                    msg = note.get("message", "")
+                    elements.append(Paragraph(f"• <b>{title}:</b> {msg}", tbl_cell))
+                    elements.append(Spacer(1, 3))
+                elements.append(Spacer(1, 10))
+
+            # 3. Top Fast-Moving Products
+            if fast_movers:
+                elements.append(Paragraph("<b>FAST-MOVING PRODUCTS (TOP PERFORMERS)</b>", section_heading))
+                fm_data = [[
+                    Paragraph("Product", tbl_header),
+                    Paragraph("Units Sold", tbl_header),
+                    Paragraph("Gross Revenue", tbl_header),
+                    Paragraph("Margin %", tbl_header)
+                ]]
+                for item in fast_movers[:8]:
+                    fm_data.append([
+                        Paragraph(str(item.get("item_name")), tbl_cell),
+                        Paragraph(str(item.get("units_sold")), tbl_cell),
+                        fmt_pdf_curr(item.get("gross_revenue")),
+                        f"{item.get('profit_margin_percent', 0)}%"
+                    ])
+                fm_table = Table(fm_data, colWidths=[240, 80, 120, 100])
+                fm_table.setStyle(TableStyle([
+                    ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
+                    ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ]))
+                elements.append(fm_table)
+                elements.append(Spacer(1, 12))
+
+            # 4. Resolved Payment Method Breakdown
+            if payment_breakdown:
+                elements.append(Paragraph("<b>RESOLVED PAYMENT CHANNEL DISTRIBUTION</b>", section_heading))
+                pm_data = [[
+                    Paragraph("Channel / Method", tbl_header),
+                    Paragraph("Settled Total", tbl_header)
+                ]]
+                for pm in payment_breakdown:
+                    pm_data.append([
+                        Paragraph(str(pm.get("method")), tbl_cell),
+                        fmt_pdf_curr(pm.get("amount"))
+                    ])
+                pm_table = Table(pm_data, colWidths=[340, 200])
+                pm_table.setStyle(TableStyle([
+                    ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
+                    ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
+                ]))
+                elements.append(pm_table)
+
+            doc.build(elements)
+            buffer.seek(0)
+
+            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="Sales_Analysis_Report_{branch_name}.pdf"'
+            return response
+
+        except Exception as e:
+            logger.exception("Export Sales Analysis PDF Error")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)                     
