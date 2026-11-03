@@ -10504,14 +10504,12 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             returns_qs = CustomerReturn.objects.all()
             repayment_qs = CreditRepayment.objects.all()
 
-            # Date Range Filtering
             if start_dt and end_dt:
                 sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
             if start_date and end_date:
                 returns_qs = returns_qs.filter(date__range=(start_date, end_date))
                 repayment_qs = repayment_qs.filter(date__range=(start_date, end_date))
 
-            # Branch Scope Filtering
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 returns_qs = returns_qs.filter(branch=branch_obj)
@@ -10521,6 +10519,94 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
 
+            # Identify all credit transaction IDs (matching FinancialReportViewSet logic)
+            credit_transaction_ids = set(
+                CreditRepayment.objects.exclude(transaction_id=None)
+                .values_list("transaction_id", flat=True)
+                .distinct()
+            )
+
+            # Channel tracking accumulators
+            cash_total = ZERO
+            paybill_total = ZERO
+            send_money_total = ZERO
+            mpesa_std_total = ZERO
+            bank_total = ZERO
+            other_total = ZERO
+            credit_sales_exposure = ZERO
+            period_credit_repayments_total = ZERO
+
+            transaction_count = sales_qs.count()
+
+            # 1. PROCESS SALES & SPLIT PAYMENTS (Exact FinancialReportViewSet algorithm)
+            sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
+
+            for sale in sales_with_payments:
+                sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
+                method = self._normalize_payment_method(sale.payment_method)
+                split_records = self._get_split_payments(sale)
+                is_credit = self._is_credit_sale(sale, credit_transaction_ids)
+
+                if method == "SPLIT" or split_records:
+                    for sp in split_records:
+                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
+                        sp_amount = quantize_money(sp.amount or ZERO)
+
+                        if sp_method == "CASH":
+                            cash_total += sp_amount
+                        elif sp_method == "PAYBILL":
+                            paybill_total += sp_amount
+                        elif sp_method == "SEND_MONEY":
+                            send_money_total += sp_amount
+                        elif sp_method == "MPESA":
+                            mpesa_std_total += sp_amount
+                        elif sp_method == "BANK_TRANSFER":
+                            bank_total += sp_amount
+                        elif sp_method == "CREDIT":
+                            credit_sales_exposure += sp_amount
+                        else:
+                            other_total += sp_amount
+                else:
+                    if is_credit:
+                        credit_sales_exposure += sale_amt
+                    elif method == "CASH":
+                        cash_total += sale_amt
+                    elif method == "PAYBILL":
+                        paybill_total += sale_amt
+                    elif method == "SEND_MONEY":
+                        send_money_total += sale_amt
+                    elif method == "MPESA":
+                        mpesa_std_total += sale_amt
+                    elif method == "BANK_TRANSFER":
+                        bank_total += sale_amt
+                    elif method == "CREDIT":
+                        credit_sales_exposure += sale_amt
+                    else:
+                        other_total += sale_amt
+
+            # 2. PROCESS DEBT REPAYMENTS AND ROUTE CASH INFLOWS
+            for rep in repayment_qs.select_related("customer", "transaction"):
+                rep_amt = quantize_money(rep.amount or ZERO)
+                if rep_amt <= ZERO:
+                    continue
+
+                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
+                period_credit_repayments_total += rep_amt
+
+                if rep_method == "CASH":
+                    cash_total += rep_amt
+                elif rep_method == "PAYBILL":
+                    paybill_total += rep_amt
+                elif rep_method == "SEND_MONEY":
+                    send_money_total += rep_amt
+                elif rep_method == "BANK_TRANSFER":
+                    bank_total += rep_amt
+                elif rep_method == "MPESA":
+                    mpesa_std_total += rep_amt
+                else:
+                    other_total += rep_amt
+
+            # 3. PROCESS LINE ITEMS FOR REVENUE, COGS, AND PROFIT MARGINS
             total_gross_revenue = ZERO
             total_cogs = ZERO
             total_discounts = ZERO
@@ -10528,67 +10614,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             products_map = {}
             daily_map = {}
 
-            # Explicit channel tracking matching FinancialReportViewSet
-            channel_totals = {
-                "CASH": ZERO,
-                "MPESA": ZERO,
-                "PAYBILL": ZERO,
-                "SEND_MONEY": ZERO,
-                "BANK_TRANSFER": ZERO,
-                "CREDIT": ZERO,
-                "OTHER": ZERO,
-            }
-
-            transaction_count = sales_qs.count()
-            credit_sales_exposure = ZERO
-
-            # 1. PROCESS DIRECT SALES & SPLIT PAYMENTS (Accrual basis for initial transactions)
-            for sale in sales_qs:
-                method = self._normalize_payment_method(getattr(sale, "payment_method", None))
-                split_records = self._get_split_payments(sale)
-                sale_amt = quantize_money(getattr(sale, "total_amount", 0) or 0)
-
-                if method == "SPLIT" or split_records:
-                    for sp in split_records:
-                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
-                        sp_amount = quantize_money(getattr(sp, "amount", 0) or 0)
-
-                        if sp_method == "CREDIT":
-                            credit_sales_exposure += sp_amount
-                            channel_totals["CREDIT"] += sp_amount
-                        elif sp_method in channel_totals:
-                            channel_totals[sp_method] += sp_amount
-                        else:
-                            channel_totals["OTHER"] += sp_amount
-                else:
-                    if method == "CREDIT":
-                        channel_totals["CREDIT"] += sale_amt
-                        credit_sales_exposure += sale_amt
-                    else:
-                        # For direct cash/M-Pesa sales, record full total_amount to avoid partial repayment collisions
-                        if method in channel_totals:
-                            channel_totals[method] += sale_amt
-                        else:
-                            channel_totals["OTHER"] += sale_amt
-
-            # 2. PROCESS DEBT REPAYMENTS (Cash collections for credit accounts)
-            period_credit_repayments_total = ZERO
-
-            for rep in repayment_qs.select_related("customer", "transaction"):
-                rep_amt = quantize_money(rep.amount or ZERO)
-                if rep_amt <= ZERO:
-                    continue
-
-                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", "CASH"))
-                period_credit_repayments_total += rep_amt
-
-                # Route debt collections into liquid payment channels
-                if rep_method in channel_totals and rep_method != "CREDIT":
-                    channel_totals[rep_method] += rep_amt
-                else:
-                    channel_totals["CASH"] += rep_amt
-
-            # 3. PROCESS LINE ITEMS FOR REVENUE, COGS, PROFIT, AND DAILY TRENDS
             for line in sale_items_qs:
                 qty = Decimal(str(line.quantity_sold or 0))
                 price = Decimal(str(line.unit_selling_price or 0))
@@ -10608,7 +10633,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 total_discounts += line_disc_total
                 total_units_sold += qty
 
-                # Product Performance Map
                 i_id = line.item_id
                 name = line.item.name if line.item else f"Item #{i_id}"
                 if i_id not in products_map:
@@ -10625,7 +10649,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 products_map[i_id]["cogs"] += line_cost
                 products_map[i_id]["discounts"] += line_disc_total
 
-                # Daily Financial Trends Aggregation
                 sale_dt = line.transaction.sale_date if line.transaction else None
                 day_str = sale_dt.strftime('%Y-%m-%d') if hasattr(sale_dt, 'strftime') else str(sale_dt)[:10] if sale_dt else "Unknown"
                 if day_str not in daily_map:
@@ -10633,7 +10656,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 daily_map[day_str]["revenue"] += line_rev
                 daily_map[day_str]["cogs"] += line_cost
 
-            # Format Daily Trends
             daily_trends = []
             for k, v in sorted(daily_map.items()):
                 if k == "Unknown":
@@ -10655,7 +10677,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             avg_basket_value = quantize_money(total_gross_revenue / transaction_count) if transaction_count > 0 else ZERO
             avg_items_per_basket = round(float(total_units_sold / transaction_count), 2) if transaction_count > 0 else 0.0
 
-            # Velocity Analysis (Fast / Slow Movers)
             performers = []
             for v in products_map.values():
                 rev_val = v["gross_revenue"]
@@ -10672,12 +10693,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     "profit_margin_percent": round(m_pct, 1)
                 })
 
-            sorted_by_velocity = sorted(
-                performers, 
-                key=lambda x: (x["gross_revenue"], x["units_sold"]), 
-                reverse=True
-            )
-
+            sorted_by_velocity = sorted(performers, key=lambda x: (x["gross_revenue"], x["units_sold"]), reverse=True)
             total_items = len(sorted_by_velocity)
             if total_items <= 5:
                 split_idx = max(1, total_items // 2)
@@ -10685,10 +10701,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 slow_movers = sorted_by_velocity[split_idx:]
             else:
                 fast_movers = sorted_by_velocity[:10]
-                slow_movers = sorted(
-                    sorted_by_velocity[10:], 
-                    key=lambda x: (x["units_sold"], x["gross_revenue"])
-                )[:10]
+                slow_movers = sorted(sorted_by_velocity[10:], key=lambda x: (x["units_sold"], x["gross_revenue"]))[:10]
 
             summary_payload = {
                 "gross_revenue": float(quantize_money(total_gross_revenue)),
@@ -10709,14 +10722,25 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
+            # Map accumulators into output dictionary structure
+            channel_map = {
+                "CASH": cash_total,
+                "PAYBILL": paybill_total,
+                "SEND_MONEY": send_money_total,
+                "MPESA": mpesa_std_total,
+                "BANK_TRANSFER": bank_total,
+                "CREDIT": credit_sales_exposure,
+                "OTHER": other_total,
+            }
+
             payment_breakdown = [
                 {"method": k, "amount": float(quantize_money(v))}
-                for k, v in channel_totals.items() if v > ZERO and k != "SPLIT"
+                for k, v in channel_map.items() if v > ZERO
             ]
 
             payment_channel_breakdown = {
                 k.lower(): float(quantize_money(v))
-                for k, v in channel_totals.items()
+                for k, v in channel_map.items()
             }
 
             return Response({
