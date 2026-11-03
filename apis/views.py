@@ -9,6 +9,7 @@ from decimal import Decimal
 from datetime import date, datetime, time, timedelta
 import os
 from django.conf import settings
+from collections import defaultdict
 
 import matplotlib
 matplotlib.use('Agg')
