@@ -3409,44 +3409,105 @@ class PendingApprovalViewSet(viewsets.ModelViewSet):
 
     def _commit_restock_purchase(self, payload):
         """
-        Commits approved restock purchase orders to Purchase, StockBatch, and StockMovement models.
+        Commits approved restock purchase orders to PurchaseOrder, PurchaseOrderItem, 
+        Purchase, StockBatch, and StockMovement models with actual purchase dates.
         """
         purchases = payload.get("purchases", [])
-        if not purchases and "item" in payload:
+        items_list = payload.get("items", [])
+        
+        if not purchases and not items_list and "item" in payload:
             purchases = [payload]
 
         branch = self._get_target_branch(payload)
         if not branch:
             raise ValueError("No valid branch found to commit restock purchase order.")
 
-        for p_data in purchases:
-            item_id = p_data.get("item") or p_data.get("item_id")
+        # 1. Parse historical/user-selected purchase date
+        raw_date = payload.get("purchase_date") or payload.get("date") or payload.get("created_at")
+        if raw_date:
+            try:
+                if isinstance(raw_date, str):
+                    clean_str = raw_date.split("T")[0]
+                    actual_purchase_dt = timezone.make_aware(
+                        datetime.strptime(clean_str, "%Y-%m-%d"),
+                        timezone.get_current_timezone()
+                    )
+                else:
+                    actual_purchase_dt = raw_date
+            except Exception:
+                actual_purchase_dt = timezone.now()
+        else:
+            actual_purchase_dt = timezone.now()
+
+        actual_date_only = actual_purchase_dt.date() if hasattr(actual_purchase_dt, "date") else actual_purchase_dt
+
+        supplier_name = payload.get("supplier_name") or payload.get("supplier", "")
+        payment_method = payload.get("payment_method", "CASH")
+        po_number = payload.get("po_number") or f"PO-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+
+        # 2. Create Parent PurchaseOrder Header (so it shows in Django Admin Purchase Orders table)
+        po_header, _ = PurchaseOrder.objects.get_or_create(
+            po_number=po_number,
+            defaults={
+                "branch": branch,
+                "supplier_name": supplier_name,
+                "payment_method": payment_method,
+                "purchase_date": actual_purchase_dt,
+                "created_by": self.request.user if self.request and self.request.user.is_authenticated else None,
+            }
+        )
+
+        # Combine any array formats (purchases or items_list)
+        combined_items = purchases if purchases else items_list
+
+        for p_data in combined_items:
+            item_id = p_data.get("item") or p_data.get("item_id") or p_data.get("id")
             item_obj = Item.objects.filter(id=item_id).first()
             if not item_obj:
                 continue
 
             quantity = Decimal(str(p_data.get("quantity", 1)))
-            cost_price = Decimal(str(p_data.get("unit_cost_price") or "0.00"))
-            payment_method = p_data.get("payment_method", "CASH")
+            cost_price = Decimal(str(p_data.get("unit_cost_price") or p_data.get("cost_price") or "0.00"))
+            p_method = p_data.get("payment_method") or payment_method
 
-            # Create official Purchase record (which handles batch & stock movement in its save method)
-            Purchase.objects.create(
-                branch=branch,
+            # 3. Create PO Line Item
+            po_item = PurchaseOrderItem.objects.create(
+                purchase_order=po_header,
                 item=item_obj,
                 quantity=quantity,
                 unit_cost_price=cost_price,
-                payment_method=payment_method,
+            )
+
+            # 4. Create official Purchase record WITH explicit purchase_date
+            purchase_rec = Purchase.objects.create(
+                branch=branch,
+                item=item_obj,
+                supplier_name=supplier_name,
+                quantity=quantity,
+                unit_cost_price=cost_price,
+                payment_method=p_method,
+                purchase_date=actual_purchase_dt,  # Explicitly preserve historical purchase date!
                 created_by=self.request.user if self.request and self.request.user.is_authenticated else None,
             )
 
-            # Update BranchItemPricing
+            # 5. Force StockMovement date & created_at to match the actual purchase date
+            ref_codes = [f"PURCHASE-{purchase_rec.pk}", f"PO-{po_header.pk}-{po_item.pk}"]
+            StockMovement.objects.filter(reference__in=ref_codes).update(
+                date=actual_date_only,
+                created_at=actual_purchase_dt
+            )
+
+            # Update BranchItemPricing WAC & Cost
             pricing, _ = BranchItemPricing.objects.get_or_create(
                 branch=branch,
                 item=item_obj,
-                defaults={"remaining_stock": 0, "unit_cost_price": cost_price}
+                defaults={"opening_stock": 0, "unit_cost_price": cost_price}
             )
             pricing.unit_cost_price = cost_price
             pricing.save()
+
+        # Recalculate totals on PurchaseOrder header
+        po_header.recalculate_totals()
 
     def _commit_stock_operation(self, payload):
         """
