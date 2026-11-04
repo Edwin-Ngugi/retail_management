@@ -2121,7 +2121,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         purchase_date_input = None
         branch_input = None
 
-        # 1. Standardize extraction whether request payload is a wrapper dict or array
+        # 1. Extract payload parameters
         if isinstance(raw_data, dict) and "items" in raw_data and isinstance(raw_data["items"], list):
             items_payload = raw_data.get("items", [])
             po_number_input = raw_data.get("po_number")
@@ -2144,7 +2144,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         user = _authenticated_user(request)
 
         try:
-            # 2. Resolve default fields from header or first item
+            # 2. Resolve Header Defaults
             first_item = items_payload[0] if isinstance(items_payload[0], dict) else {}
             
             branch_param = (
@@ -2155,6 +2155,12 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 or self.request.query_params.get("branch_id")
             )
             branch_obj = _resolve_branch(branch_param)
+
+            if not branch_obj:
+                return Response(
+                    {"error": "A valid branch is required to record purchases."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             supplier_name = (
                 supplier_name_input
@@ -2170,11 +2176,17 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 .replace("-", "_")
             )
 
-            purchase_date = _parse_business_date(
+            # Safely parse date into a datetime.date object
+            raw_parsed_date = _parse_business_date(
                 purchase_date_input
                 or first_item.get("purchase_date")
                 or first_item.get("date")
                 or first_item.get("transaction_date")
+            )
+            purchase_date = (
+                raw_parsed_date.date()
+                if isinstance(raw_parsed_date, datetime)
+                else (raw_parsed_date or timezone.localdate())
             )
 
             po_number = po_number_input or first_item.get("po_number")
@@ -2183,7 +2195,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 unique_suffix = random.randint(1000, 9999)
                 po_number = f"PO-{date_clean}-BATCH-{unique_suffix}"
 
-            # 3. Create parent PurchaseOrder for Django Admin visibility
+            # 3. Create parent PurchaseOrder header
             po_header, _ = PurchaseOrder.objects.get_or_create(
                 po_number=po_number,
                 defaults={
@@ -2195,7 +2207,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 },
             )
 
-            # 4. Loop over items and create rows
+            # 4. Loop over items and create Purchase and PurchaseOrderItem rows
             for data in items_payload:
                 item_id = data.get("item") or data.get("item_id")
                 if not item_id:
@@ -2235,7 +2247,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     },
                 )
 
-                # Add to PurchaseOrder items list
+                # Link under PurchaseOrder
                 PurchaseOrderItem.objects.create(
                     purchase_order=po_header,
                     item=item,
@@ -2243,7 +2255,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     unit_cost_price=unit_cost,
                 )
 
-                # Save standalone Purchase record
+                # Create standalone Purchase
                 purchase = Purchase(
                     item=item,
                     branch=cur_branch,
@@ -2274,7 +2286,6 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 item_id=created_purchases[0].item_id,
             )
 
-            # Return success response with generated batch details
             return Response(
                 {
                     "message": "Batch purchase order recorded successfully.",

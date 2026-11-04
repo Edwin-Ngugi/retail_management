@@ -199,23 +199,6 @@ def _coerce_to_date(value):
     return value
 
 
-def _extract_id(value):
-    if value is None or value == "":
-        return None
-    if isinstance(value, dict):
-        return value.get("id") or value.get("pk") or value.get("branch_id") or value.get("item_id")
-    if hasattr(value, "id"):
-        return value.id
-    if isinstance(value, str):
-        value = value.strip()
-        if value.isdigit():
-            return int(value)
-        return value
-    if isinstance(value, int):
-        return value
-    return value
-
-
 def _resolve_customer(customer_input, retailer=None):
     if not customer_input:
         return None
