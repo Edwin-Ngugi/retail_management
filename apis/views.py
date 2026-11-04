@@ -2112,9 +2112,27 @@ class PurchaseViewSet(viewsets.ModelViewSet):
 
         return queryset
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
-        is_batch = isinstance(request.data, list)
-        items_payload = request.data if is_batch else [request.data]
+        # 1. Standardize incoming payload structure
+        raw_data = request.data
+        po_number_input = None
+        supplier_name_input = None
+        payment_method_input = None
+        purchase_date_input = None
+        branch_input = None
+
+        if isinstance(raw_data, dict) and "items" in raw_data and isinstance(raw_data["items"], list):
+            items_payload = raw_data.get("items", [])
+            po_number_input = raw_data.get("po_number")
+            supplier_name_input = raw_data.get("supplier_name")
+            payment_method_input = raw_data.get("payment_method")
+            purchase_date_input = raw_data.get("purchase_date")
+            branch_input = raw_data.get("branch") or raw_data.get("branch_id")
+        elif isinstance(raw_data, list):
+            items_payload = raw_data
+        else:
+            items_payload = [raw_data]
 
         if not items_payload:
             return Response(
@@ -2126,137 +2144,146 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         user = _authenticated_user(request)
 
         try:
-            with transaction.atomic():
-                for data in items_payload:
-                    item_id = data.get("item") or data.get("item_id")
-                    if not item_id:
-                        continue
+            # 2. Resolve Header Details
+            first_item = items_payload[0] if isinstance(items_payload[0], dict) else {}
+            
+            branch_param = (
+                branch_input
+                or first_item.get("branch")
+                or first_item.get("branch_id")
+                or self.request.query_params.get("branch")
+                or self.request.query_params.get("branch_id")
+            )
+            branch_obj = _resolve_branch(branch_param)
 
-                    branch_param = (
-                        data.get("branch")
-                        or data.get("branch_id")
-                        or self.request.query_params.get("branch")
-                        or self.request.query_params.get("branch_id")
-                    )
+            supplier_name = (
+                supplier_name_input
+                or first_item.get("supplier_name")
+                or "Direct Supplier"
+            )
 
-                    quantity = Decimal(str(data.get("quantity", 0) or 0))
-                    if quantity <= ZERO:
-                        continue
+            payment_method = (
+                str(payment_method_input or first_item.get("payment_method") or "CASH")
+                .strip()
+                .upper()
+                .replace(" ", "_")
+                .replace("-", "_")
+            )
 
-                    unit_cost_raw = (
-                        data.get("unit_cost_price")
-                        or data.get("cost_price")
-                        or data.get("unit_cost")
-                    )
-                    unit_cost = Decimal(
-                        str(unit_cost_raw if unit_cost_raw not in (None, "") else "0.00")
-                    )
+            purchase_date = _parse_business_date(
+                purchase_date_input
+                or first_item.get("purchase_date")
+                or first_item.get("date")
+                or first_item.get("transaction_date")
+            )
 
-                    purchase_date = _parse_business_date(
-                        data.get("purchase_date")
-                        or data.get("date")
-                        or data.get("transaction_date")
-                    )
+            # Generate PO Number if missing
+            po_number = po_number_input or first_item.get("po_number")
+            if not po_number:
+                date_clean = timezone.now().strftime("%Y%m%d")
+                unique_suffix = random.randint(1000, 9999)
+                po_number = f"PO-{date_clean}-BATCH-{unique_suffix}"
 
-                    payment_method = (
-                        str(data.get("payment_method") or "CASH")
-                        .strip()
-                        .upper()
-                        .replace(" ", "_")
-                        .replace("-", "_")
-                    )
+            # 3. Create or Get Parent PurchaseOrder Header (for Django Admin)
+            po_header, _ = PurchaseOrder.objects.get_or_create(
+                po_number=po_number,
+                defaults={
+                    "branch": branch_obj,
+                    "supplier_name": supplier_name,
+                    "payment_method": payment_method,
+                    "purchase_date": purchase_date,
+                    "created_by": user,
+                },
+            )
 
-                    supplier_id = data.get("supplier") or data.get("supplier_id")
-                    supplier_obj = None
-                    if supplier_id:
-                        if str(supplier_id).isdigit():
-                            supplier_obj = Supplier.objects.filter(id=int(supplier_id)).first()
-                        else:
-                            supplier_obj = Supplier.objects.filter(name__iexact=str(supplier_id).strip()).first()
+            # 4. Process Line Items
+            for data in items_payload:
+                item_id = data.get("item") or data.get("item_id")
+                if not item_id:
+                    continue
 
-                    item = Item.objects.select_for_update().get(id=item_id)
-                    branch = _resolve_branch(branch_param)
+                quantity = Decimal(str(data.get("quantity", 0) or 0))
+                if quantity <= ZERO:
+                    continue
 
-                    if not branch:
-                        pricing = BranchItemPricing.objects.filter(item=item).first()
-                        if pricing:
-                            branch = pricing.branch
-
-                    if not branch:
-                        continue
-
-                    self._align_retailer(item, branch, supplier_obj)
-
-                    BranchItemPricing.objects.get_or_create(
-                        item=item,
-                        branch=branch,
-                        defaults={
-                            "opening_stock": ZERO,
-                            "unit_cost_price": unit_cost,
-                            "unit_selling_price": ZERO,
-                        },
-                    )
-
-                    supplier_name = (
-                        data.get("supplier_name")
-                        or (supplier_obj.name if supplier_obj else "")
-                    )
-
-                    purchase = Purchase(
-                        item=item,
-                        branch=branch,
-                        supplier=supplier_obj,
-                        supplier_name=supplier_name,
-                        quantity=quantity,
-                        unit_cost_price=unit_cost,
-                        payment_method=payment_method,
-                        purchase_date=purchase_date,
-                        created_by=user,
-                    )
-                    purchase.save()
-
-                    recalculate_wac_sales_cost(branch, item)
-                    created_purchases.append(purchase)
-
-                if not created_purchases:
-                    return Response(
-                        {"error": "No valid purchase entries were processed."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-                self._broadcast_websocket_event(
-                    branch_id=created_purchases[0].branch_id,
-                    event_type="PURCHASE_RECORDED",
-                    purchase_id=created_purchases[0].id,
-                    item_id=created_purchases[0].item_id,
+                unit_cost_raw = (
+                    data.get("unit_cost_price")
+                    or data.get("cost_price")
+                    or data.get("unit_cost")
+                )
+                unit_cost = Decimal(
+                    str(unit_cost_raw if unit_cost_raw not in (None, "") else "0.00")
                 )
 
-                if is_batch:
-                    serializer = self.get_serializer(created_purchases, many=True)
-                    return Response(serializer.data, status=status.HTTP_201_CREATED)
-                else:
-                    serializer = self.get_serializer(created_purchases[0])
-                    response_data = serializer.data
-                    response_data["calculated_wac"] = str(
-                        recalculate_wac_sales_cost(
-                            created_purchases[0].branch,
-                            created_purchases[0].item
-                        )
-                    )
-                    return Response(response_data, status=status.HTTP_201_CREATED)
+                item = Item.objects.select_for_update().get(id=item_id)
+                cur_branch = (
+                    _resolve_branch(data.get("branch") or data.get("branch_id"))
+                    or branch_obj
+                )
+
+                if not cur_branch:
+                    continue
+
+                self._align_retailer(item, cur_branch)
+
+                BranchItemPricing.objects.get_or_create(
+                    item=item,
+                    branch=cur_branch,
+                    defaults={
+                        "opening_stock": ZERO,
+                        "unit_cost_price": unit_cost,
+                        "unit_selling_price": ZERO,
+                    },
+                )
+
+                # Create PurchaseOrderItem Line
+                PurchaseOrderItem.objects.create(
+                    purchase_order=po_header,
+                    item=item,
+                    quantity=quantity,
+                    unit_cost_price=unit_cost,
+                )
+
+                # Create individual Purchase record
+                purchase = Purchase(
+                    item=item,
+                    branch=cur_branch,
+                    supplier_name=supplier_name,
+                    quantity=quantity,
+                    unit_cost_price=unit_cost,
+                    payment_method=payment_method,
+                    purchase_date=purchase_date,
+                    created_by=user,
+                )
+                purchase.save()
+
+                recalculate_wac_sales_cost(cur_branch, item)
+                created_purchases.append(purchase)
+
+            # Recalculate PurchaseOrder totals for Admin UI
+            po_header.recalculate_totals()
+
+            if not created_purchases:
+                return Response(
+                    {"error": "No valid purchase entries were processed."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            self._broadcast_websocket_event(
+                branch_id=created_purchases[0].branch_id,
+                event_type="PURCHASE_RECORDED",
+                purchase_id=created_purchases[0].id,
+                item_id=created_purchases[0].item_id,
+            )
+
+            serializer = self.get_serializer(created_purchases, many=True)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
 
         except Item.DoesNotExist:
             return Response(
                 {"error": "Item not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        except DjangoValidationError as e:
-            return Response(
-                e.message_dict if hasattr(e, "message_dict") else {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        except DRFValidationError as e:
-            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response(
                 {

@@ -1,56 +1,67 @@
 import os
+import sys
 import django
 
-# Initialize Django environment settings
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # Replace 'your_project_name' with your actual Django settings module path
+# 1. Add current project root directory to Python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# 2. Set Django settings module (replace 'your_project_name' with your actual project package name)
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+
+# 3. Initialize Django environment
 django.setup()
 
 from django.db import transaction
-from django.db.models import Sum
-from stocks.models import PurchaseOrder, PurchaseOrderItem, StockBatch, StockMovement
+from stocks.models import Purchase, PurchaseOrder, PurchaseOrderItem, StockBatch, StockMovement
+
+# Explicit ID list matching the selected items in your screenshot
+TARGET_PURCHASE_IDS = [115, 114, 113, 112, 111]
 
 with transaction.atomic():
-    # Fetch all retro purchase orders that have PO numbers containing RETRO
-    retro_pos = PurchaseOrder.objects.filter(po_number__icontains="RETRO")
+    purchases = list(Purchase.objects.filter(id__in=TARGET_PURCHASE_IDS).order_by("id"))
     
-    # Group them by branch, date, and supplier
-    grouped_map = {}
-    for po in retro_pos:
-        date_str = po.purchase_date.strftime("%Y%m%d")
-        branch_id = po.branch_id
-        supplier_id = po.supplier_id or 0
-        key = (branch_id, date_str, supplier_id)
-        
-        if key not in grouped_map:
-            grouped_map[key] = []
-        grouped_map[key].append(po)
+    if not purchases:
+        print("No matching purchase records found!")
+    else:
+        # Use details from the first purchase record for the batch header
+        base_purchase = purchases[0]
+        date_str = base_purchase.purchase_date.strftime("%Y%m%d")
+        batch_po_number = f"PO-{date_str}-BATCH-OCT2"
 
-    merged_count = 0
-    for (branch_id, date_str, supplier_id), pos in grouped_map.items():
-        if len(pos) <= 1:
-            continue
+        # 1. Create or get the parent PurchaseOrder batch header
+        po_header, created = PurchaseOrder.objects.get_or_create(
+            po_number=batch_po_number,
+            defaults={
+                "branch": base_purchase.branch,
+                "supplier": base_purchase.supplier,
+                "supplier_name": base_purchase.supplier_name or "Direct Supplier",
+                "payment_method": base_purchase.payment_method,
+                "purchase_date": base_purchase.purchase_date,
+                "created_by": base_purchase.created_by,
+            }
+        )
 
-        # Choose primary PO as batch container
-        primary_po = pos[0]
-        batch_po_number = f"PO-{date_str}-BATCH-{primary_po.branch.name[:3].upper()}"
-        primary_po.po_number = batch_po_number
-        primary_po.save()
+        items_added = 0
+        for p in purchases:
+            # 2. Add as a line item to the batch header
+            po_item, _ = PurchaseOrderItem.objects.get_or_create(
+                purchase_order=po_header,
+                item=p.item,
+                defaults={
+                    "quantity": p.quantity,
+                    "unit_cost_price": p.unit_cost_price,
+                }
+            )
 
-        # Move line items, stock batches, and stock movements to the primary PO
-        for po in pos[1:]:
-            # Move items
-            PurchaseOrderItem.objects.filter(purchase_order=po).update(purchase_order=primary_po)
-            
-            # Re-reference StockBatches & StockMovements
-            old_ref_prefix = f"PO-{po.pk}-"
-            new_ref_prefix = f"PO-{primary_po.pk}-"
-            
-            StockBatch.objects.filter(batch_number=po.po_number).update(batch_number=batch_po_number)
-            
-            # Delete empty duplicate header
-            po.delete()
-            merged_count += 1
+            # 3. Align references on StockBatches & StockMovements to point to the batch header
+            StockBatch.objects.filter(reference=f"PURCHASE-{p.pk}").update(batch_number=batch_po_number)
+            StockMovement.objects.filter(reference=f"PURCHASE-{p.pk}").update(
+                notes=f"Purchase Order ({batch_po_number})"
+            )
 
-        primary_po.recalculate_totals()
+            items_added += 1
 
-print(f"Successfully consolidated {merged_count} redundant purchase order headers into unified Batch Orders!")
+        # 4. Recalculate financial totals for the parent batch header
+        po_header.recalculate_totals()
+
+        print(f"Successfully consolidated {items_added} purchases (IDs {TARGET_PURCHASE_IDS}) into Batch Order '{batch_po_number}'!")
