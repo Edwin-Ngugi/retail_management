@@ -1846,33 +1846,56 @@ class SaleTransaction(models.Model):
         Calculates channel totals for this transaction taking into account
         split payments, actual amount paid, and normalization rules.
         """
-        totals = {"MPESA": Decimal("0.00"), "PAYBILL": Decimal("0.00"), "CASH": Decimal("0.00"), "CREDIT": Decimal("0.00")}
-        
+        totals = {
+            "CASH": Decimal("0.00"),
+            "PAYBILL": Decimal("0.00"),
+            "SEND_MONEY": Decimal("0.00"),
+            "MPESA": Decimal("0.00"),
+            "BANK_TRANSFER": Decimal("0.00"),
+            "CREDIT": Decimal("0.00"),
+            "OTHER": Decimal("0.00"),
+        }
+
         split_qs = getattr(self, "split_payments", None) or getattr(self, "payments", None)
-        if (self.payment_method == self.PaymentMethod.SPLIT or (split_qs and split_qs.exists())):
+        has_splits = split_qs and split_qs.exists()
+
+        if self.payment_method in ["SPLIT", "SPLIT PAYMENT"] or has_splits:
             for sp in split_qs.all():
                 amt = Decimal(str(sp.amount or 0))
-                method = str(sp.method or "").upper()
-                if "PAYBILL" in method or "BANK" in method:
+                raw_method = str(getattr(sp, "method", "") or getattr(sp, "payment_method", "") or "").upper().replace(" ", "_")
+
+                if "PAYBILL" in raw_method:
                     totals["PAYBILL"] += amt
-                elif "MPESA" in method or "SEND_MONEY" in method or "TILL" in method:
+                elif "SEND_MONEY" in raw_method or "SENDMONEY" in raw_method or "TILL" in raw_method:
+                    totals["SEND_MONEY"] += amt
+                elif "MPESA" in raw_method:
                     totals["MPESA"] += amt
-                elif "CREDIT" in method:
+                elif "BANK" in raw_method:
+                    totals["BANK_TRANSFER"] += amt
+                elif "CREDIT" in raw_method:
                     totals["CREDIT"] += amt
-                else:
+                elif "CASH" in raw_method:
                     totals["CASH"] += amt
+                else:
+                    totals["OTHER"] += amt
         else:
             amt = Decimal(str(self.amount_paid if self.amount_paid is not None else self.total_amount or 0))
-            method = str(self.payment_method or "").upper()
-            
-            if self.payment_method == self.PaymentMethod.CREDIT:
+            raw_method = str(self.payment_method or "").upper().replace(" ", "_")
+
+            if raw_method == "CREDIT":
                 totals["CREDIT"] += Decimal(str(self.total_amount or 0))
-            elif "PAYBILL" in method or "BANK" in method:
+            elif "PAYBILL" in raw_method:
                 totals["PAYBILL"] += amt
-            elif "MPESA" in method or "SEND_MONEY" in method or "TILL" in method:
+            elif "SEND_MONEY" in raw_method or "SENDMONEY" in raw_method or "TILL" in raw_method:
+                totals["SEND_MONEY"] += amt
+            elif "MPESA" in raw_method:
                 totals["MPESA"] += amt
-            else:
+            elif "BANK" in raw_method:
+                totals["BANK_TRANSFER"] += amt
+            elif "CASH" in raw_method:
                 totals["CASH"] += amt
+            else:
+                totals["OTHER"] += amt
 
         return totals
 
@@ -2230,6 +2253,12 @@ class SalePayment(models.Model):
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     reference_code = models.CharField(max_length=100, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        # Auto-link transaction from sale if transaction is empty
+        if not self.transaction_id and self.sale_id and hasattr(self.sale, 'transaction_id'):
+            self.transaction_id = self.sale.transaction_id
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.method}: KSh {self.amount}"
