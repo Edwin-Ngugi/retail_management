@@ -206,6 +206,56 @@ def bulk_add_to_branch(modeladmin, request, queryset):
     )
 
 
+@admin.action(description="Consolidate selected Purchase Orders into a single Batch Order")
+def consolidate_into_batch_order(modeladmin, request, queryset):
+    pos = list(queryset.order_by("purchase_date"))
+    if len(pos) < 2:
+        modeladmin.message_user(
+            request,
+            "Please select at least 2 purchase orders to consolidate.",
+            messages.WARNING,
+        )
+        return
+
+    # Ensure all selected POs belong to the same branch
+    branch_ids = set(p.branch_id for p in pos)
+    if len(branch_ids) > 1:
+        modeladmin.message_user(
+            request,
+            "Selected orders must belong to the same branch.",
+            messages.ERROR,
+        )
+        return
+
+    with transaction.atomic():
+        primary_po = pos[0]
+        date_str = primary_po.purchase_date.strftime("%Y%m%d")
+        batch_po_number = f"PO-{date_str}-BATCH-{primary_po.pk}"
+
+        primary_po.po_number = batch_po_number
+        primary_po.save(update_fields=["po_number"])
+
+        items_moved = 0
+        for secondary_po in pos[1:]:
+            # Move line items to primary batch order
+            updated_items = PurchaseOrderItem.objects.filter(purchase_order=secondary_po).update(purchase_order=primary_po)
+            items_moved += updated_items
+            
+            # Update batch reference
+            StockBatch.objects.filter(batch_number=secondary_po.po_number).update(batch_number=batch_po_number)
+            
+            # Delete redundant header
+            secondary_po.delete()
+
+        primary_po.recalculate_totals()
+
+    modeladmin.message_user(
+        request,
+        f"Successfully merged {len(pos)} purchase orders ({items_moved} line items) into Batch Order '{batch_po_number}'.",
+        messages.SUCCESS,
+    )
+
+
 # =============================================================================
 # BASE ADMIN
 # =============================================================================
@@ -612,6 +662,7 @@ class PurchaseOrderItemInline(admin.TabularInline):
 class PurchaseOrderAdmin(admin.ModelAdmin):
     list_display = ("po_number", "branch", "supplier_name", "total_amount", "amount_paid", "payment_method", "purchase_date")
     inlines = [PurchaseOrderItemInline]
+    actions = [consolidate_into_batch_order]
 
 
 @admin.register(PurchaseReturn)

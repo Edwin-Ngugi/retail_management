@@ -1,33 +1,56 @@
 import os
-import sys
 import django
 
-# Set up Django environment settings
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # Replace 'retail.settings' with your actual settings module path if different
+# Initialize Django environment settings
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # Replace 'your_project_name' with your actual Django settings module path
 django.setup()
 
 from django.db import transaction
-from stocks.models import SaleTransaction
+from django.db.models import Sum
+from stocks.models import PurchaseOrder, PurchaseOrderItem, StockBatch, StockMovement
 
-# Mapping: Current receipt_number -> Target invoice_number
-updates = {
-    "REC-20261003-E56526C5": "INV 1_29",
-    "REC-20261003-455B1DC5": "INV 1_27",
-}
+with transaction.atomic():
+    # Fetch all retro purchase orders that have PO numbers containing RETRO
+    retro_pos = PurchaseOrder.objects.filter(po_number__icontains="RETRO")
+    
+    # Group them by branch, date, and supplier
+    grouped_map = {}
+    for po in retro_pos:
+        date_str = po.purchase_date.strftime("%Y%m%d")
+        branch_id = po.branch_id
+        supplier_id = po.supplier_id or 0
+        key = (branch_id, date_str, supplier_id)
+        
+        if key not in grouped_map:
+            grouped_map[key] = []
+        grouped_map[key].append(po)
 
-def main():
-    with transaction.atomic():
-        for old_rec, new_inv in updates.items():
-            sale = SaleTransaction.objects.filter(receipt_number=old_rec).first()
-            if sale:
-                sale.receipt_number = new_inv
-                sale.invoice_number = new_inv
-                # Save using update_fields to bypass triggering re-generation logic in save()
-                sale.save(update_fields=["receipt_number", "invoice_number"])
-                print(f"✅ Updated Sale ID {sale.id}: {old_rec} -> {new_inv}")
-            else:
-                print(f"❌ Transaction with receipt_number '{old_rec}' not found.")
+    merged_count = 0
+    for (branch_id, date_str, supplier_id), pos in grouped_map.items():
+        if len(pos) <= 1:
+            continue
 
-if __name__ == "__main__":
-    main()
+        # Choose primary PO as batch container
+        primary_po = pos[0]
+        batch_po_number = f"PO-{date_str}-BATCH-{primary_po.branch.name[:3].upper()}"
+        primary_po.po_number = batch_po_number
+        primary_po.save()
+
+        # Move line items, stock batches, and stock movements to the primary PO
+        for po in pos[1:]:
+            # Move items
+            PurchaseOrderItem.objects.filter(purchase_order=po).update(purchase_order=primary_po)
+            
+            # Re-reference StockBatches & StockMovements
+            old_ref_prefix = f"PO-{po.pk}-"
+            new_ref_prefix = f"PO-{primary_po.pk}-"
+            
+            StockBatch.objects.filter(batch_number=po.po_number).update(batch_number=batch_po_number)
+            
+            # Delete empty duplicate header
+            po.delete()
+            merged_count += 1
+
+        primary_po.recalculate_totals()
+
+print(f"Successfully consolidated {merged_count} redundant purchase order headers into unified Batch Orders!")
