@@ -2114,7 +2114,6 @@ class PurchaseViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
-        # 1. Standardize incoming payload structure
         raw_data = request.data
         po_number_input = None
         supplier_name_input = None
@@ -2122,6 +2121,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         purchase_date_input = None
         branch_input = None
 
+        # 1. Standardize extraction whether request payload is a wrapper dict or array
         if isinstance(raw_data, dict) and "items" in raw_data and isinstance(raw_data["items"], list):
             items_payload = raw_data.get("items", [])
             po_number_input = raw_data.get("po_number")
@@ -2144,7 +2144,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         user = _authenticated_user(request)
 
         try:
-            # 2. Resolve Header Details
+            # 2. Resolve default fields from header or first item
             first_item = items_payload[0] if isinstance(items_payload[0], dict) else {}
             
             branch_param = (
@@ -2177,14 +2177,13 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 or first_item.get("transaction_date")
             )
 
-            # Generate PO Number if missing
             po_number = po_number_input or first_item.get("po_number")
             if not po_number:
                 date_clean = timezone.now().strftime("%Y%m%d")
                 unique_suffix = random.randint(1000, 9999)
                 po_number = f"PO-{date_clean}-BATCH-{unique_suffix}"
 
-            # 3. Create or Get Parent PurchaseOrder Header (for Django Admin)
+            # 3. Create parent PurchaseOrder for Django Admin visibility
             po_header, _ = PurchaseOrder.objects.get_or_create(
                 po_number=po_number,
                 defaults={
@@ -2196,7 +2195,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 },
             )
 
-            # 4. Process Line Items
+            # 4. Loop over items and create rows
             for data in items_payload:
                 item_id = data.get("item") or data.get("item_id")
                 if not item_id:
@@ -2236,7 +2235,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     },
                 )
 
-                # Create PurchaseOrderItem Line
+                # Add to PurchaseOrder items list
                 PurchaseOrderItem.objects.create(
                     purchase_order=po_header,
                     item=item,
@@ -2244,7 +2243,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     unit_cost_price=unit_cost,
                 )
 
-                # Create individual Purchase record
+                # Save standalone Purchase record
                 purchase = Purchase(
                     item=item,
                     branch=cur_branch,
@@ -2260,7 +2259,6 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 recalculate_wac_sales_cost(cur_branch, item)
                 created_purchases.append(purchase)
 
-            # Recalculate PurchaseOrder totals for Admin UI
             po_header.recalculate_totals()
 
             if not created_purchases:
@@ -2276,8 +2274,15 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 item_id=created_purchases[0].item_id,
             )
 
-            serializer = self.get_serializer(created_purchases, many=True)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            # Return success response with generated batch details
+            return Response(
+                {
+                    "message": "Batch purchase order recorded successfully.",
+                    "po_number": po_header.po_number,
+                    "count": len(created_purchases),
+                },
+                status=status.HTTP_201_CREATED,
+            )
 
         except Item.DoesNotExist:
             return Response(

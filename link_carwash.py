@@ -5,7 +5,7 @@ import django
 # 1. Add current project root directory to Python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# 2. Set Django settings module (replace 'your_project_name' with your actual project package name)
+# 2. Set Django settings module (replace 'myproject.settings' with your actual project module if different)
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
 
 # 3. Initialize Django environment
@@ -14,8 +14,8 @@ django.setup()
 from django.db import transaction
 from stocks.models import Purchase, PurchaseOrder, PurchaseOrderItem, StockBatch, StockMovement
 
-# Explicit ID list matching the selected items in your screenshot
-TARGET_PURCHASE_IDS = [115, 114, 113, 112, 111]
+# Selected Purchase IDs from screenshot (PO-116 through PO-126)
+TARGET_PURCHASE_IDS = [116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126]
 
 with transaction.atomic():
     purchases = list(Purchase.objects.filter(id__in=TARGET_PURCHASE_IDS).order_by("id"))
@@ -23,12 +23,12 @@ with transaction.atomic():
     if not purchases:
         print("No matching purchase records found!")
     else:
-        # Use details from the first purchase record for the batch header
+        # Details from the base purchase record for header defaults
         base_purchase = purchases[0]
         date_str = base_purchase.purchase_date.strftime("%Y%m%d")
-        batch_po_number = f"PO-{date_str}-BATCH-OCT2"
+        batch_po_number = f"PO-{date_str}-BATCH-8F8B"
 
-        # 1. Create or get the parent PurchaseOrder batch header
+        # 1. Create or retrieve parent PurchaseOrder header
         po_header, created = PurchaseOrder.objects.get_or_create(
             po_number=batch_po_number,
             defaults={
@@ -43,8 +43,8 @@ with transaction.atomic():
 
         items_added = 0
         for p in purchases:
-            # 2. Add as a line item to the batch header
-            po_item, _ = PurchaseOrderItem.objects.get_or_create(
+            # 2. Link line item under PurchaseOrder
+            PurchaseOrderItem.objects.get_or_create(
                 purchase_order=po_header,
                 item=p.item,
                 defaults={
@@ -53,7 +53,7 @@ with transaction.atomic():
                 }
             )
 
-            # 3. Align references on StockBatches & StockMovements to point to the batch header
+            # 3. Update stock tracking references to reference the batch order number
             StockBatch.objects.filter(reference=f"PURCHASE-{p.pk}").update(batch_number=batch_po_number)
             StockMovement.objects.filter(reference=f"PURCHASE-{p.pk}").update(
                 notes=f"Purchase Order ({batch_po_number})"
@@ -61,7 +61,7 @@ with transaction.atomic():
 
             items_added += 1
 
-        # 4. Recalculate financial totals for the parent batch header
+        # 4. Calculate total amount & amount paid for parent PurchaseOrder
         po_header.recalculate_totals()
 
         print(f"Successfully consolidated {items_added} purchases (IDs {TARGET_PURCHASE_IDS}) into Batch Order '{batch_po_number}'!")
