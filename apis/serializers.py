@@ -1628,6 +1628,38 @@ class StockTransferSerializer(serializers.ModelSerializer):
         except IntegrityError as e:
             raise _integrity_error(e)
 
+class PurchaseOrderItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PurchaseOrderItem
+        fields = ['id', 'item', 'quantity', 'unit_cost_price']
+
+class PurchaseOrderSerializer(serializers.ModelSerializer):
+    items = PurchaseOrderItemSerializer(many=True)
+
+    class Meta:
+        model = PurchaseOrder
+        fields = ['id', 'po_number', 'branch', 'supplier_name', 'payment_method', 'total_amount', 'amount_paid', 'purchase_date', 'items']
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        po = PurchaseOrder.objects.create(**validated_data)
+        
+        for item_data in items_data:
+            PurchaseOrderItem.objects.create(purchase_order=po, **item_data)
+            
+            # Also create standalone Purchase record so it syncs with traditional reports
+            Purchase.objects.create(
+                branch=po.branch,
+                item=item_data['item'],
+                supplier_name=po.supplier_name,
+                quantity=item_data['quantity'],
+                unit_cost_price=item_data['unit_cost_price'],
+                payment_method=po.payment_method,
+                purchase_date=po.purchase_date,
+            )
+
+        po.recalculate_totals()
+        return po
 
 # ============================================================
 # DAILY FINANCIAL REPORT
