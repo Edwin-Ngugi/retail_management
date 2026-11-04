@@ -11033,14 +11033,11 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
             return "PAYBILL"
 
-        if any(k in clean for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "BUYGOODS", "P2P"]):
+        if any(k in clean for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "BUYGOODS", "P2P", "MPESA", "M_PESA", "MOBILE"]):
             return "SEND_MONEY"
 
         if any(k in clean for k in ["BANK", "EFT", "TRANSFER"]):
             return "BANK_TRANSFER"
-
-        if any(k in clean for k in ["MPESA", "M_PESA", "MOBILE"]):
-            return "MPESA"
 
         if "CASH" in clean:
             return "CASH"
@@ -11061,16 +11058,21 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         return None
 
     def _get_split_payments(self, sale):
-        for rel_attr in ["split_payments", "payments", "payment_breakdown", "splits", "sale_payments"]:
+        all_found = []
+        for rel_attr in ["split_payments", "payments", "payment_breakdown", "splits", "sale_payments", "legacy_sales"]:
             relation = getattr(sale, rel_attr, None)
             if relation is not None:
                 try:
                     records = list(relation.all())
-                    if records:
-                        return records
+                    for r in records:
+                        # If relation is legacy_sales, extract its child split_payments
+                        if hasattr(r, "split_payments"):
+                            all_found.extend(list(r.split_payments.all()))
+                        else:
+                            all_found.append(r)
                 except Exception:
                     pass
-        return []
+        return all_found
 
     def _get_branch_and_dates(self, request):
         branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
@@ -11226,15 +11228,20 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DUAL-LOOKUP MAP FOR SPLIT PAYMENTS (BOTH TRANSACTION & SALE FKs)
+            # 1. ROBUST SPLIT PAYMENTS MAPPING & CHANNEL RESOLUTION
             # -----------------------------------------------------------------
-            split_payments_qs = SalePayment.objects.filter(
-                Q(transaction__in=sales_qs) | Q(sale__transaction__in=sales_qs)
-            )
+            sale_tx_ids = set(sales_qs.values_list('id', flat=True))
             
+            # Query SalePayment across all potential relation links
+            split_payments_qs = SalePayment.objects.filter(
+                Q(transaction_id__in=sale_tx_ids) |
+                Q(sale__transaction_id__in=sale_tx_ids) |
+                Q(sale_id__in=sale_tx_ids)
+            ).select_related('transaction', 'sale')
+
             split_payments_map = {}
             for sp in split_payments_qs:
-                tx_id = sp.transaction_id or (sp.sale.transaction_id if sp.sale else None)
+                tx_id = sp.transaction_id or (sp.sale.transaction_id if sp.sale and hasattr(sp.sale, 'transaction_id') else sp.sale_id)
                 if tx_id:
                     if tx_id not in split_payments_map:
                         split_payments_map[tx_id] = []
@@ -11256,26 +11263,36 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
                 if main_method == "SPLIT" or len(split_records) > 0:
                     for sp in split_records:
-                        raw_sp_method = str(getattr(sp, "method", "") or "").upper()
+                        raw_sp_method = str(getattr(sp, "method", "") or getattr(sp, "payment_method", "") or "").upper().replace(" ", "_")
                         sp_method = self._normalize_payment_method(raw_sp_method)
                         sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
 
-                        if sp_method == "CASH":
+                        if sp_method == "CASH" or "CASH" in raw_sp_method:
                             cash_total += sp_amount
-                        elif sp_method == "PAYBILL":
+                        elif sp_method == "PAYBILL" or "PAYBILL" in raw_sp_method:
                             paybill_total += sp_amount
-                        elif sp_method == "SEND_MONEY":
+                        elif sp_method == "SEND_MONEY" or "SEND_MONEY" in raw_sp_method or "SENDMONEY" in raw_sp_method or "TILL" in raw_sp_method:
                             send_money_total += sp_amount
-                        elif sp_method == "MPESA":
+                        elif sp_method == "MPESA" or "MPESA" in raw_sp_method:
                             mpesa_std_total += sp_amount
-                        elif sp_method == "BANK_TRANSFER":
+                        elif sp_method == "BANK_TRANSFER" or "BANK" in raw_sp_method:
                             bank_total += sp_amount
-                        elif sp_method == "CREDIT":
+                        elif sp_method == "CREDIT" or "CREDIT" in raw_sp_method:
                             gross_credit_sales += sp_amount
                         else:
                             other_total += sp_amount
                 else:
-                    if main_method == "CREDIT":
+                    # Fallback to model property if method is split but no split_records array was created
+                    if main_method == "SPLIT" and hasattr(sale, "liquid_payments_breakdown"):
+                        breakdown = sale.liquid_payments_breakdown
+                        cash_total += breakdown.get("CASH", ZERO)
+                        paybill_total += breakdown.get("PAYBILL", ZERO)
+                        send_money_total += breakdown.get("SEND_MONEY", ZERO)
+                        mpesa_std_total += breakdown.get("MPESA", ZERO)
+                        bank_total += breakdown.get("BANK_TRANSFER", ZERO)
+                        gross_credit_sales += breakdown.get("CREDIT", ZERO)
+                        other_total += breakdown.get("OTHER", ZERO)
+                    elif main_method == "CREDIT":
                         gross_credit_sales += sale_amt
                     elif main_method == "CASH":
                         cash_total += sale_amt
