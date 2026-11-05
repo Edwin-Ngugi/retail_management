@@ -1182,129 +1182,6 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 s_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
                 e_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
 
-                queryset =Based on the provided `models.py` schema[cite: 13], here is why the exception `TypeError: () got unexpected keyword argument(s)` was occurring and the complete solution to update `apis/views.py`.
-
-### Root Cause
-Looking closely at the `CreditRepayment` model in your `models.py`[cite: 13]:
-1. **No `retailer` field**: The model defines `customer`, `transaction`, `branch`, `payment_method`, `amount`, `date`, `notes`, `created_by`, and `created_at`[cite: 13]. Attempting to pass `retailer=...` into `CreditRepayment.objects.create(...)` causes Django to throw a TypeError[cite: 12, 13].
-2. **No `reference_number` field**: The model uses `notes` instead of a separate `reference_number` column[cite: 13].
-
----
-
-### Backend Fix (`apis/views.py`)
-
-Update your `CreditRepaymentViewSet` in `apis/views.py` with this clean implementation. It automatically appends `reference_number` into the `notes` field and omits `retailer` from `.create()`[cite: 13]:
-
-```python
-class CreditRepaymentViewSet(viewsets.ModelViewSet):
-    serializer_class = CreditRepaymentSerializer
-    permission_classes = [permissions.AllowAny]
-
-    def get_queryset(self):
-        queryset = (
-            CreditRepayment.objects
-            .select_related(
-                "customer",
-                "branch",
-                "transaction",
-            )
-            .all()
-            .order_by("-id")
-        )
-
-        customer_id = self.request.query_params.get("customer")
-        branch_id = (
-            self.request.query_params.get("branch")
-            or self.request.query_params.get("branch_id")
-        )
-
-        month_param = self.request.query_params.get("month")
-        year_param = self.request.query_params.get("year")
-        date_param = (
-            self.request.query_params.get("date") 
-            or self.request.query_params.get("selectedDate")
-        )
-        start_date_param = self.request.query_params.get("startDate") or self.request.query_params.get("start_date")
-        end_date_param = self.request.query_params.get("endDate") or self.request.query_params.get("end_date")
-
-        period_type = self.request.query_params.get("period_type") or self.request.query_params.get("periodType")
-
-        # 1. Branch Filter
-        if branch_id and str(branch_id).lower() not in ["all", "none", "", "null"]:
-            if str(branch_id).isdigit():
-                queryset = queryset.filter(
-                    Q(branch_id=int(branch_id)) | Q(transaction__branch_id=int(branch_id))
-                )
-            else:
-                queryset = queryset.filter(
-                    Q(branch__name__iexact=str(branch_id).strip())
-                    | Q(transaction__branch__name__iexact=str(branch_id).strip())
-                )
-
-        if customer_id:
-            queryset = queryset.filter(customer_id=customer_id)
-
-        # 2. Dynamic Date Range Filtering
-        if period_type:
-            period_type = str(period_type).lower().strip()
-
-        tz = timezone.get_current_timezone()
-
-        # A. Custom Range (startDate & endDate)
-        if start_date_param and end_date_param:
-            try:
-                s_date = datetime.strptime(start_date_param, "%Y-%m-%d").date()
-                e_date = datetime.strptime(end_date_param, "%Y-%m-%d").date()
-                s_dt = timezone.make_aware(datetime.combine(s_date, datetime.min.time()), tz)
-                e_dt = timezone.make_aware(datetime.combine(e_date, datetime.max.time()), tz)
-                queryset = queryset.filter(
-                    Q(date__range=(s_date, e_date)) | Q(created_at__range=(s_dt, e_dt))
-                )
-            except ValueError:
-                pass
-
-        # B. Specific Day Filter
-        elif date_param or period_type == "day":
-            if date_param:
-                try:
-                    target_date = datetime.strptime(date_param, "%Y-%m-%d").date()
-                    s_dt = timezone.make_aware(datetime.combine(target_date, datetime.min.time()), tz)
-                    e_dt = timezone.make_aware(datetime.combine(target_date, datetime.max.time()), tz)
-                    queryset = queryset.filter(
-                        Q(date=target_date) | Q(created_at__range=(s_dt, e_dt))
-                    )
-                except ValueError:
-                    pass
-
-        # C. Month Filter
-        elif period_type == "month" or (month_param and year_param):
-            try:
-                today = timezone.localdate()
-                yr = int(year_param) if year_param else today.year
-                mth = int(month_param) if month_param else today.month
-                _, last_day = calendar.monthrange(yr, mth)
-                start_date = date(yr, mth, 1)
-                end_date = date(yr, mth, last_day)
-
-                s_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-                e_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
-
-                queryset = queryset.filter(
-                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(s_dt, e_dt))
-                )
-            except (ValueError, TypeError):
-                pass
-
-        # D. Year Filter
-        elif period_type == "year" and year_param:
-            try:
-                yr = int(year_param)
-                start_date = date(yr, 1, 1)
-                end_date = date(yr, 12, 31)
-
-                s_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-                e_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
-
                 queryset = queryset.filter(
                     Q(date__range=(start_date, end_date)) | Q(created_at__range=(s_dt, e_dt))
                 )
@@ -1425,7 +1302,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             if ref_no:
                 formatted_notes = f"Ref: {ref_no} | {notes_input}".strip(" |")
 
-            # 2. Save strictly using fields present in CreditRepayment model schema
+            # 2. Save strictly using model schema fields
             repayment = CreditRepayment.objects.create(
                 customer=customer_obj,
                 transaction=transaction_obj,
