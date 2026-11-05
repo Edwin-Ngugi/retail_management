@@ -9212,26 +9212,41 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             year = int(request.query_params.get('year', now.year))
             month = int(request.query_params.get('month', now.month))
 
+            # Fix malformed YYYY-MM-DD parameter strings (e.g., '2026-10-098' -> '2026-10-09')
+            def sanitize_date_str(val):
+                if not val:
+                    return None
+                clean = str(val).strip()[:10]
+                try:
+                    return datetime.strptime(clean, '%Y-%m-%d').date()
+                except ValueError:
+                    return None
+
+            selected_date_clean = sanitize_date_str(
+                request.query_params.get('selectedDate') or request.query_params.get('date')
+            )
+
             if start_date_param and end_date_param:
-                start_date = datetime.strptime(str(start_date_param)[:10], '%Y-%m-%d').date()
-                end_date = datetime.strptime(str(end_date_param)[:10], '%Y-%m-%d').date()
+                start_date = sanitize_date_str(start_date_param) or now.date()
+                end_date = sanitize_date_str(end_date_param) or now.date()
+            elif period_type == 'day' and selected_date_clean:
+                start_date = selected_date_clean
+                end_date = selected_date_clean
             elif period_type == 'month':
                 _, last_day = calendar.monthrange(year, month)
                 start_date = date(year, month, 1)
                 end_date = date(year, month, last_day)
-            elif period_type == 'day':
-                d_str = (request.query_params.get('selectedDate') or request.query_params.get('date') or str(now.date()))[:10]
-                start_date = datetime.strptime(d_str, '%Y-%m-%d').date()
-                end_date = start_date
             elif period_type == 'year':
                 start_date = date(year, 1, 1)
                 end_date = date(year, 12, 31)
             else:
-                start_date = date(year, month, 1)
-                _, last_day = calendar.monthrange(year, month)
-                end_date = date(year, month, last_day)
+                start_date = selected_date_clean or date(year, month, 1)
+                _, last_day = calendar.monthrange(start_date.year, start_date.month)
+                end_date = date(start_date.year, start_date.month, last_day)
 
-            # Base Querysets aligned with models.py
+            # -----------------------------------------------------------------
+            # QUERYSETS
+            # -----------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__date__gte=start_date,
                 sale_date__date__lte=end_date
@@ -9272,14 +9287,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch_id=clean_branch_id)
 
             # -----------------------------------------------------------------
-            # 1. CHANNEL INFLOWS (Sales + Repayments routed by PaymentMethod)
+            # 1. INFLOWS
             # -----------------------------------------------------------------
             tot_cash = ZERO
             tot_paybill = ZERO
             tot_send_money = ZERO
             tot_bank = ZERO
 
-            # Process Sales Inflows using liquid_payments_breakdown property
             for sale in sales_qs.prefetch_related('split_payments'):
                 bd = sale.liquid_payments_breakdown
                 tot_cash += bd.get('CASH', ZERO)
@@ -9287,7 +9301,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 tot_send_money += bd.get('SEND_MONEY', ZERO) + bd.get('MPESA', ZERO)
                 tot_bank += bd.get('BANK_TRANSFER', ZERO)
 
-            # Route CreditRepayment models dynamically by payment_method enum
             for rep in repayments_qs:
                 rep_amt = rep.amount or ZERO
                 pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
@@ -9302,26 +9315,25 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     tot_cash += rep_amt
 
             # -----------------------------------------------------------------
-            # 2. OUTFLOWS (Direct Purchases + Supplier Repayments + Expenses)
+            # 2. ACTUAL LIQUID OUTFLOWS ONLY
             # -----------------------------------------------------------------
-            direct_purchases = purchases_qs.exclude(
+            # Calculate actual cash spent on purchases (exclude unpaid credit balances)
+            direct_cash_purchases = purchases_qs.exclude(
                 payment_method='CREDIT'
-            ).filter(
-                supplier_payments__isnull=True
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
 
             supplier_repayments = supplier_payments_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
 
-            purchases_cost = direct_purchases + supplier_repayments
+            purchases_outflow = direct_cash_purchases + supplier_repayments
 
             expenses_total = expenses_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
 
             tot_inflow = tot_cash + tot_paybill + tot_send_money + tot_bank
-            tot_outflow = purchases_cost + expenses_total
+            tot_outflow = purchases_outflow + expenses_total
             net_position = tot_inflow - tot_outflow
 
             date_str = str(end_date)
@@ -9367,13 +9379,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "id": "SUMMARY-PURCHASES",
                     "reference": "SUM-PURCHASES",
                     "date": date_str,
-                    "description": "Total Cost of Goods Purchased & Supplier Outflows",
+                    "description": "Total Supplier Cash Purchases & Settlements",
                     "type": "OUTFLOW",
                     "payment_method": "PURCHASE",
                     "channel": "STOCK_PURCHASE",
                     "inflow": 0.0,
-                    "outflow": float(purchases_cost),
-                    "amount": float(purchases_cost)
+                    "outflow": float(purchases_outflow),
+                    "amount": float(purchases_outflow)
                 },
                 {
                     "id": "SUMMARY-EXPENSES",
