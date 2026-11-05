@@ -10451,7 +10451,9 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                 return_qs = return_qs.filter(branch=branch_obj)
 
             if start_dt and end_dt:
-                po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
+                po_qs = po_qs.filter(
+                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                )
             if start_date and end_date:
                 return_qs = return_qs.filter(date__range=(start_date, end_date))
 
@@ -10528,13 +10530,15 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             if branch_obj:
                 po_qs = po_qs.filter(branch=branch_obj)
             if start_dt and end_dt:
-                po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
+                po_qs = po_qs.filter(
+                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                )
 
             results = []
 
             if po_qs.exists():
-                for po in po_qs.order_by('-created_at'):
-                    supplier_name = getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "N/A")
+                for po in po_qs.order_by('-purchase_date', '-created_at'):
+                    supplier_name = getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "Direct Supplier")
                     items_list = list(po.items.all())
 
                     items_data = []
@@ -10555,10 +10559,13 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                         [item.item.name for item in items_list if item.item]
                     ) or "Multiple Items"
 
+                    date_val = getattr(po, 'purchase_date', None) or po.created_at
+                    date_str = date_val.strftime('%Y-%m-%d') if date_val else ""
+
                     results.append({
                         "id": po.id,
                         "po_number": getattr(po, 'po_number', f"PO-{po.id}"),
-                        "purchase_date": po.created_at.strftime('%Y-%m-%d') if po.created_at else "",
+                        "purchase_date": date_str,
                         "supplier_name": supplier_name,
                         "item_name": item_names,
                         "quantity": float(total_qty),
@@ -10574,17 +10581,19 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                     purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
 
                 for p in purchases_qs.order_by('-purchase_date'):
-                    supplier_name = getattr(p, 'supplier_name', None) or (p.supplier.name if p.supplier else "N/A")
+                    supplier_name = getattr(p, 'supplier_name', None) or (p.supplier.name if p.supplier else "Direct Supplier")
                     item_name = p.item.name if p.item else f"Item #{p.item_id}"
 
                     qty_dec = to_decimal(getattr(p, 'quantity', 0))
                     cost_dec = to_decimal(getattr(p, 'unit_cost_price', 0))
                     total_cost = quantize_money(qty_dec * cost_dec)
 
+                    date_str = p.purchase_date.strftime('%Y-%m-%d') if p.purchase_date else ""
+
                     results.append({
                         "id": p.id,
                         "po_number": f"PUR-{p.id}",
-                        "purchase_date": p.purchase_date.strftime('%Y-%m-%d') if p.purchase_date else "",
+                        "purchase_date": date_str,
                         "supplier_name": supplier_name,
                         "item_name": item_name,
                         "quantity": float(qty_dec),
@@ -10616,16 +10625,20 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             if branch_obj:
                 po_qs = po_qs.filter(branch=branch_obj)
             if start_dt and end_dt:
-                po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
+                po_qs = po_qs.filter(
+                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                )
 
             results = []
-            for po in po_qs.order_by('-created_at'):
+            for po in po_qs.order_by('-purchase_date', '-created_at'):
+                date_val = getattr(po, 'purchase_date', None) or po.created_at
+                date_str = date_val.strftime('%Y-%m-%d') if date_val else ""
                 results.append({
                     "id": po.id,
                     "grn_number": f"GRN-{po.id}",
                     "po_number": getattr(po, 'po_number', f"PO-{po.id}"),
-                    "supplier_name": getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "N/A"),
-                    "received_date": po.created_at.strftime('%Y-%m-%d') if po.created_at else "",
+                    "supplier_name": getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "Direct Supplier"),
+                    "received_date": date_str,
                     "notes": f"Goods received for Order #{getattr(po, 'po_number', po.id)}",
                 })
 
@@ -10647,19 +10660,23 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             if branch_obj:
                 po_qs = po_qs.filter(branch=branch_obj)
             if start_dt and end_dt:
-                po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
+                po_qs = po_qs.filter(
+                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                )
 
             results = []
-            for po in po_qs.order_by('-created_at'):
+            for po in po_qs.order_by('-purchase_date', '-created_at'):
                 tot_amt = to_decimal(getattr(po, 'total_amount', 0))
                 amt_paid = to_decimal(getattr(po, 'amount_paid', 0))
                 is_paid = (getattr(po, 'payment_method', 'CASH') != 'CREDIT') or (amt_paid >= tot_amt)
+                date_val = getattr(po, 'purchase_date', None) or po.created_at
+                date_str = date_val.strftime('%Y-%m-%d') if date_val else ""
                 results.append({
                     "id": po.id,
                     "invoice_number": f"INV-{po.id}",
-                    "supplier_name": getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "N/A"),
+                    "supplier_name": getattr(po, 'supplier_name', None) or (po.supplier.name if po.supplier else "Direct Supplier"),
                     "total_cost": float(quantize_money(tot_amt)),
-                    "invoice_date": po.created_at.strftime('%Y-%m-%d') if po.created_at else "",
+                    "invoice_date": date_str,
                     "due_date": "",
                     "is_paid": is_paid
                 })
@@ -10687,7 +10704,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             results = []
             for pay in pay_qs.order_by('-created_at'):
                 p = pay.purchase
-                supplier_name = getattr(p, 'supplier_name', None) or (p.supplier.name if p and p.supplier else "N/A") if p else "N/A"
+                supplier_name = getattr(p, 'supplier_name', None) or (p.supplier.name if p and p.supplier else "Direct Supplier") if p else "Direct Supplier"
 
                 results.append({
                     "id": pay.id,
@@ -10714,14 +10731,19 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
             suppliers = Supplier.objects.all()
 
             results = []
+            supplier_names_seen = set()
+
             for sup in suppliers:
+                supplier_names_seen.add(sup.name.strip().lower())
                 po_qs = PurchaseOrder.objects.filter(Q(supplier=sup) | Q(supplier_name__iexact=sup.name))
 
                 if branch_obj:
                     po_qs = po_qs.filter(branch=branch_obj)
 
                 if start_dt and end_dt:
-                    po_qs = po_qs.filter(created_at__range=(start_dt, end_dt))
+                    po_qs = po_qs.filter(
+                        Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                    )
 
                 po_count = po_qs.count()
                 total_spend = ZERO
@@ -10757,6 +10779,45 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                 results.append({
                     "id": sup.id,
                     "supplier_name": sup.name,
+                    "total_purchases_count": po_count,
+                    "total_spend": float(quantize_money(total_spend)),
+                    "outstanding_balance": float(quantize_money(outstanding_balance)),
+                })
+
+            # Handle ad-hoc text-based supplier names (e.g., "Direct Supplier")
+            adhoc_po_qs = PurchaseOrder.objects.exclude(supplier_name__in=[s.name for s in suppliers])
+            if branch_obj:
+                adhoc_po_qs = adhoc_po_qs.filter(branch=branch_obj)
+            if start_dt and end_dt:
+                adhoc_po_qs = adhoc_po_qs.filter(
+                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                )
+
+            adhoc_suppliers = adhoc_po_qs.values_list('supplier_name', flat=True).distinct()
+            for name in adhoc_suppliers:
+                clean_name = (name or "Direct Supplier").strip()
+                if clean_name.lower() in supplier_names_seen:
+                    continue
+                supplier_names_seen.add(clean_name.lower())
+
+                sub_pos = adhoc_po_qs.filter(supplier_name__iexact=clean_name)
+                po_count = sub_pos.count()
+                total_spend = ZERO
+                total_paid = ZERO
+
+                for po in sub_pos:
+                    po_total = to_decimal(getattr(po, 'total_amount', 0))
+                    total_spend += po_total
+                    if getattr(po, 'payment_method', 'CASH') != 'CREDIT':
+                        total_paid += po_total
+                    else:
+                        total_paid += to_decimal(getattr(po, 'amount_paid', 0))
+
+                outstanding_balance = max(ZERO, total_spend - total_paid)
+
+                results.append({
+                    "id": f"adhoc-{clean_name}",
+                    "supplier_name": clean_name,
                     "total_purchases_count": po_count,
                     "total_spend": float(quantize_money(total_spend)),
                     "outstanding_balance": float(quantize_money(outstanding_balance)),
