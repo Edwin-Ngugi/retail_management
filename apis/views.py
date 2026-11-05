@@ -3050,14 +3050,16 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
 
             # 5. Process Sale via Transaction Atomic Block
             with transaction.atomic():
+                amount_paid_quantized = quantize_money(data.get("amount_paid") or "0.00")
+
                 create_kwargs = {
                     "branch": branch_obj,
                     "customer": customer_obj,
                     "customer_name": customer_name,
                     "payment_method": normalized_pm,
                     "sale_date": parsed_date,
-                    "total_amount": Decimal("0.00"),
-                    "amount_paid": Decimal(str(data.get("amount_paid") or "0.00")),
+                    "total_amount": ZERO,
+                    "amount_paid": amount_paid_quantized,
                     "created_by": request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
                 }
 
@@ -3067,7 +3069,7 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
 
                 sale = SaleTransaction.objects.create(**create_kwargs)
 
-                calculated_total = Decimal("0.00")
+                calculated_total = ZERO
 
                 for item_data in items_payload:
                     item_id = item_data.get("item") or item_data.get("item_id") or item_data.get("id")
@@ -3083,9 +3085,9 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                         continue
 
                     pricing = BranchItemPricing.objects.filter(item=item_obj, branch=branch_obj).first()
-                    cost_price = Decimal(str(pricing.unit_cost_price if pricing else getattr(item_obj, "unit_cost_price", ZERO) or ZERO))
-                    retail_price = Decimal(str(item_data.get("unit_selling_price") or item_data.get("unit_retail_price") or (pricing.unit_selling_price if pricing else ZERO) or ZERO))
-                    discount = Decimal(str(item_data.get("discount_per_item") or "0.00"))
+                    cost_price = quantize_money(pricing.unit_cost_price if pricing else getattr(item_obj, "unit_cost_price", ZERO) or ZERO)
+                    retail_price = quantize_money(item_data.get("unit_selling_price") or item_data.get("unit_retail_price") or (pricing.unit_selling_price if pricing else ZERO) or ZERO)
+                    discount = quantize_money(item_data.get("discount_per_item") or "0.00")
 
                     line_total = qty * (retail_price - discount)
                     calculated_total += line_total
@@ -3099,9 +3101,13 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                         discount_per_item=discount,
                     )
 
+                calculated_total = quantize_money(calculated_total)
                 sale.total_amount = calculated_total
                 if normalized_pm != "CREDIT" and sale.amount_paid == ZERO:
                     sale.amount_paid = calculated_total
+                else:
+                    sale.amount_paid = quantize_money(sale.amount_paid)
+
                 sale.save()
 
             # 6. Broadcast Real-time WebSocket Event
