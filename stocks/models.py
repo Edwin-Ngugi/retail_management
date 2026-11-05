@@ -1882,21 +1882,26 @@ class SaleTransaction(models.Model):
             "OTHER": Decimal("0.00"),
         }
 
+        # Retrieve attached split payments (supporting both 'split_payments' and 'payments' reverse relations)
         split_qs = getattr(self, "split_payments", None) or getattr(self, "payments", None)
-        has_splits = split_qs and split_qs.exists()
+        split_list = list(split_qs.all()) if split_qs is not None else []
 
-        if self.payment_method in ["SPLIT", "SPLIT PAYMENT"] or has_splits:
-            for sp in split_qs.all():
-                amt = Decimal(str(sp.amount or 0))
-                raw_method = str(getattr(sp, "method", "") or getattr(sp, "payment_method", "") or "").upper().replace(" ", "_")
+        if (self.payment_method or "").upper() in ["SPLIT", "SPLIT PAYMENT"] or len(split_list) > 0:
+            for sp in split_list:
+                amt = Decimal(str(getattr(sp, "amount", 0) or 0))
+                raw_method = str(
+                    getattr(sp, "method", None) 
+                    or getattr(sp, "payment_method", None) 
+                    or ""
+                ).upper().replace("-", "_").replace(" ", "_")
 
                 if "PAYBILL" in raw_method:
                     totals["PAYBILL"] += amt
-                elif "SEND_MONEY" in raw_method or "SENDMONEY" in raw_method or "TILL" in raw_method:
+                elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
                     totals["SEND_MONEY"] += amt
                 elif "MPESA" in raw_method:
                     totals["MPESA"] += amt
-                elif "BANK" in raw_method:
+                elif any(k in raw_method for k in ["BANK", "TRANSFER", "EFT"]):
                     totals["BANK_TRANSFER"] += amt
                 elif "CREDIT" in raw_method:
                     totals["CREDIT"] += amt
@@ -1906,17 +1911,17 @@ class SaleTransaction(models.Model):
                     totals["OTHER"] += amt
         else:
             amt = Decimal(str(self.amount_paid if self.amount_paid is not None else self.total_amount or 0))
-            raw_method = str(self.payment_method or "").upper().replace(" ", "_")
+            raw_method = str(self.payment_method or "").upper().replace("-", "_").replace(" ", "_")
 
             if raw_method == "CREDIT":
                 totals["CREDIT"] += Decimal(str(self.total_amount or 0))
             elif "PAYBILL" in raw_method:
                 totals["PAYBILL"] += amt
-            elif "SEND_MONEY" in raw_method or "SENDMONEY" in raw_method or "TILL" in raw_method:
+            elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
                 totals["SEND_MONEY"] += amt
             elif "MPESA" in raw_method:
                 totals["MPESA"] += amt
-            elif "BANK" in raw_method:
+            elif any(k in raw_method for k in ["BANK", "TRANSFER", "EFT"]):
                 totals["BANK_TRANSFER"] += amt
             elif "CASH" in raw_method:
                 totals["CASH"] += amt
