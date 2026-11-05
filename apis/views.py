@@ -8558,13 +8558,18 @@ def _get_pdf_logo_element():
     return None
 
 
+def _get_pdf_logo_element():
+    """Helper for rendering PDF header logo."""
+    return None
+
+
 class ManagementReportsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_branch_and_dates(self, request):
         """
         Robustly extracts and sanitizes branch and date parameters across 
-        Profit & Loss, Cash Flow, Balance Sheet, and Cashbook endpoints.
+        Profit & Loss, Cash Flow, Balance Sheet, Cash Operations, and Cashbook endpoints.
         """
         branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
         start_date_param = request.query_params.get('start_date') or request.query_params.get('startDate')
@@ -8607,7 +8612,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             _, last_day = calendar.monthrange(start_date.year, start_date.month)
             end_date = date(start_date.year, start_date.month, last_day)
 
-        # Datetime boundaries for precise query filtering
+        # Datetime boundaries for precise query filtering across models
         start_dt = timezone.make_aware(datetime.combine(start_date, time.min))
         end_dt = timezone.make_aware(datetime.combine(end_date, time.max))
 
@@ -8621,88 +8626,98 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
         return branch_obj, start_date, end_date, start_dt, end_dt
 
-
+    # =========================================================================
+    # CASH OPERATIONS REPORT (/management-reports/cash-operations/)
+    # =========================================================================
     @action(detail=False, methods=['get'], url_path='cash-operations')
     def cash_operations_report(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # -----------------------------------------------------------------
-            # 1. BASE QUERYSETS
-            # -----------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
-                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
-            )
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__gte=start_dt,
+                sale_date__lte=end_dt
+            ).prefetch_related('split_payments', 'repayments')
+
             repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                date__gte=start_date,
+                date__lte=end_date
             )
+
             purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                purchase_date__gte=start_dt,
+                purchase_date__lte=end_dt
             )
-            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
-            
-            # Pure expenses excluding supplier repayments
+
+            supplier_payments_qs = SupplierPayment.objects.filter(
+                created_at__gte=start_dt,
+                created_at__lte=end_dt
+            )
+
             expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                date__gte=start_date,
+                date__lte=end_date
             ).exclude(description__icontains='Supplier Repayment')
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
+                repayments_qs = repayments_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+                )
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
 
             # -----------------------------------------------------------------
-            # 2. CHANNEL INFLOW BREAKDOWN
+            # 1. LIQUID INFLOW BREAKDOWN
             # -----------------------------------------------------------------
             cash_inflow = ZERO
             mpesa_inflow = ZERO
             paybill_inflow = ZERO
 
-            # Process Sales Payments via SalePayment child entries & single payment fallbacks
-            split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
-            
-            # A) Single-method Sales
-            single_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
-            s_agg = single_sales.aggregate(
-                cash=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
-                paybill=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
-            )
-            
-            # B) Split-method Sales Payments
-            split_payments = SalePayment.objects.filter(transaction__in=sales_qs)
-            sp_agg = split_payments.aggregate(
-                cash=Coalesce(Sum('amount', filter=Q(method='CASH')), ZERO, output_field=DecimalField()),
-                paybill=Coalesce(Sum('amount', filter=Q(method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('amount', filter=Q(method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
-            )
+            for sale in sales_qs:
+                bd = sale.liquid_payments_breakdown
+                cash_inflow += bd.get('CASH', ZERO)
+                paybill_inflow += bd.get('PAYBILL', ZERO)
+                mpesa_inflow += bd.get('SEND_MONEY', ZERO) + bd.get('MPESA', ZERO)
 
-            # C) Credit Repayments
-            r_agg = repayments_qs.aggregate(
-                cash=Coalesce(Sum('amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
-                paybill=Coalesce(Sum('amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
-            )
+            for rep in repayments_qs:
+                rep_amt = rep.amount or ZERO
+                pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
 
-            cash_inflow = s_agg['cash'] + sp_agg['cash'] + r_agg['cash']
-            paybill_inflow = s_agg['paybill'] + sp_agg['paybill'] + r_agg['paybill']
-            mpesa_inflow = s_agg['send_money'] + sp_agg['send_money'] + r_agg['send_money']
+                if pm in ['SPLIT', 'SPLIT_PAYMENT']:
+                    split_details = getattr(rep, 'split_details', None) or {}
+                    if isinstance(split_details, dict) and split_details:
+                        c_amt = Decimal(str(split_details.get('cash', 0) or 0))
+                        p_amt = Decimal(str(split_details.get('paybill', 0) or 0))
+                        s_amt = Decimal(str(split_details.get('send_money', 0) or split_details.get('mpesa', 0) or 0))
+                        cash_inflow += c_amt
+                        paybill_inflow += p_amt
+                        mpesa_inflow += s_amt
+                    else:
+                        cash_inflow += rep_amt
+                elif 'PAYBILL' in pm:
+                    paybill_inflow += rep_amt
+                elif any(k in pm for k in ['SEND_MONEY', 'SENDMONEY', 'MPESA', 'TILL']):
+                    mpesa_inflow += rep_amt
+                else:
+                    cash_inflow += rep_amt
 
             total_inflows = cash_inflow + mpesa_inflow + paybill_inflow
 
             # -----------------------------------------------------------------
-            # 3. OUTFLOW ALLOCATION BREAKDOWN
+            # 2. OUTFLOW ALLOCATION BREAKDOWN
             # -----------------------------------------------------------------
-            direct_purchases = purchases_qs.exclude(payment_method='CREDIT').filter(
+            direct_purchases = purchases_qs.exclude(
+                payment_method=Purchase.PaymentMethod.CREDIT
+            ).filter(
                 supplier_payments__isnull=True
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
 
             supplier_settlements = supplier_payments_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
-            
+
             total_supplier_outflow = direct_purchases + supplier_settlements
 
             salaries_wages = expenses_qs.filter(
@@ -8717,7 +8732,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             net_position = total_inflows - total_outflows
 
             # -----------------------------------------------------------------
-            # 4. DAILY TRAJECTORY GRAPH
+            # 3. DAILY TRAJECTORY GRAPH
             # -----------------------------------------------------------------
             daily_trajectory = []
             curr = start_date
@@ -8726,10 +8741,17 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 d_expenses = expenses_qs.filter(date=curr)
                 d_supp_payments = supplier_payments_qs.filter(created_at__date=curr)
 
-                d_inflow = d_sales.aggregate(total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField()))['total']
+                d_inflow = ZERO
+                for s in d_sales:
+                    bd = s.liquid_payments_breakdown
+                    d_inflow += (
+                        bd.get('CASH', ZERO) + bd.get('PAYBILL', ZERO) +
+                        bd.get('SEND_MONEY', ZERO) + bd.get('MPESA', ZERO)
+                    )
+
                 d_outflow = (
-                    expenses_qs.filter(date=curr).aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total'] +
-                    supplier_payments_qs.filter(created_at__date=curr).aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
+                    d_expenses.aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total'] +
+                    d_supp_payments.aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
                 )
 
                 daily_trajectory.append({
@@ -8740,14 +8762,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 })
                 curr += timedelta(days=1)
 
-            # Quantized outputs
             q_inflow = float(quantize_money(total_inflows))
             q_outflow = float(quantize_money(total_outflows))
             q_net = float(quantize_money(net_position))
 
             return Response({
-                "period": start_date.strftime('%B %Y'),
-                # Top-level legacy keys for backward compatibility
+                "period": start_date.strftime('%B %Y') if start_date else timezone.localdate().strftime('%B %Y'),
                 "total_cash_inflows": q_inflow,
                 "total_cash_outflows": q_outflow,
                 "net_cash_flow": q_net,
@@ -8757,7 +8777,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "supplier_outflows": float(quantize_money(total_supplier_outflow)),
                 "operating_expenses": float(quantize_money(operating_expenses)),
                 "salaries_and_wages": float(quantize_money(salaries_wages)),
-                # Grouped structured keys for analytics views
                 "summary": {
                     "total_inflows": q_inflow,
                     "total_outflows": q_outflow,
@@ -8795,25 +8814,22 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             }, status=status.HTTP_200_OK)
 
     # =========================================================================
-    # 1. PROFIT & LOSS REPORT (/management-reports/profit-loss/)
+    # PROFIT & LOSS REPORT (/management-reports/profit-loss/)
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='profit-loss')
     def profit_report(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # ------------------------------------------------------------------
-            # 1. ACCRUAL REVENUE AGGREGATION (CASH + SPLIT + CREDIT SALES ISSUED)
-            # ------------------------------------------------------------------
             sales_qs = SaleTransaction.objects.filter(
-                sale_date__range=(start_dt, end_dt)
+                sale_date__gte=start_dt,
+                sale_date__lte=end_dt
             )
 
             expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            ).exclude(
-                description__icontains='Supplier Repayment'
-            )
+                date__gte=start_date,
+                date__lte=end_date
+            ).exclude(description__icontains='Supplier Repayment')
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -8823,26 +8839,19 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
             )['total']
 
-            # ------------------------------------------------------------------
-            # 2. COST OF GOODS SOLD (COGS)
-            # ------------------------------------------------------------------
             items_qs = SaleItem.objects.filter(
                 transaction__in=sales_qs
             ).select_related('item', 'transaction')
 
-            # Calculate direct COGS where unit_cost_price > 0
             direct_cogs_expr = ExpressionWrapper(
                 F('quantity_sold') * F('unit_cost_price'),
                 output_field=DecimalField(max_digits=12, decimal_places=2)
             )
-            
-            direct_cogs = items_qs.filter(unit_cost_price__gt=0).aggregate(
+
+            cogs = items_qs.filter(unit_cost_price__gt=0).aggregate(
                 total=Coalesce(Sum(direct_cogs_expr), ZERO, output_field=DecimalField())
             )['total']
 
-            cogs = direct_cogs
-
-            # Fallback for items recorded with 0 unit_cost_price using BranchItemPricing
             zero_cost_items = items_qs.filter(Q(unit_cost_price=0) | Q(unit_cost_price__isnull=True))
 
             if zero_cost_items.exists():
@@ -8853,16 +8862,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     cogs += Decimal(str(line.quantity_sold or 0)) * Decimal(str(cost_unit))
 
             gross_profit = revenue - cogs
-            
-            # ------------------------------------------------------------------
-            # 3. OPERATING EXPENSES & NET PROFIT
-            # ------------------------------------------------------------------
+
             operating_expenses = expenses_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
 
             operating_profit = gross_profit - operating_expenses
-
             finance_costs_and_tax = ZERO
             net_profit = operating_profit - finance_costs_and_tax
 
@@ -8891,41 +8896,39 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
             }, status=status.HTTP_200_OK)
 
-
     # =========================================================================
-    # 2. CASH FLOW REPORT (/management-reports/cash-flow/)
+    # CASH FLOW REPORT (/management-reports/cash-flow/)
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='cash-flow')
     def cash_flow_report(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            # -----------------------------------------------------------------
-            # BASE QUERYSETS
-            # -----------------------------------------------------------------
-            # Exclude purely CREDIT sales from direct cash flow inflows
             sales_qs = SaleTransaction.objects.filter(
-                sale_date__range=(start_dt, end_dt)
+                sale_date__gte=start_dt,
+                sale_date__lte=end_dt
             ).exclude(
                 payment_method=SaleTransaction.PaymentMethod.CREDIT
             ).prefetch_related('split_payments', 'payments')
 
-            # Realized cash inflows from customer credit repayments
             repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                date__gte=start_date,
+                date__lte=end_date
             )
 
             purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                purchase_date__gte=start_dt,
+                purchase_date__lte=end_dt
             )
 
             supplier_payments_qs = SupplierPayment.objects.filter(
-                created_at__range=(start_dt, end_dt)
+                created_at__gte=start_dt,
+                created_at__lte=end_dt
             )
 
-            # Operating expenses excluding supplier settlements
             expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                date__gte=start_date,
+                date__lte=end_date
             ).exclude(description__icontains='Supplier Repayment')
 
             if branch_obj:
@@ -8935,10 +8938,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-            # -----------------------------------------------------------------
-            # 1. OPERATING ACTIVITIES
-            # -----------------------------------------------------------------
-            # A) Realized liquid cash sales (excluding credit sales)
             realized_sales_cash = ZERO
             for s in sales_qs:
                 bd = s.liquid_payments_breakdown
@@ -8950,7 +8949,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     bd.get('BANK_TRANSFER', ZERO)
                 )
 
-            # B) Liquid cash received from customer credit repayments
             customer_repayments = ZERO
             for rep in repayments_qs:
                 rep_amt = rep.amount or ZERO
@@ -8970,9 +8968,8 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             customer_receipts = realized_sales_cash + customer_repayments
 
-            # Supplier Outflows (Direct Cash Purchases + Supplier Settlements)
             direct_purchases = purchases_qs.exclude(
-                payment_method='CREDIT'
+                payment_method=Purchase.PaymentMethod.CREDIT
             ).filter(
                 supplier_payments__isnull=True
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
@@ -8983,7 +8980,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             
             supplier_payments = direct_purchases + actual_supplier_payments
 
-            # Filter non-operating expense items out of OpEx calculation
             non_opex_filter = Q(description__icontains='salary') | Q(description__icontains='wage') | \
                               Q(description__icontains='equipment') | Q(description__icontains='asset') | \
                               Q(description__icontains='loan') | Q(description__icontains='drawing') | \
@@ -9001,9 +8997,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             net_operating_cash = customer_receipts - supplier_payments - operating_expenses - salaries_and_wages
 
-            # -----------------------------------------------------------------
-            # 2. INVESTING ACTIVITIES
-            # -----------------------------------------------------------------
             equipment_purchased = expenses_qs.filter(
                 Q(description__icontains='equipment') | Q(description__icontains='asset') | Q(description__icontains='machinery')
             ).aggregate(
@@ -9012,9 +9005,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             net_investing_cash = -equipment_purchased
 
-            # -----------------------------------------------------------------
-            # 3. FINANCING ACTIVITIES
-            # -----------------------------------------------------------------
             capital_plus_loan_received = expenses_qs.filter(
                 Q(description__icontains='capital') | Q(description__icontains='loan received')
             ).aggregate(
@@ -9035,9 +9025,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             net_financing_cash = capital_plus_loan_received - loan_repayment - drawings
 
-            # -----------------------------------------------------------------
-            # 4. CASH SUMMARY
-            # -----------------------------------------------------------------
             net_increase_in_cash = net_operating_cash + net_investing_cash + net_financing_cash
             opening_cash = ZERO
             closing_cash = opening_cash + net_increase_in_cash
@@ -9088,29 +9075,25 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             }, status=status.HTTP_200_OK)
 
     # =========================================================================
-    # 3. BALANCE SHEET REPORT (/management-reports/balance-sheet/)
+    # BALANCE SHEET REPORT (/management-reports/balance-sheet/)
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='balance-sheet')
     def balance_sheet_report(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            sales_filter = {"sale_date__range": (start_dt, end_dt)} if start_dt else {"sale_date__lte": end_dt}
-            repay_filter = {"date__range": (start_date, end_date)} if start_date else {"date__lte": end_date}
-            expense_filter = {"date__range": (start_date, end_date)} if start_date else {"date__lte": end_date}
-            purchases_filter = {"purchase_date__range": (start_dt, end_dt)} if start_dt else {"purchase_date__lte": end_dt}
-
-            # ------------------------------------------------------------------
-            # 1. Period Liquid Cash Inflows
-            # ------------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(**sales_filter).prefetch_related('split_payments', 'payments')
-            repayments_qs = CreditRepayment.objects.filter(**repay_filter)
+            sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).prefetch_related('split_payments', 'payments')
+            repayments_qs = CreditRepayment.objects.filter(date__lte=end_date)
+            expenses_qs = Expense.objects.filter(date__lte=end_date).exclude(description__icontains='Supplier Repayment')
+            purchases_qs = Purchase.objects.filter(purchase_date__lte=end_dt)
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 repayments_qs = repayments_qs.filter(
                     Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
                 )
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
 
             tot_sales_cash = ZERO
             for s in sales_qs:
@@ -9142,18 +9125,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             tot_inflows = tot_sales_cash + tot_repayments
 
-            # ------------------------------------------------------------------
-            # 2. Period Liquid Cash Outflows (OpEx + Non-Credit Purchases)
-            # ------------------------------------------------------------------
-            expenses_qs = Expense.objects.filter(**expense_filter).exclude(
-                description__icontains='Supplier Repayment'
-            )
-            purchases_qs = Purchase.objects.filter(**purchases_filter)
-
-            if branch_obj:
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-
             tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
 
             tot_purchases_direct = ZERO
@@ -9163,7 +9134,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             tot_outflows = tot_expenses + tot_purchases_direct
             net_cash = tot_inflows - tot_outflows
 
-            # Reclassify negative cash as bank overdraft liability
             if net_cash < ZERO:
                 cash_bank_mpesa = ZERO
                 bank_overdraft = abs(net_cash)
@@ -9171,10 +9141,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 cash_bank_mpesa = net_cash
                 bank_overdraft = ZERO
 
-            # ------------------------------------------------------------------
-            # 3. Customer Debts & Inventory Stock Assets
-            # ------------------------------------------------------------------
-            # Include all sales with outstanding balance_due (not limited strictly to payment_method=CREDIT)
             all_pending_sales = SaleTransaction.objects.filter(sale_date__lte=end_dt)
             if branch_obj:
                 all_pending_sales = all_pending_sales.filter(branch=branch_obj)
@@ -9192,9 +9158,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             equipment = ZERO
             total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
 
-            # ------------------------------------------------------------------
-            # 4. Liabilities (Supplier Debts + Bank Overdraft)
-            # ------------------------------------------------------------------
             cum_purchases_qs = Purchase.objects.filter(purchase_date__lte=end_dt)
             if branch_obj:
                 cum_purchases_qs = cum_purchases_qs.filter(branch=branch_obj)
@@ -9206,9 +9169,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             bank_loan = ZERO
             total_liabilities = supplier_debts + bank_loan + bank_overdraft
 
-            # ------------------------------------------------------------------
-            # 5. Equity & Balance Equation
-            # ------------------------------------------------------------------
             all_sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt)
             if branch_obj:
                 all_sales_qs = all_sales_qs.filter(branch=branch_obj)
@@ -9261,57 +9221,17 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "liabilities_plus_equity": 0.0
             }, status=status.HTTP_200_OK)
 
+    # =========================================================================
+    # CASHBOOK REPORT (/management-reports/cash-book/)
+    # =========================================================================
     @action(detail=False, methods=['get'], url_path='cash-book')
     def cash_book(self, request):
         try:
-            branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
-            start_date_param = request.query_params.get('start_date') or request.query_params.get('startDate')
-            end_date_param = request.query_params.get('end_date') or request.query_params.get('endDate')
-            period_type = request.query_params.get('period_type') or request.query_params.get('periodType') or 'month'
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            now = datetime.now()
-            year = int(request.query_params.get('year', now.year))
-            month = int(request.query_params.get('month', now.month))
-
-            # Fix malformed YYYY-MM-DD parameter strings (e.g., '2026-10-098' -> '2026-10-09')
-            def sanitize_date_str(val):
-                if not val:
-                    return None
-                clean = str(val).strip()[:10]
-                try:
-                    return datetime.strptime(clean, '%Y-%m-%d').date()
-                except ValueError:
-                    return None
-
-            selected_date_clean = sanitize_date_str(
-                request.query_params.get('selectedDate') or request.query_params.get('date')
-            )
-
-            if start_date_param and end_date_param:
-                start_date = sanitize_date_str(start_date_param) or now.date()
-                end_date = sanitize_date_str(end_date_param) or now.date()
-            elif period_type == 'day' and selected_date_clean:
-                start_date = selected_date_clean
-                end_date = selected_date_clean
-            elif period_type == 'month':
-                _, last_day = calendar.monthrange(year, month)
-                start_date = date(year, month, 1)
-                end_date = date(year, month, last_day)
-            elif period_type == 'year':
-                start_date = date(year, 1, 1)
-                end_date = date(year, 12, 31)
-            else:
-                start_date = selected_date_clean or date(year, month, 1)
-                _, last_day = calendar.monthrange(start_date.year, start_date.month)
-                end_date = date(start_date.year, start_date.month, last_day)
-
-            # -----------------------------------------------------------------
-            # QUERYSETS
-            # -----------------------------------------------------------------
-            # Include sales that either are not purely CREDIT, OR have liquid split_payments attached
             sales_qs = SaleTransaction.objects.filter(
-                sale_date__date__gte=start_date,
-                sale_date__date__lte=end_date
+                sale_date__gte=start_dt,
+                sale_date__lte=end_dt
             ).filter(
                 Q(split_payments__isnull=False) | Q(payments__isnull=False) | ~Q(payment_method='CREDIT')
             ).distinct().prefetch_related('split_payments', 'payments')
@@ -9327,38 +9247,29 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             ).exclude(description__icontains='Supplier Repayment')
 
             purchases_qs = Purchase.objects.filter(
-                purchase_date__date__gte=start_date,
-                purchase_date__date__lte=end_date
+                purchase_date__gte=start_dt,
+                purchase_date__lte=end_dt
             )
 
             supplier_payments_qs = SupplierPayment.objects.filter(
-                created_at__date__gte=start_date,
-                created_at__date__lte=end_date
+                created_at__gte=start_dt,
+                created_at__lte=end_dt
             )
 
-            if branch_id and str(branch_id).lower() not in ['all', 'none', '', 'null']:
-                try:
-                    clean_branch_id = int(branch_id)
-                except (ValueError, TypeError):
-                    clean_branch_id = branch_id
-
-                sales_qs = sales_qs.filter(branch_id=clean_branch_id)
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
                 repayments_qs = repayments_qs.filter(
-                    Q(branch_id=clean_branch_id) | Q(transaction__branch_id=clean_branch_id)
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
                 )
-                expenses_qs = expenses_qs.filter(branch_id=clean_branch_id)
-                purchases_qs = purchases_qs.filter(branch_id=clean_branch_id)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch_id=clean_branch_id)
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
 
-            # -----------------------------------------------------------------
-            # 1. INFLOWS
-            # -----------------------------------------------------------------
             tot_cash = ZERO
             tot_paybill = ZERO
             tot_send_money = ZERO
             tot_bank = ZERO
 
-            # Process Sales & Child Split Payments
             for sale in sales_qs:
                 bd = sale.liquid_payments_breakdown
                 tot_cash += bd.get('CASH', ZERO)
@@ -9366,19 +9277,16 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 tot_send_money += bd.get('SEND_MONEY', ZERO) + bd.get('MPESA', ZERO)
                 tot_bank += bd.get('BANK_TRANSFER', ZERO)
 
-            # Process Credit Repayments & Split Repayments
             for rep in repayments_qs:
                 rep_amt = rep.amount or ZERO
                 pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
 
                 if pm in ['SPLIT', 'SPLIT_PAYMENT']:
-                    # Extract split details payload if attached to repayment
                     split_details = getattr(rep, 'split_details', None) or {}
                     if isinstance(split_details, dict) and split_details:
                         c_amt = Decimal(str(split_details.get('cash', 0) or 0))
                         p_amt = Decimal(str(split_details.get('paybill', 0) or 0))
                         s_amt = Decimal(str(split_details.get('send_money', 0) or split_details.get('mpesa', 0) or 0))
-                        
                         tot_cash += c_amt
                         tot_paybill += p_amt
                         tot_send_money += s_amt
@@ -9386,18 +9294,15 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                         tot_cash += rep_amt
                 elif 'PAYBILL' in pm:
                     tot_paybill += rep_amt
-                elif 'SEND_MONEY' in pm or 'SENDMONEY' in pm or 'MPESA' in pm:
+                elif any(k in pm for k in ['SEND_MONEY', 'SENDMONEY', 'MPESA', 'TILL']):
                     tot_send_money += rep_amt
-                elif 'BANK' in pm or 'TRANSFER' in pm:
+                elif any(k in pm for k in ['BANK', 'TRANSFER']):
                     tot_bank += rep_amt
                 else:
                     tot_cash += rep_amt
 
-            # -----------------------------------------------------------------
-            # 2. ACTUAL LIQUID OUTFLOWS ONLY
-            # -----------------------------------------------------------------
             direct_cash_purchases = purchases_qs.exclude(
-                payment_method='CREDIT'
+                payment_method=Purchase.PaymentMethod.CREDIT
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
 
             supplier_repayments = supplier_payments_qs.aggregate(
@@ -9505,885 +9410,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "results": [],
                 "entries": [],
                 "records": []
-            }, status=status.HTTP_200_OK)        
-
-    # =========================================================================
-    # PDF EXPORT ACTIONS
-    # =========================================================================
-    @action(detail=False, methods=['get'], url_path='export-profit-loss-pdf')
-    def export_profit_loss_pdf(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-
-            # -----------------------------------------------------------------
-            # 1. CASH-BASIS REVENUE AGGREGATION
-            # -----------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(
-                Q(sale_date__range=(start_dt, end_dt)) | Q(sale_date__date__range=(start_date, end_date))
-            ).exclude(
-                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
-            )
-
-            repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
-
-            # Pure operating expenses excluding supplier repayments
-            expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            ).exclude(
-                description__icontains='Supplier Repayment'
-            )
-
-            items_qs = SaleItem.objects.filter(
-                Q(transaction__sale_date__range=(start_dt, end_dt)) |
-                Q(transaction__sale_date__date__range=(start_date, end_date))
-            ).exclude(
-                Q(transaction__payment_method='CREDIT') | Q(transaction__receipt_number__startswith='INV')
-            )
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(
-                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
-                )
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-                items_qs = items_qs.filter(transaction__branch=branch_obj)
-
-            # Split payments routing
-            split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
-            non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
-
-            single_sales_revenue = non_split_sales.aggregate(
-                total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs).exclude(method='CREDIT')
-            split_payments_revenue = split_payments_qs.aggregate(
-                total=Coalesce(
-                    Sum(
-                        'amount',
-                        filter=Q(method__icontains='PAYBILL') | 
-                               Q(method__icontains='BANK') | 
-                               Q(method__in=['CASH', 'MPESA', 'SEND_MONEY', 'TILL'])
-                    ),
-                    ZERO,
-                    output_field=DecimalField()
-                )
-            )['total']
-
-            repayments_revenue = repayments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            total_sales = single_sales_revenue + split_payments_revenue + repayments_revenue
-
-            # -----------------------------------------------------------------
-            # 2. COST OF GOODS SOLD & EXPENSES
-            # -----------------------------------------------------------------
-            cogs_expr = ExpressionWrapper(
-                F('quantity_sold') * F('unit_cost_price'),
-                output_field=DecimalField(max_digits=12, decimal_places=2)
-            )
-            total_cogs = items_qs.aggregate(total=Coalesce(Sum(cogs_expr), ZERO, output_field=DecimalField()))['total']
-
-            gross_profit = total_sales - total_cogs
-            operating_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField()))['total']
-            operating_profit = gross_profit - operating_expenses
-            tax = ZERO
-            net_profit = operating_profit - tax
-
-            # Helper function for PDF currency formatting
-            def fmt_pdf_curr(val):
-                num = float(val or 0)
-                if num < 0:
-                    return f"(KSh {abs(num):,.2f})"
-                return f"KSh {num:,.2f}"
-
-            # -----------------------------------------------------------------
-            # 3. REPORTLAB PDF BUILD
-            # -----------------------------------------------------------------
-            buffer = io.BytesIO()
-            doc = SimpleDocTemplate(
-                buffer,
-                pagesize=letter,
-                rightMargin=40,
-                leftMargin=40,
-                topMargin=40,
-                bottomMargin=40
-            )
-
-            styles = getSampleStyleSheet()
-
-            company_style = ParagraphStyle(
-                'PdfCompanyHeader',
-                parent=styles['Normal'],
-                fontName='Helvetica-Bold',
-                fontSize=18,
-                leading=22,
-                textColor=colors.HexColor('#004D40'),
-                alignment=1,
-                spaceAfter=4
-            )
-
-            subtitle_style = ParagraphStyle(
-                'PdfSubHeader',
-                parent=styles['Normal'],
-                fontName='Helvetica',
-                fontSize=10,
-                leading=14,
-                textColor=colors.HexColor('#475569'),
-                alignment=1,
-                spaceAfter=15
-            )
-
-            label_style = ParagraphStyle(
-                'TableLabel',
-                parent=styles['Normal'],
-                fontName='Helvetica',
-                fontSize=10,
-                textColor=colors.HexColor('#1E293B')
-            )
-
-            bold_label_style = ParagraphStyle(
-                'TableLabelBold',
-                parent=styles['Normal'],
-                fontName='Helvetica-Bold',
-                fontSize=10,
-                textColor=colors.HexColor('#0F172A')
-            )
-
-            branch_name = branch_obj.name if branch_obj else "All Branches"
-            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}"
-
-            elements = []
-
-            logo_element = _get_pdf_logo_element()
-            if logo_element:
-                elements.append(logo_element)
-                elements.append(Spacer(1, 8))
-
-            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
-            elements.append(Paragraph(f"<b>PROFIT & LOSS STATEMENT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
-            elements.append(Spacer(1, 10))
-
-            data = [
-                [Paragraph("Revenue", bold_label_style), fmt_pdf_curr(total_sales)],
-                [Paragraph("Less: Cost of Goods Sold", label_style), fmt_pdf_curr(total_cogs)],
-                [Paragraph("Gross Profit", bold_label_style), fmt_pdf_curr(gross_profit)],
-                [Paragraph("Less: Operating Expenses", label_style), fmt_pdf_curr(operating_expenses)],
-                [Paragraph("Operating Profit", bold_label_style), fmt_pdf_curr(operating_profit)],
-                [Paragraph("Finance Costs & Tax", label_style), fmt_pdf_curr(tax)],
-                [Paragraph("Net Profit / (Loss)", bold_label_style), fmt_pdf_curr(net_profit)]
-            ]
-
-            table = Table(data, colWidths=[340, 192])
-            table.setStyle(TableStyle([
-                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('TOPPADDING', (0, 0), (-1, -1), 8),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                ('BACKGROUND', (0, 2), (-1, 2), colors.HexColor('#F8FAFC')),
-                ('BACKGROUND', (0, 4), (-1, 4), colors.HexColor('#F8FAFC')),
-                ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#E6FFFA')),
-                ('TEXTCOLOR', (1, 6), (1, 6), colors.HexColor('#004D40')),
-                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
-                ('LINEBELOW', (0, 6), (-1, 6), 1.5, colors.HexColor('#004D40')),
-            ]))
-
-            elements.append(table)
-            doc.build(elements)
-            buffer.seek(0)
-
-            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="Profit_Loss_Statement_{branch_name}.pdf"'
-            return response
-
-        except Exception as e:
-            logger.exception("Export Profit Loss PDF Error")
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=False, methods=['get'], url_path='export-cash-flow-pdf')
-    def export_cash_flow_pdf(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-
-            # -----------------------------------------------------------------
-            # 1. BASE QUERYSETS (UNIFIED OUTFLOW & INFLOW FILTERS)
-            # -----------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
-                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
-            )
-            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
-            supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
-            
-            # Pure operating expenses excluding supplier repayments
-            expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            ).exclude(description__icontains='Supplier Repayment')
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-
-            # -----------------------------------------------------------------
-            # 2. CASH INFLOWS
-            # -----------------------------------------------------------------
-            realized_sales_cash = ZERO
-            for s in sales_qs:
-                if not getattr(s, 'is_invoice', False):
-                    bd = s.liquid_payments_breakdown
-                    realized_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
-
-            customer_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            customer_receipts = realized_sales_cash + customer_repayments
-
-            # -----------------------------------------------------------------
-            # 3. CASH OUTFLOWS (EXCLUDE DOUBLE-COUNTED SUPPLIER PAYMENTS)
-            # -----------------------------------------------------------------
-            # Direct cash purchases without existing supplier payment records
-            direct_purchases = purchases_qs.exclude(payment_method='CREDIT').filter(
-                supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
-
-            supplier_repayments = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            supplier_payments = direct_purchases + supplier_repayments
-
-            operating_expenses = expenses_qs.exclude(description__icontains='salary').exclude(description__icontains='wage').aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            salaries_and_wages = expenses_qs.filter(Q(description__icontains='salary') | Q(description__icontains='wage')).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-
-            net_operating_cash = customer_receipts - supplier_payments - operating_expenses - salaries_and_wages
-
-            equipment_purchased = ZERO
-            net_investing_cash = -equipment_purchased
-
-            capital_loan_received = ZERO
-            loan_repayment = ZERO
-            drawings = ZERO
-            net_financing_cash = capital_loan_received - loan_repayment - drawings
-
-            net_increase_in_cash = net_operating_cash + net_investing_cash + net_financing_cash
-            opening_cash = ZERO
-            closing_cash = opening_cash + net_increase_in_cash
-
-            # Helper function for currency formatting
-            def fmt_pdf_curr(val):
-                num = float(val or 0)
-                if num < 0:
-                    return f"(KSh {abs(num):,.2f})"
-                return f"KSh {num:,.2f}"
-
-            # -----------------------------------------------------------------
-            # 4. REPORTLAB PDF SETUP
-            # -----------------------------------------------------------------
-            buffer = io.BytesIO()
-            doc = SimpleDocTemplate(
-                buffer,
-                pagesize=letter,
-                rightMargin=40,
-                leftMargin=40,
-                topMargin=40,
-                bottomMargin=40
-            )
-
-            styles = getSampleStyleSheet()
-
-            company_style = ParagraphStyle(
-                'CompanyTitle',
-                parent=styles['Normal'],
-                fontName='Helvetica-Bold',
-                fontSize=18,
-                leading=22,
-                textColor=colors.HexColor('#004D40'),
-                alignment=1,
-                spaceAfter=4
-            )
-
-            subtitle_style = ParagraphStyle(
-                'SubTitle',
-                parent=styles['Normal'],
-                fontName='Helvetica',
-                fontSize=10,
-                leading=14,
-                textColor=colors.HexColor('#475569'),
-                alignment=1,
-                spaceAfter=15
-            )
-
-            label_style = ParagraphStyle(
-                'LabelNormal',
-                parent=styles['Normal'],
-                fontName='Helvetica',
-                fontSize=10,
-                textColor=colors.HexColor('#1E293B')
-            )
-
-            bold_label_style = ParagraphStyle(
-                'LabelBold',
-                parent=styles['Normal'],
-                fontName='Helvetica-Bold',
-                fontSize=10,
-                textColor=colors.HexColor('#0F172A')
-            )
-
-            branch_name = branch_obj.name if branch_obj else "All Branches"
-            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}"
-
-            elements = []
-
-            # Centered Logo Wrapper
-            logo_element = _get_pdf_logo_element()
-            if logo_element:
-                elements.append(logo_element)
-                elements.append(Spacer(1, 8))
-
-            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
-            elements.append(Paragraph(f"<b>CASH FLOW STATEMENT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
-            elements.append(Spacer(1, 10))
-
-            # Financial Data Table
-            data = [
-                [Paragraph("<b>OPERATING ACTIVITIES</b>", bold_label_style), ""],
-                [Paragraph("Customer receipts", label_style), fmt_pdf_curr(customer_receipts)],
-                [Paragraph("Supplier payments", label_style), fmt_pdf_curr(supplier_payments)],
-                [Paragraph("Operating expenses", label_style), fmt_pdf_curr(operating_expenses)],
-                [Paragraph("Salaries & wages", label_style), fmt_pdf_curr(salaries_and_wages)],
-                [Paragraph("Net operating cash", bold_label_style), fmt_pdf_curr(net_operating_cash)],
-                [Paragraph("<b>INVESTING ACTIVITIES</b>", bold_label_style), ""],
-                [Paragraph("Equipment purchased", label_style), fmt_pdf_curr(equipment_purchased)],
-                [Paragraph("Net investing cash", bold_label_style), fmt_pdf_curr(net_investing_cash)],
-                [Paragraph("<b>FINANCING ACTIVITIES</b>", bold_label_style), ""],
-                [Paragraph("Capital loan received", label_style), fmt_pdf_curr(capital_loan_received)],
-                [Paragraph("Loan repayment", label_style), fmt_pdf_curr(loan_repayment)],
-                [Paragraph("Drawings", label_style), fmt_pdf_curr(drawings)],
-                [Paragraph("Net financing cash", bold_label_style), fmt_pdf_curr(net_financing_cash)],
-                [Paragraph("Net increase in cash", bold_label_style), fmt_pdf_curr(net_increase_in_cash)],
-                [Paragraph("Opening cash", label_style), fmt_pdf_curr(opening_cash)],
-                [Paragraph("CLOSING CASH", bold_label_style), fmt_pdf_curr(closing_cash)]
-            ]
-
-            table = Table(data, colWidths=[340, 192])
-            table.setStyle(TableStyle([
-                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
-                ('BACKGROUND', (0, 5), (-1, 5), colors.HexColor('#F8FAFC')),
-                ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#F1F5F9')),
-                ('BACKGROUND', (0, 8), (-1, 8), colors.HexColor('#F8FAFC')),
-                ('BACKGROUND', (0, 9), (-1, 9), colors.HexColor('#F1F5F9')),
-                ('BACKGROUND', (0, 13), (-1, 13), colors.HexColor('#F8FAFC')),
-                ('BACKGROUND', (0, 16), (-1, 16), colors.HexColor('#E6FFFA')),
-                ('TEXTCOLOR', (1, 16), (1, 16), colors.HexColor('#004D40')),
-                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
-                ('LINEBELOW', (0, 16), (-1, 16), 1.5, colors.HexColor('#004D40')),
-            ]))
-
-            elements.append(table)
-            doc.build(elements)
-            buffer.seek(0)
-
-            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="Cash_Flow_Statement_{branch_name}.pdf"'
-            return response
-
-        except Exception as e:
-            logger.exception("Export Cash Flow PDF Error")
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=False, methods=['get'], url_path='export-balance-sheet-pdf')
-    def export_balance_sheet_pdf(self, request):
-        try:
-            branch_obj, _, end_date, _, end_dt = self._get_branch_and_dates(request)
-
-            # -----------------------------------------------------------------
-            # 1. CASH, BANK & M-PESA INFLOW/OUTFLOW BALANCE (UNIFIED LOGIC)
-            # -----------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).exclude(
-                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
-            )
-            repayments_qs = CreditRepayment.objects.filter(Q(date__lte=end_date) | Q(created_at__lte=end_dt))
-            
-            # Pure operating expenses excluding supplier repayments
-            expenses_qs = Expense.objects.filter(
-                Q(date__lte=end_date) | Q(created_at__lte=end_dt)
-            ).exclude(description__icontains='Supplier Repayment')
-            
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__lte=end_dt) | Q(created_at__lte=end_dt))
-            supplier_payments_qs = SupplierPayment.objects.filter(created_at__lte=end_dt)
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
-
-            tot_sales_cash = ZERO
-            for s in sales_qs:
-                if not getattr(s, 'is_invoice', False):
-                    bd = s.liquid_payments_breakdown
-                    tot_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
-
-            tot_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            tot_inflows = tot_sales_cash + tot_repayments
-
-            # Outflows without double-counting
-            tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            tot_purchases_direct = purchases_qs.exclude(payment_method='CREDIT').filter(
-                supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
-            tot_supplier_repay = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-            
-            tot_outflows = tot_expenses + tot_purchases_direct + tot_supplier_repay
-
-            cash_bank_mpesa = max(ZERO, tot_inflows - tot_outflows)
-
-            # -----------------------------------------------------------------
-            # 2. CUSTOMER RECEIVABLES
-            # -----------------------------------------------------------------
-            credit_sales_qs = SaleTransaction.objects.filter(payment_method=SaleTransaction.PaymentMethod.CREDIT)
-            if branch_obj:
-                credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
-            customer_debts = sum((s.balance_due for s in credit_sales_qs), ZERO)
-
-            # -----------------------------------------------------------------
-            # 3. INVENTORY STOCK VALUATION
-            # -----------------------------------------------------------------
-            inventory_stock = ZERO
-            try:
-                stock_qs = BranchStock.objects.all().select_related('item', 'branch')
-                if branch_obj:
-                    stock_qs = stock_qs.filter(branch=branch_obj)
-
-                for bs in stock_qs:
-                    pricing = bs.item.branch_pricings.filter(branch=bs.branch).first()
-                    cost = pricing.unit_cost_price if pricing else ZERO
-                    inventory_stock += Decimal(str(bs.quantity)) * Decimal(str(cost))
-            except Exception:
-                pricing_qs = BranchItemPricing.objects.all().select_related('item', 'branch')
-                if branch_obj:
-                    pricing_qs = pricing_qs.filter(branch=branch_obj)
-                for pr in pricing_qs:
-                    inventory_stock += pr.remaining_stock * pr.unit_cost_price
-
-            equipment = ZERO
-            total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
-
-            # -----------------------------------------------------------------
-            # 4. SUPPLIER PAYABLES (LIABILITIES)
-            # -----------------------------------------------------------------
-            credit_purchases_qs = Purchase.objects.filter(payment_method='CREDIT')
-            if branch_obj:
-                credit_purchases_qs = credit_purchases_qs.filter(branch=branch_obj)
-
-            supplier_debts = sum((p.balance_due for p in credit_purchases_qs), ZERO)
-            bank_loan = ZERO
-            total_liabilities = supplier_debts + bank_loan
-
-            # -----------------------------------------------------------------
-            # 5. EQUITY & CAPITAL
-            # -----------------------------------------------------------------
-            capital_and_retained_profits = total_assets - total_liabilities
-            liabilities_plus_equity = total_liabilities + capital_and_retained_profits
-
-            # Helper function for currency formatting
-            def fmt_pdf_curr(val):
-                num = float(val or 0)
-                if num < 0:
-                    return f"(KSh {abs(num):,.2f})"
-                return f"KSh {num:,.2f}"
-
-            # -----------------------------------------------------------------
-            # 6. REPORTLAB PDF SETUP
-            # -----------------------------------------------------------------
-            buffer = io.BytesIO()
-            doc = SimpleDocTemplate(
-                buffer,
-                pagesize=letter,
-                rightMargin=40,
-                leftMargin=40,
-                topMargin=40,
-                bottomMargin=40
-            )
-
-            styles = getSampleStyleSheet()
-
-            company_style = ParagraphStyle(
-                'BsCompanyHeader',
-                parent=styles['Normal'],
-                fontName='Helvetica-Bold',
-                fontSize=18,
-                leading=22,
-                textColor=colors.HexColor('#004D40'),
-                alignment=1,
-                spaceAfter=4
-            )
-
-            subtitle_style = ParagraphStyle(
-                'BsSubHeader',
-                parent=styles['Normal'],
-                fontName='Helvetica',
-                fontSize=10,
-                leading=14,
-                textColor=colors.HexColor('#475569'),
-                alignment=1,
-                spaceAfter=15
-            )
-
-            label_style = ParagraphStyle(
-                'BsLabelNormal',
-                parent=styles['Normal'],
-                fontName='Helvetica',
-                fontSize=10,
-                textColor=colors.HexColor('#1E293B')
-            )
-
-            bold_label_style = ParagraphStyle(
-                'BsLabelBold',
-                parent=styles['Normal'],
-                fontName='Helvetica-Bold',
-                fontSize=10,
-                textColor=colors.HexColor('#0F172A')
-            )
-
-            branch_name = branch_obj.name if branch_obj else "All Branches"
-            as_at_str = end_date.strftime('%b %d, %Y')
-
-            elements = []
-
-            # Centered SVG Logo Header
-            logo_element = _get_pdf_logo_element()
-            if logo_element:
-                elements.append(logo_element)
-                elements.append(Spacer(1, 8))
-
-            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
-            elements.append(Paragraph(f"<b>BALANCE SHEET STATEMENT — {branch_name.upper()}</b><br/>As of {as_at_str}", subtitle_style))
-            elements.append(Spacer(1, 10))
-
-            # Balance Sheet Data Table
-            data = [
-                [Paragraph("<b>ASSETS</b>", bold_label_style), ""],
-                [Paragraph("Cash & Bank / M-Pesa", label_style), fmt_pdf_curr(cash_bank_mpesa)],
-                [Paragraph("Customer Receivables (Debts)", label_style), fmt_pdf_curr(customer_debts)],
-                [Paragraph("Inventory Stock Asset Value", label_style), fmt_pdf_curr(inventory_stock)],
-                [Paragraph("Equipment & Fixed Assets", label_style), fmt_pdf_curr(equipment)],
-                [Paragraph("Total Assets", bold_label_style), fmt_pdf_curr(total_assets)],
-                [Paragraph("<b>LIABILITIES</b>", bold_label_style), ""],
-                [Paragraph("Accounts Payable (Suppliers)", label_style), fmt_pdf_curr(supplier_debts)],
-                [Paragraph("Bank Loans & Borrowings", label_style), fmt_pdf_curr(bank_loan)],
-                [Paragraph("Total Liabilities", bold_label_style), fmt_pdf_curr(total_liabilities)],
-                [Paragraph("<b>EQUITY</b>", bold_label_style), ""],
-                [Paragraph("Capital & Retained Earnings", label_style), fmt_pdf_curr(capital_and_retained_profits)],
-                [Paragraph("TOTAL LIABILITIES & EQUITY", bold_label_style), fmt_pdf_curr(liabilities_plus_equity)]
-            ]
-
-            table = Table(data, colWidths=[340, 192])
-            table.setStyle(TableStyle([
-                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
-                ('BACKGROUND', (0, 5), (-1, 5), colors.HexColor('#F8FAFC')),
-                ('BACKGROUND', (0, 6), (-1, 6), colors.HexColor('#F1F5F9')),
-                ('BACKGROUND', (0, 9), (-1, 9), colors.HexColor('#F8FAFC')),
-                ('BACKGROUND', (0, 10), (-1, 10), colors.HexColor('#F1F5F9')),
-                ('BACKGROUND', (0, 12), (-1, 12), colors.HexColor('#E6FFFA')),
-                ('TEXTCOLOR', (1, 12), (1, 12), colors.HexColor('#004D40')),
-                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
-                ('LINEBELOW', (0, 12), (-1, 12), 1.5, colors.HexColor('#004D40')),
-            ]))
-
-            elements.append(table)
-            doc.build(elements)
-            buffer.seek(0)
-
-            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="Balance_Sheet_{branch_name}.pdf"'
-            return response
-
-        except Exception as e:
-            logger.exception("Export Balance Sheet PDF Error")
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=False, methods=['get'], url_path='export-cash-book-pdf')
-    def export_cash_book_pdf(self, request):
-        try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-
-            # -----------------------------------------------------------------
-            # 1. BASE QUERYSETS FOR PERIOD & BRANCH
-            # -----------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.all()
-            repayment_qs = CreditRepayment.objects.all()
-            expenses_qs = Expense.objects.all()
-            purchases_qs = Purchase.objects.all()
-            supplier_payments_qs = SupplierPayment.objects.all()
-
-            if start_dt and end_dt:
-                sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
-            if start_date and end_date:
-                repayment_qs = repayment_qs.filter(date__range=(start_date, end_date))
-                expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
-                purchases_qs = purchases_qs.filter(purchase_date__range=(start_date, end_date))
-                supplier_payments_qs = supplier_payments_qs.filter(created_at__date__range=(start_date, end_date))
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                repayment_qs = repayment_qs.filter(
-                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
-                )
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
-
-            # Exclude credit sales & non-cash repayments from direct expenses
-            sales_qs = sales_qs.exclude(Q(payment_method__iexact='CREDIT') | Q(receipt_number__startswith='INV'))
-            expenses_qs = expenses_qs.exclude(description__icontains='Supplier Repayment')
-
-            # -----------------------------------------------------------------
-            # 2. AGGREGATE CHANNEL TOTALS (MATCHING UI SUMMARY)
-            # -----------------------------------------------------------------
-            cash_total = ZERO
-            paybill_total = ZERO
-            send_money_total = ZERO
-            bank_total = ZERO
-
-            # Aggregate sales channels (Handling Single & Split Payments)
-            sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
-            for sale in sales_with_payments:
-                sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
-                method = self._normalize_payment_method(getattr(sale, "payment_method", None))
-                split_records = self._get_split_payments(sale)
-
-                if method == "SPLIT" or (split_records and len(split_records) > 0):
-                    for sp in split_records:
-                        sp_method = self._normalize_payment_method(self._extract_sp_method(sp))
-                        sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
-                        if sp_method == "CASH":
-                            cash_total += sp_amount
-                        elif sp_method == "PAYBILL":
-                            paybill_total += sp_amount
-                        elif sp_method in ["SEND_MONEY", "MPESA"]:
-                            send_money_total += sp_amount
-                        elif sp_method in ["BANK_TRANSFER", "BANK"]:
-                            bank_total += sp_amount
-                else:
-                    if method == "CASH":
-                        cash_total += sale_amt
-                    elif method == "PAYBILL":
-                        paybill_total += sale_amt
-                    elif method in ["SEND_MONEY", "MPESA"]:
-                        send_money_total += sale_amt
-                    elif method in ["BANK_TRANSFER", "BANK"]:
-                        bank_total += sale_amt
-
-            # Aggregate debt repayments into their respective channels
-            for rep in repayment_qs:
-                rep_amt = quantize_money(rep.amount or ZERO)
-                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
-                if rep_method == "PAYBILL":
-                    paybill_total += rep_amt
-                elif rep_method in ["SEND_MONEY", "MPESA"]:
-                    send_money_total += rep_amt
-                elif rep_method in ["BANK_TRANSFER", "BANK"]:
-                    bank_total += rep_amt
-                else:
-                    cash_total += rep_amt
-
-            # -----------------------------------------------------------------
-            # 3. OUTFLOWS (PURCHASES & OPERATING EXPENSES)
-            # -----------------------------------------------------------------
-            direct_purchases = purchases_qs.exclude(
-                payment_method__iexact='CREDIT'
-            ).filter(
-                supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
-
-            supplier_repayments = supplier_payments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            tot_purchases = direct_purchases + supplier_repayments
-
-            tot_expenses = expenses_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            entries = [
-                {
-                    'ref': 'SUM-CASH',
-                    'desc': 'Total Cash Collections & Repayments',
-                    'type': 'INFLOW',
-                    'inflow': float(cash_total),
-                    'outflow': 0.0
-                },
-                {
-                    'ref': 'SUM-PAYBILL',
-                    'desc': 'Total Paybill Collections & Repayments',
-                    'type': 'INFLOW',
-                    'inflow': float(paybill_total),
-                    'outflow': 0.0
-                },
-                {
-                    'ref': 'SUM-SENDMONEY',
-                    'desc': 'Total Send Money / M-Pesa Collections & Repayments',
-                    'type': 'INFLOW',
-                    'inflow': float(send_money_total),
-                    'outflow': 0.0
-                },
-                {
-                    'ref': 'SUM-PURCHASES',
-                    'desc': 'Total Cost of Goods Purchased & Supplier Outflows',
-                    'type': 'OUTFLOW',
-                    'inflow': 0.0,
-                    'outflow': float(tot_purchases)
-                },
-                {
-                    'ref': 'SUM-EXPENSES',
-                    'desc': 'Total Operating Expenses',
-                    'type': 'OUTFLOW',
-                    'inflow': 0.0,
-                    'outflow': float(tot_expenses)
-                }
-            ]
-
-            tot_inflow = sum(e['inflow'] for e in entries) + float(bank_total)
-            tot_outflow = sum(e['outflow'] for e in entries)
-            net_position = tot_inflow - tot_outflow
-
-            def fmt_pdf_curr(val):
-                num = float(val or 0)
-                if num < 0:
-                    return f"(KSh {abs(num):,.2f})"
-                return f"KSh {num:,.2f}"
-
-            # -----------------------------------------------------------------
-            # 4. REPORTLAB PDF BUILD
-            # -----------------------------------------------------------------
-            buffer = io.BytesIO()
-            doc = SimpleDocTemplate(
-                buffer,
-                pagesize=letter,
-                rightMargin=30,
-                leftMargin=30,
-                topMargin=30,
-                bottomMargin=30
-            )
-
-            styles = getSampleStyleSheet()
-
-            company_style = ParagraphStyle(
-                'CbCompanyHeader',
-                parent=styles['Normal'],
-                fontName='Helvetica-Bold',
-                fontSize=16,
-                leading=20,
-                textColor=colors.HexColor('#004D40'),
-                alignment=1,
-                spaceAfter=3
-            )
-
-            subtitle_style = ParagraphStyle(
-                'CbSubHeader',
-                parent=styles['Normal'],
-                fontName='Helvetica',
-                fontSize=9,
-                leading=13,
-                textColor=colors.HexColor('#475569'),
-                alignment=1,
-                spaceAfter=12
-            )
-
-            table_header_style = ParagraphStyle(
-                'CbTh',
-                parent=styles['Normal'],
-                fontName='Helvetica-Bold',
-                fontSize=8,
-                textColor=colors.HexColor('#0F172A')
-            )
-
-            cell_style = ParagraphStyle(
-                'CbTd',
-                parent=styles['Normal'],
-                fontName='Helvetica',
-                fontSize=8,
-                textColor=colors.HexColor('#1E293B')
-            )
-
-            branch_name = branch_obj.name if branch_obj else "All Branches"
-            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}" if start_date and end_date else "All Time"
-
-            elements = []
-
-            logo_element = _get_pdf_logo_element()
-            if logo_element:
-                elements.append(logo_element)
-                elements.append(Spacer(1, 6))
-
-            elements.append(Paragraph("MELVEX BUSINESS SOLUTIONS", company_style))
-            elements.append(Paragraph(f"<b>CASHBOOK AGGREGATION & LIQUIDITY REPORT — {branch_name.upper()}</b><br/>Period: {period_str}", subtitle_style))
-            elements.append(Spacer(1, 8))
-
-            table_data = [[
-                Paragraph("Ref Code", table_header_style),
-                Paragraph("Channel / Category Description", table_header_style),
-                Paragraph("Type", table_header_style),
-                Paragraph("Inflow (KSh)", table_header_style),
-                Paragraph("Outflow (KSh)", table_header_style)
-            ]]
-
-            for e in entries:
-                table_data.append([
-                    Paragraph(e['ref'], cell_style),
-                    Paragraph(e['desc'], cell_style),
-                    Paragraph(e['type'], cell_style),
-                    fmt_pdf_curr(e['inflow']) if e['inflow'] > 0 else "-",
-                    fmt_pdf_curr(e['outflow']) if e['outflow'] > 0 else "-"
-                ])
-
-            table_data.append([
-                Paragraph("<b>TOTALS</b>", table_header_style),
-                Paragraph(f"<b>Net Cash Position: {fmt_pdf_curr(net_position)}</b>", table_header_style),
-                "",
-                Paragraph(f"<b>{fmt_pdf_curr(tot_inflow)}</b>", table_header_style),
-                Paragraph(f"<b>{fmt_pdf_curr(tot_outflow)}</b>", table_header_style)
-            ])
-
-            table = Table(table_data, colWidths=[90, 230, 60, 85, 85])
-            table.setStyle(TableStyle([
-                ('ALIGN', (3, 0), (-1, -1), 'RIGHT'),
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 8),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F1F5F9')),
-                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
-                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#E6FFFA')),
-                ('LINEABOVE', (0, -1), (-1, -1), 1.5, colors.HexColor('#004D40')),
-            ]))
-
-            elements.append(table)
-            doc.build(elements)
-            buffer.seek(0)
-
-            response = HttpResponse(buffer.getvalue(), content_type='application/pdf')
-            response['Content-Disposition'] = f'attachment; filename="Cashbook_Summary_{branch_name}.pdf"'
-            return response
-
-        except Exception as e:
-            logger.exception("Export Cash Book PDF Error")
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            }, status=status.HTTP_200_OK)
 
 # ============================================================
 # USER PERMISSION VIEWSET
