@@ -1195,8 +1195,37 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         try:
             raw_data = request.data if isinstance(request.data, dict) else {}
 
-            customer_id = raw_data.get("customer") or raw_data.get("customer_id")
-            amount_raw = raw_data.get("amount")
+            # 1. Broad Customer / Transaction extraction
+            customer_id = (
+                raw_data.get("customer")
+                or raw_data.get("customer_id")
+                or raw_data.get("client")
+                or raw_data.get("client_id")
+            )
+
+            # If customer ID is nested inside an object (e.g., {"customer": {"id": 5}})
+            if isinstance(customer_id, dict):
+                customer_id = customer_id.get("id") or customer_id.get("pk")
+
+            transaction_id = (
+                raw_data.get("transaction")
+                or raw_data.get("transaction_id")
+                or raw_data.get("sale")
+                or raw_data.get("sale_id")
+                or raw_data.get("invoice_id")
+            )
+
+            if isinstance(transaction_id, dict):
+                transaction_id = transaction_id.get("id") or transaction_id.get("pk")
+
+            # Resolve customer via transaction if customer_id was not explicitly passed
+            transaction_obj = None
+            if transaction_id:
+                transaction_obj = SaleTransaction.objects.filter(pk=transaction_id).first()
+                if transaction_obj and not customer_id:
+                    customer_id = transaction_obj.customer_id
+
+            amount_raw = raw_data.get("amount") or raw_data.get("repayment_amount")
             
             if not customer_id or amount_raw in (None, ""):
                 return Response(
@@ -1225,8 +1254,11 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 .replace("-", "_")
             )
 
-            # Resolve Customer
+            # Resolve Customer Instance
             customer_obj = Customer.objects.filter(pk=customer_id).first()
+            if not customer_obj and transaction_obj:
+                customer_obj = transaction_obj.customer
+
             if not customer_obj:
                 return Response(
                     {"error": "Selected customer does not exist."},
@@ -1248,6 +1280,8 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 if not branch_obj:
                     branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
 
+            if not branch_obj and transaction_obj:
+                branch_obj = transaction_obj.branch
             if not branch_obj:
                 branch_obj = getattr(customer_obj, "branch", None)
 
@@ -1256,7 +1290,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             retailer_user = user or (branch_obj.retailer if branch_obj else None)
 
             # Date handling
-            date_input = raw_data.get("date")
+            date_input = raw_data.get("date") or raw_data.get("repayment_date")
             repayment_date = timezone.localdate()
             if date_input:
                 try:
@@ -1270,6 +1304,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             # Create repayment safely
             repayment = CreditRepayment.objects.create(
                 customer=customer_obj,
+                transaction=transaction_obj,
                 branch=branch_obj,
                 retailer=retailer_user,
                 created_by=user,
