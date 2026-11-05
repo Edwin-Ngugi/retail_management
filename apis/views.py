@@ -2115,13 +2115,8 @@ class PurchaseViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         raw_data = request.data
-        po_number_input = None
-        supplier_name_input = None
-        payment_method_input = None
-        purchase_date_input = None
-        branch_input = None
 
-        # 1. Standardize extraction whether request payload is a wrapper dict or array
+        # 1. Standardize payload parsing
         if isinstance(raw_data, dict) and "items" in raw_data and isinstance(raw_data["items"], list):
             items_payload = raw_data.get("items", [])
             po_number_input = raw_data.get("po_number")
@@ -2140,13 +2135,10 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        created_purchases = []
         user = _authenticated_user(request)
 
         try:
-            # 2. Resolve default fields from header or first item
             first_item = items_payload[0] if isinstance(items_payload[0], dict) else {}
-            
             branch_param = (
                 branch_input
                 or first_item.get("branch")
@@ -2176,20 +2168,17 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 .replace("-", "_")
             )
 
-            # SAFE DATE NORMALIZATION: Prevents AttributeError: 'datetime.date' object has no attribute 'date'
             raw_parsed_date = _parse_business_date(
                 purchase_date_input
                 or first_item.get("purchase_date")
                 or first_item.get("date")
                 or first_item.get("transaction_date")
             )
-            
-            if isinstance(raw_parsed_date, datetime):
-                purchase_date = raw_parsed_date.date()
-            elif isinstance(raw_parsed_date, date):
-                purchase_date = raw_parsed_date
-            else:
-                purchase_date = timezone.localdate()
+            purchase_date = (
+                raw_parsed_date.date()
+                if isinstance(raw_parsed_date, datetime)
+                else (raw_parsed_date or timezone.localdate())
+            )
 
             po_number = po_number_input or first_item.get("po_number")
             if not po_number:
@@ -2197,7 +2186,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 unique_suffix = random.randint(1000, 9999)
                 po_number = f"PO-{date_clean}-BATCH-{unique_suffix}"
 
-            # 3. Create parent PurchaseOrder for Django Admin visibility
+            # 2. Create PurchaseOrder Batch Header
             po_header, _ = PurchaseOrder.objects.get_or_create(
                 po_number=po_number,
                 defaults={
@@ -2209,7 +2198,10 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 },
             )
 
-            # 4. Loop over items and create rows
+            created_purchases = []
+            processed_items = set()
+
+            # 3. Process items in batch
             for data in items_payload:
                 item_id = data.get("item") or data.get("item_id")
                 if not item_id:
@@ -2249,7 +2241,6 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     },
                 )
 
-                # Add to PurchaseOrder items list
                 PurchaseOrderItem.objects.create(
                     purchase_order=po_header,
                     item=item,
@@ -2257,7 +2248,6 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     unit_cost_price=unit_cost,
                 )
 
-                # Save standalone Purchase record using normalized purchase_date
                 purchase = Purchase(
                     item=item,
                     branch=cur_branch,
@@ -2270,10 +2260,13 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 )
                 purchase.save()
 
-                recalculate_wac_sales_cost(cur_branch, item)
                 created_purchases.append(purchase)
+                processed_items.add((cur_branch, item))
 
+            # 4. Single calculation pass after all items are inserted
             po_header.recalculate_totals()
+            for branch, item in processed_items:
+                recalculate_wac_sales_cost(branch, item)
 
             if not created_purchases:
                 return Response(
@@ -2298,17 +2291,10 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             )
 
         except Item.DoesNotExist:
-            return Response(
-                {"error": "Item not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"error": "Item not found."}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response(
-                {
-                    "error": "Purchase creation failed.",
-                    "details": str(e),
-                    "exception_type": type(e).__name__,
-                },
+                {"error": "Purchase creation failed.", "details": str(e), "exception_type": type(e).__name__},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

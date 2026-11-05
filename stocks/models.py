@@ -1415,7 +1415,7 @@ class PurchaseOrderItem(models.Model):
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
 
-        # 1. Reuse existing StockBatch or update quantities to prevent duplication
+        # 1. Reuse existing StockBatch or update quantities
         batch, _ = StockBatch.objects.get_or_create(
             branch=self.purchase_order.branch,
             item=self.item,
@@ -1429,14 +1429,11 @@ class PurchaseOrderItem(models.Model):
             }
         )
 
-        # 2. Extract date safely (prevents AttributeError if already a date object)
+        # 2. Extract date safely
         po_date = self.purchase_order.purchase_date
-        if hasattr(po_date, 'date') and callable(getattr(po_date, 'date')):
-            movement_date = po_date.date()
-        else:
-            movement_date = po_date
+        movement_date = po_date.date() if hasattr(po_date, 'date') and callable(getattr(po_date, 'date')) else po_date
 
-        # 3. Use update_or_create to ensure only ONE StockMovement exists per line item
+        # 3. Create or update StockMovement
         ref_code = f"PO-{self.purchase_order.pk}-{self.pk}"
         StockMovement.objects.update_or_create(
             branch=self.purchase_order.branch,
@@ -1447,16 +1444,13 @@ class PurchaseOrderItem(models.Model):
                 "movement_type": StockMovement.MovementType.PURCHASE,
                 "quantity": self.quantity,
                 "unit_cost_price": self.unit_cost_price,
-                "date": movement_date,  # ✅ SAFE DATE EXTRACTION
+                "date": movement_date,
                 "created_at": self.purchase_order.purchase_date,
                 "reference_id": self.purchase_order.pk,
                 "notes": f"Purchase Order ({self.purchase_order.po_number})",
                 "created_by": self.purchase_order.created_by,
             }
         )
-
-        recalculate_wac_sales_cost(self.purchase_order.branch, self.item)
-        self.purchase_order.recalculate_totals()
 
 class SupplierPayment(models.Model):
     class PaymentMethod(models.TextChoices):
