@@ -400,7 +400,7 @@ class SaleItemInline(admin.TabularInline):
 
 class SalePaymentInline(admin.TabularInline):
     model = SalePayment
-    extra = 0
+    extra = 1
     fields = ("method", "amount", "reference_code", "created_at")
     readonly_fields = ("created_at",)
 
@@ -687,7 +687,7 @@ class MonthlyTransactionArchiveAdmin(TenantAwareModelAdmin):
 
 
 # =============================================================================
-# SALES & TRANSACTION MANAGEMENT (FIXED FOR DELETION & LIST VIEW)
+# SALES & TRANSACTION MANAGEMENT (FIXED FOR DELETION, LIST VIEW & SPLIT INLINES)
 # =============================================================================
 
 
@@ -743,6 +743,26 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
             .get_queryset(request)
             .select_related("branch", "customer", "created_by")
         )
+
+    def save_formset(self, request, form, formset, change):
+        """
+        Automatically recalculate amount_paid and is_paid status 
+        when split payment inline records are saved in Django Admin.
+        """
+        instances = formset.save(commit=False)
+        for instance in instances:
+            instance.save()
+        formset.save_m2m()
+
+        obj = form.instance
+        if formset.model == SalePayment and obj.pk:
+            split_payments = obj.split_payments.all()
+            if split_payments.exists():
+                total_split_paid = sum(sp.amount for sp in split_payments)
+                obj.amount_paid = total_split_paid
+                if total_split_paid >= (obj.total_amount or 0):
+                    obj.is_paid = True
+                obj.save(update_fields=["amount_paid", "is_paid"])
 
     @admin.display(description="Amount Paid", ordering="amount_paid")
     def display_amount_paid(self, obj):
