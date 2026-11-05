@@ -1885,7 +1885,7 @@ class SaleTransaction(models.Model):
             "OTHER": Decimal("0.00"),
         }
 
-        # Retrieve attached split payments (supporting both 'split_payments' and 'payments' reverse relations)
+        # 1. Inspect attached SalePayment records
         split_qs = getattr(self, "split_payments", None) or getattr(self, "payments", None)
         split_list = list(split_qs.all()) if split_qs is not None else []
 
@@ -1913,12 +1913,30 @@ class SaleTransaction(models.Model):
                 else:
                     totals["OTHER"] += amt
         else:
-            amt = Decimal(str(self.amount_paid if self.amount_paid is not None else self.total_amount or 0))
+            amt = Decimal(str(self.amount_paid if self.amount_paid is not None else 0))
             raw_method = str(self.payment_method or "").upper().replace("-", "_").replace(" ", "_")
 
             if raw_method == "CREDIT":
-                totals["CREDIT"] += max(ZERO, Decimal(str(self.total_amount or 0)) - amt)
-                totals["CASH"] += amt
+                total_val = Decimal(str(self.total_amount or 0))
+                credit_due = max(ZERO, total_val - amt)
+                totals["CREDIT"] += credit_due
+
+                # Route any upfront liquid payment if explicit repayments or payment breakdown exist
+                repayment_records = list(self.repayments.all()) if hasattr(self, "repayments") else []
+                if repayment_records:
+                    for rep in repayment_records:
+                        rep_amt = Decimal(str(rep.amount or 0))
+                        rep_pm = str(rep.payment_method or "CASH").upper().replace("-", "_").replace(" ", "_")
+                        if "PAYBILL" in rep_pm:
+                            totals["PAYBILL"] += rep_amt
+                        elif any(k in rep_pm for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
+                            totals["SEND_MONEY"] += rep_amt
+                        elif any(k in rep_pm for k in ["BANK", "TRANSFER", "EFT"]):
+                            totals["BANK_TRANSFER"] += rep_amt
+                        else:
+                            totals["CASH"] += rep_amt
+                else:
+                    totals["CASH"] += amt
             elif "PAYBILL" in raw_method:
                 totals["PAYBILL"] += amt
             elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
