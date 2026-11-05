@@ -1391,17 +1391,31 @@ class PurchaseOrder(models.Model):
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="purchase_orders_created")
     created_at = models.DateTimeField(auto_now_add=True)
 
+    @property
+    def balance_due(self):
+        """Calculates the remaining credit balance owed to the supplier."""
+        return max(ZERO, self.total_amount - self.amount_paid)
+
+    @property
+    def is_fully_paid(self):
+        """Returns True if the order has no outstanding credit balance."""
+        return self.amount_paid >= self.total_amount
+
     def recalculate_totals(self):
         aggregated = self.items.aggregate(
             total=Sum(F("quantity") * F("unit_cost_price"), output_field=models.DecimalField(max_digits=12, decimal_places=2))
         )
         self.total_amount = quantize_money(aggregated["total"] or ZERO)
-        if self.payment_method != self.PaymentMethod.CREDIT:
+        
+        if self.amount_paid > self.total_amount:
             self.amount_paid = self.total_amount
+        elif self.amount_paid == ZERO and self.payment_method != self.PaymentMethod.CREDIT:
+            self.amount_paid = self.total_amount
+            
         self.save(update_fields=["total_amount", "amount_paid"])
 
     def __str__(self):
-        return f"{self.po_number} ({self.branch.name}) - KSh {self.total_amount}"
+        return f"{self.po_number} ({self.branch.name}) - Total: KSh {self.total_amount} | Paid: KSh {self.amount_paid}"
 
 
 class PurchaseOrderItem(models.Model):
