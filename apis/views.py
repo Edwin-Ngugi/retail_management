@@ -9205,9 +9205,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         try:
             # Extract query parameters directly or via helper
             branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
-            start_date_param = request.query_params.get('start_date')
-            end_date_param = request.query_params.get('end_date')
-            period_type = request.query_params.get('period_type', 'month')
+            start_date_param = request.query_params.get('start_date') or request.query_params.get('startDate')
+            end_date_param = request.query_params.get('end_date') or request.query_params.get('endDate')
+            period_type = request.query_params.get('period_type') or request.query_params.get('periodType') or 'month'
 
             # Compute fallback start/end dates if missing
             now = datetime.now()
@@ -9222,7 +9222,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 start_date = date(year, month, 1)
                 end_date = date(year, month, last_day)
             elif period_type == 'day':
-                d_str = request.query_params.get('date', str(now.date()))[:10]
+                d_str = (request.query_params.get('selectedDate') or request.query_params.get('date') or str(now.date()))[:10]
                 start_date = datetime.strptime(d_str, '%Y-%m-%d').date()
                 end_date = start_date
             elif period_type == 'year':
@@ -9238,7 +9238,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 sale_date__date__gte=start_date,
                 sale_date__date__lte=end_date
             ).exclude(
-                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
+                Q(payment_method__iexact='CREDIT') | Q(receipt_number__startswith='INV')
             )
 
             repayments_qs = CreditRepayment.objects.filter(
@@ -9262,7 +9262,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             )
 
             # Apply Branch Filter safely
-            if branch_id and str(branch_id).lower() != 'all':
+            if branch_id and str(branch_id).lower() not in ['all', 'none', '', 'null']:
                 try:
                     clean_branch_id = int(branch_id)
                 except (ValueError, TypeError):
@@ -9281,40 +9281,44 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
 
-            # A) Single-Method Transactions
-            non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method='SPLIT')
+            # A) Single-Method Sale Transactions
+            non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method__iexact='SPLIT')
             
             single_sales_totals = non_split_sales.aggregate(
-                cash=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
+                cash=Coalesce(Sum('total_amount', filter=Q(payment_method__iexact='CASH')), ZERO, output_field=DecimalField()),
                 paybill=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='SEND') | Q(payment_method__icontains='MPESA') | Q(payment_method__icontains='M_PESA')), ZERO, output_field=DecimalField()),
+                bank=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='BANK') | Q(payment_method__icontains='TRANSFER')), ZERO, output_field=DecimalField()),
             )
 
             # B) Split Payment Child Entries ONLY
             split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs)
             split_totals = split_payments_qs.aggregate(
-                cash=Coalesce(Sum('amount', filter=Q(method='CASH')), ZERO, output_field=DecimalField()),
+                cash=Coalesce(Sum('amount', filter=Q(method__iexact='CASH')), ZERO, output_field=DecimalField()),
                 paybill=Coalesce(Sum('amount', filter=Q(method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('amount', filter=Q(method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('amount', filter=Q(method__icontains='SEND') | Q(method__icontains='MPESA') | Q(method__icontains='M_PESA')), ZERO, output_field=DecimalField()),
+                bank=Coalesce(Sum('amount', filter=Q(method__icontains='BANK') | Q(method__icontains='TRANSFER')), ZERO, output_field=DecimalField()),
             )
 
-            # C) Credit Repayments Totals
+            # C) Credit Repayments Totals Routed strictly by Repayment Method
             repayment_totals = repayments_qs.aggregate(
-                cash=Coalesce(Sum('amount', filter=Q(payment_method='CASH')), ZERO, output_field=DecimalField()),
+                cash=Coalesce(Sum('amount', filter=Q(payment_method__iexact='CASH')), ZERO, output_field=DecimalField()),
                 paybill=Coalesce(Sum('amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('amount', filter=Q(payment_method__in=['SEND_MONEY', 'MPESA'])), ZERO, output_field=DecimalField()),
+                send_money=Coalesce(Sum('amount', filter=Q(payment_method__icontains='SEND') | Q(payment_method__icontains='MPESA') | Q(payment_method__icontains='M_PESA')), ZERO, output_field=DecimalField()),
+                bank=Coalesce(Sum('amount', filter=Q(payment_method__icontains='BANK') | Q(payment_method__icontains='TRANSFER')), ZERO, output_field=DecimalField()),
             )
 
             # Consolidated Channel Sums
             tot_cash = single_sales_totals['cash'] + split_totals['cash'] + repayment_totals['cash']
             tot_paybill = single_sales_totals['paybill'] + split_totals['paybill'] + repayment_totals['paybill']
             tot_send_money = single_sales_totals['send_money'] + split_totals['send_money'] + repayment_totals['send_money']
+            tot_bank = single_sales_totals['bank'] + split_totals['bank'] + repayment_totals['bank']
 
             # -----------------------------------------------------------------
             # 2. OUTFLOWS (PURCHASES & OPERATING EXPENSES)
             # -----------------------------------------------------------------
             direct_purchases = purchases_qs.exclude(
-                payment_method='CREDIT'
+                payment_method__iexact='CREDIT'
             ).filter(
                 supplier_payments__isnull=True
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
@@ -9329,7 +9333,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
 
-            tot_inflow = tot_cash + tot_paybill + tot_send_money
+            tot_inflow = tot_cash + tot_paybill + tot_send_money + tot_bank
             tot_outflow = purchases_cost + expenses_total
             net_position = tot_inflow - tot_outflow
 
@@ -9352,7 +9356,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "id": "SUMMARY-PAYBILL",
                     "reference": "SUM-PAYBILL",
                     "date": date_str,
-                    "description": "Total Paybill Collections",
+                    "description": "Total Paybill Collections & Repayments",
                     "type": "INFLOW",
                     "payment_method": "PAYBILL",
                     "channel": "PAYBILL",
@@ -9364,7 +9368,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "id": "SUMMARY-SENDMONEY",
                     "reference": "SUM-SENDMONEY",
                     "date": date_str,
-                    "description": "Total Send Money / M-Pesa Collections",
+                    "description": "Total Send Money / M-Pesa Collections & Repayments",
                     "type": "INFLOW",
                     "payment_method": "SEND_MONEY",
                     "channel": "SEND_MONEY",
@@ -10047,6 +10051,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             repayment_qs = CreditRepayment.objects.all()
             expenses_qs = Expense.objects.all()
             purchases_qs = Purchase.objects.all()
+            supplier_payments_qs = SupplierPayment.objects.all()
 
             if start_dt and end_dt:
                 sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
@@ -10054,6 +10059,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 repayment_qs = repayment_qs.filter(date__range=(start_date, end_date))
                 expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
                 purchases_qs = purchases_qs.filter(purchase_date__range=(start_date, end_date))
+                supplier_payments_qs = supplier_payments_qs.filter(created_at__date__range=(start_date, end_date))
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -10062,6 +10068,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 )
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
+                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
+
+            # Exclude credit sales & non-cash repayments from direct expenses
+            sales_qs = sales_qs.exclude(Q(payment_method__iexact='CREDIT') | Q(receipt_number__startswith='INV'))
+            expenses_qs = expenses_qs.exclude(description__icontains='Supplier Repayment')
 
             # -----------------------------------------------------------------
             # 2. AGGREGATE CHANNEL TOTALS (MATCHING UI SUMMARY)
@@ -10069,8 +10080,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             cash_total = ZERO
             paybill_total = ZERO
             send_money_total = ZERO
+            bank_total = ZERO
 
-            # Aggregate sales channels
+            # Aggregate sales channels (Handling Single & Split Payments)
             sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
             for sale in sales_with_payments:
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
@@ -10085,17 +10097,21 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                             cash_total += sp_amount
                         elif sp_method == "PAYBILL":
                             paybill_total += sp_amount
-                        elif sp_method == "SEND_MONEY" or sp_method == "MPESA":
+                        elif sp_method in ["SEND_MONEY", "MPESA"]:
                             send_money_total += sp_amount
+                        elif sp_method in ["BANK_TRANSFER", "BANK"]:
+                            bank_total += sp_amount
                 else:
                     if method == "CASH":
                         cash_total += sale_amt
                     elif method == "PAYBILL":
                         paybill_total += sale_amt
-                    elif method == "SEND_MONEY" or method == "MPESA":
+                    elif method in ["SEND_MONEY", "MPESA"]:
                         send_money_total += sale_amt
+                    elif method in ["BANK_TRANSFER", "BANK"]:
+                        bank_total += sale_amt
 
-            # Aggregate debt repayments into cash flow channels
+            # Aggregate debt repayments into their respective channels
             for rep in repayment_qs:
                 rep_amt = quantize_money(rep.amount or ZERO)
                 rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
@@ -10103,13 +10119,25 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     paybill_total += rep_amt
                 elif rep_method in ["SEND_MONEY", "MPESA"]:
                     send_money_total += rep_amt
+                elif rep_method in ["BANK_TRANSFER", "BANK"]:
+                    bank_total += rep_amt
                 else:
                     cash_total += rep_amt
 
-            # Aggregate total purchases and operating expenses
-            tot_purchases = purchases_qs.aggregate(
-                total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField())
+            # -----------------------------------------------------------------
+            # 3. OUTFLOWS (PURCHASES & OPERATING EXPENSES)
+            # -----------------------------------------------------------------
+            direct_purchases = purchases_qs.exclude(
+                payment_method__iexact='CREDIT'
+            ).filter(
+                supplier_payments__isnull=True
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
+
+            supplier_repayments = supplier_payments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
             )['total']
+
+            tot_purchases = direct_purchases + supplier_repayments
 
             tot_expenses = expenses_qs.aggregate(
                 total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
@@ -10125,14 +10153,14 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 },
                 {
                     'ref': 'SUM-PAYBILL',
-                    'desc': 'Total Paybill Collections',
+                    'desc': 'Total Paybill Collections & Repayments',
                     'type': 'INFLOW',
                     'inflow': float(paybill_total),
                     'outflow': 0.0
                 },
                 {
                     'ref': 'SUM-SENDMONEY',
-                    'desc': 'Total Send Money / M-Pesa Collections',
+                    'desc': 'Total Send Money / M-Pesa Collections & Repayments',
                     'type': 'INFLOW',
                     'inflow': float(send_money_total),
                     'outflow': 0.0
@@ -10153,7 +10181,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 }
             ]
 
-            tot_inflow = sum(e['inflow'] for e in entries)
+            tot_inflow = sum(e['inflow'] for e in entries) + float(bank_total)
             tot_outflow = sum(e['outflow'] for e in entries)
             net_position = tot_inflow - tot_outflow
 
@@ -10164,7 +10192,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 return f"KSh {num:,.2f}"
 
             # -----------------------------------------------------------------
-            # 3. REPORTLAB PDF BUILD
+            # 4. REPORTLAB PDF BUILD
             # -----------------------------------------------------------------
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(
@@ -10217,7 +10245,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             )
 
             branch_name = branch_obj.name if branch_obj else "All Branches"
-            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}"
+            period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}" if start_date and end_date else "All Time"
 
             elements = []
 
