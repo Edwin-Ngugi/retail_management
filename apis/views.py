@@ -3063,24 +3063,37 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
-        # 1. Restrict view to today's date only
-        today = timezone.localdate()
+        # Allow date filtering via query params; default to today if not provided
+        selected_date_str = self.request.query_params.get("date") or self.request.query_params.get("selectedDate")
+        target_date = timezone.localdate()
 
-        # 2. Exclude supplier repayments / purchase entries
+        if selected_date_str:
+            try:
+                target_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        # Exclude supplier repayments / purchase entries
         queryset = (
             Expense.objects
-            .select_related("branch")
-            .filter(date=today)
+            .select_related("branch", "retailer")
+            .filter(date=target_date)
             .exclude(description__icontains="Supplier Repayment")
             .order_by("-date", "-id")
         )
+
+        user = _authenticated_user(self.request)
+        if user:
+            queryset = queryset.filter(
+                Q(retailer=user) | Q(branch__retailer=user)
+            )
 
         branch_param = (
             self.request.query_params.get("branch")
             or self.request.query_params.get("branch_id")
         )
 
-        if branch_param and str(branch_param).lower() != "all":
+        if branch_param and str(branch_param).lower() not in ["all", "none", "", "null"]:
             if str(branch_param).isdigit():
                 queryset = queryset.filter(branch_id=int(branch_param))
             else:
@@ -3104,29 +3117,39 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             or self.request.query_params.get("branch_id")
         )
 
-        validated_date = serializer.validated_data.get("date")
-
-        if isinstance(validated_date, datetime):
-            validated_date = validated_date.date()
-
-        save_kwargs = {
-            "date": (validated_date or timezone.localdate())
-        }
-
-        if user:
-            save_kwargs["retailer"] = user
-
-        if branch_param and str(branch_param).lower() != "all":
+        # 1. Resolve Branch
+        branch_obj = None
+        if branch_param and str(branch_param).lower() not in ["all", "none", "", "null"]:
             if str(branch_param).isdigit():
-                save_kwargs["branch_id"] = int(branch_param)
-            else:
+                branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
+            if not branch_obj:
                 branch_obj = (
                     RetailBranch.objects
                     .filter(name__iexact=str(branch_param).strip())
                     .first()
                 )
-                if branch_obj:
-                    save_kwargs["branch"] = branch_obj
+
+        # 2. Extract Date safely
+        validated_date = serializer.validated_data.get("date") or data.get("date")
+        if isinstance(validated_date, str):
+            try:
+                validated_date = datetime.strptime(validated_date.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                validated_date = None
+        elif isinstance(validated_date, datetime):
+            validated_date = validated_date.date()
+
+        save_kwargs = {
+            "date": validated_date or timezone.localdate()
+        }
+
+        if branch_obj:
+            save_kwargs["branch"] = branch_obj
+
+        # 3. Ensure Retailer is attached
+        retailer_user = user or (branch_obj.retailer if branch_obj else None)
+        if retailer_user:
+            save_kwargs["retailer"] = retailer_user
 
         try:
             expense = serializer.save(**save_kwargs)
@@ -3135,8 +3158,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 e.message_dict if hasattr(e, "message_dict") else str(e)
             )
 
+        # 4. Broadcast event
         target_branch_id = expense.branch_id
-
         if target_branch_id:
             channel_layer = get_channel_layer()
             if channel_layer:
