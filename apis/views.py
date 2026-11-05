@@ -8562,80 +8562,62 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_branch_and_dates(self, request):
-        branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
-        
-        # 1. Capture single-date queries (from daily selection) as well as ranges
-        single_date_param = (
-            request.query_params.get("date") or 
-            request.query_params.get("selectedDate")
-        )
-        start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
-        end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
-        
-        month_param = request.query_params.get("month")
-        year_param = request.query_params.get("year")
+        """
+        Robustly extracts and sanitizes branch and date parameters across 
+        Profit & Loss, Cash Flow, Balance Sheet, and Cashbook endpoints.
+        """
+        branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+        start_date_param = request.query_params.get('start_date') or request.query_params.get('startDate')
+        end_date_param = request.query_params.get('end_date') or request.query_params.get('endDate')
+        period_type = request.query_params.get('period_type') or request.query_params.get('periodType') or 'month'
 
-        today = timezone.localdate()
+        now = datetime.now()
+        year = int(request.query_params.get('year', now.year))
+        month = int(request.query_params.get('month', now.month))
 
-        # Helper function to safely parse and sanitize YYYY-MM-DD strings
-        def parse_safe_date(date_str):
-            if not date_str:
+        # Sanitize malformed YYYY-MM-DD parameter strings (e.g., '2026-10-098' -> '2026-10-09')
+        def sanitize_date(val):
+            if not val:
                 return None
-            clean_str = str(date_str).strip()[:10]  # Trims extra characters like '2026-10-018' -> '2026-10-01'
+            clean_str = str(val).strip()[:10]
             try:
-                return datetime.strptime(clean_str, "%Y-%m-%d").date()
+                return datetime.strptime(clean_str, '%Y-%m-%d').date()
             except ValueError:
                 return None
 
-        # CASE A: Explicit Range (start_date & end_date)
-        if start_param and end_param:
-            start_date = parse_safe_date(start_param) or today
-            end_date = parse_safe_date(end_param) or today
+        selected_date = sanitize_date(
+            request.query_params.get('selectedDate') or request.query_params.get('date')
+        )
 
-        # CASE B: Single Day Query (daily report view)
-        elif single_date_param:
-            parsed_day = parse_safe_date(single_date_param) or today
-            start_date = parsed_day
-            end_date = parsed_day
-
-        # CASE C: Single Day start_param only (fallback for single start_date)
-        elif start_param:
-            parsed_day = parse_safe_date(start_param) or today
-            start_date = parsed_day
-            end_date = parsed_day
-
-        # CASE D: Month and Year Query
-        elif month_param and year_param:
-            try:
-                yr = int(year_param)
-                mth = int(month_param)
-                _, last_day = calendar.monthrange(yr, mth)
-                start_date = datetime(yr, mth, 1).date()
-                end_date = datetime(yr, mth, last_day).date()
-            except (ValueError, TypeError):
-                start_date = today
-                end_date = today
-
-        # CASE E: Default Fallback -> Current Month
+        if start_date_param and end_date_param:
+            start_date = sanitize_date(start_date_param) or now.date()
+            end_date = sanitize_date(end_date_param) or now.date()
+        elif period_type == 'day' and selected_date:
+            start_date = selected_date
+            end_date = selected_date
+        elif period_type == 'month':
+            _, last_day = calendar.monthrange(year, month)
+            start_date = date(year, month, 1)
+            end_date = date(year, month, last_day)
+        elif period_type == 'year':
+            start_date = date(year, 1, 1)
+            end_date = date(year, 12, 31)
         else:
-            yr = today.year
-            mth = today.month
-            _, last_day = calendar.monthrange(yr, mth)
-            start_date = datetime(yr, mth, 1).date()
-            end_date = datetime(yr, mth, last_day).date()
+            start_date = selected_date or date(year, month, 1)
+            _, last_day = calendar.monthrange(start_date.year, start_date.month)
+            end_date = date(start_date.year, start_date.month, last_day)
 
-        # Create timezone-aware datetimes covering the entire period
-        tz = timezone.get_current_timezone()
-        start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-        end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
+        # Datetime boundaries for precise query filtering
+        start_dt = timezone.make_aware(datetime.combine(start_date, time.min))
+        end_dt = timezone.make_aware(datetime.combine(end_date, time.max))
 
-        # Resolve Branch Object
+        # Resolve Branch instance
         branch_obj = None
-        if branch_param and str(branch_param).lower() != "all":
+        if branch_id and str(branch_id).lower() not in ['all', 'none', '', 'null']:
             try:
-                branch_obj = RetailBranch.objects.get(pk=branch_param)
+                branch_obj = RetailBranch.objects.get(pk=int(branch_id))
             except (RetailBranch.DoesNotExist, ValueError):
-                branch_obj = None
+                pass
 
         return branch_obj, start_date, end_date, start_dt, end_dt
 
