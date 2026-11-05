@@ -3063,7 +3063,6 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
-        # Allow date filtering via query params; default to today if not provided
         selected_date_str = self.request.query_params.get("date") or self.request.query_params.get("selectedDate")
         target_date = timezone.localdate()
 
@@ -3073,7 +3072,6 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             except ValueError:
                 pass
 
-        # Exclude supplier repayments / purchase entries
         queryset = (
             Expense.objects
             .select_related("branch", "retailer")
@@ -3101,78 +3099,89 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         return queryset
 
-    def perform_create(self, serializer):
-        user = _authenticated_user(self.request)
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        try:
+            raw_data = request.data if isinstance(request.data, dict) else {}
 
-        data = (
-            self.request.data
-            if isinstance(self.request.data, dict)
-            else {}
-        )
-
-        branch_param = (
-            data.get("branch")
-            or data.get("branch_id")
-            or self.request.query_params.get("branch")
-            or self.request.query_params.get("branch_id")
-        )
-
-        # 1. Resolve Branch
-        branch_obj = None
-        if branch_param and str(branch_param).lower() not in ["all", "none", "", "null"]:
-            if str(branch_param).isdigit():
-                branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
-            if not branch_obj:
-                branch_obj = (
-                    RetailBranch.objects
-                    .filter(name__iexact=str(branch_param).strip())
-                    .first()
+            description = str(raw_data.get("description", "")).strip()
+            amount_raw = raw_data.get("amount")
+            
+            if not description or amount_raw in (None, ""):
+                return Response(
+                    {"error": "Expense description and amount are required."},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
 
-        # 2. Extract Date safely
-        validated_date = serializer.validated_data.get("date") or data.get("date")
-        if isinstance(validated_date, str):
-            try:
-                validated_date = datetime.strptime(validated_date.strip(), "%Y-%m-%d").date()
-            except ValueError:
-                validated_date = None
-        elif isinstance(validated_date, datetime):
-            validated_date = validated_date.date()
+            amount = Decimal(str(amount_raw))
+            if amount <= Decimal("0.00"):
+                return Response(
+                    {"error": "Expense amount must be greater than zero."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-        save_kwargs = {
-            "date": validated_date or timezone.localdate()
-        }
+            # 1. Extract Date
+            date_input = raw_data.get("date")
+            expense_date = timezone.localdate()
+            if date_input:
+                try:
+                    expense_date = datetime.strptime(str(date_input).strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    pass
 
-        if branch_obj:
-            save_kwargs["branch"] = branch_obj
+            # 2. Extract and resolve Branch
+            branch_param = (
+                raw_data.get("branch")
+                or raw_data.get("branch_id")
+                or request.query_params.get("branch")
+                or request.query_params.get("branch_id")
+            )
+            
+            branch_obj = None
+            if branch_param and str(branch_param).lower() not in ["all", "none", "", "null"]:
+                clean_param = str(branch_param).strip()
+                if clean_param.isdigit():
+                    branch_obj = RetailBranch.objects.filter(pk=int(clean_param)).first()
+                if not branch_obj:
+                    branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
 
-        # 3. Ensure Retailer is attached
-        retailer_user = user or (branch_obj.retailer if branch_obj else None)
-        if retailer_user:
-            save_kwargs["retailer"] = retailer_user
+            # 3. Resolve Retailer Owner
+            user = _authenticated_user(request)
+            retailer_user = user or (branch_obj.retailer if branch_obj else None)
 
-        try:
-            expense = serializer.save(**save_kwargs)
-        except DjangoValidationError as e:
-            raise DRFValidationError(
-                e.message_dict if hasattr(e, "message_dict") else str(e)
+            # 4. Save directly
+            expense = Expense.objects.create(
+                branch=branch_obj,
+                retailer=retailer_user,
+                description=description,
+                amount=amount,
+                date=expense_date,
             )
 
-        # 4. Broadcast event
-        target_branch_id = expense.branch_id
-        if target_branch_id:
-            channel_layer = get_channel_layer()
-            if channel_layer:
-                try:
-                    async_to_sync(channel_layer.group_send)(
-                        f"analytics_branch_{target_branch_id}",
-                        {
-                            "type": "analytics_update",
-                            "event": "EXPENSE_RECORDED",
-                        },
-                    )
-                except Exception:
-                    pass
+            # 5. Broadcast WebSocket event
+            if branch_obj:
+                channel_layer = get_channel_layer()
+                if channel_layer:
+                    try:
+                        async_to_sync(channel_layer.group_send)(
+                            f"analytics_branch_{branch_obj.id}",
+                            {
+                                "type": "analytics_update",
+                                "event": "EXPENSE_RECORDED",
+                            },
+                        )
+                    except Exception:
+                        pass
+
+            serializer = self.get_serializer(expense)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            logger.exception("Error saving operational expense entry")
+            return Response(
+                {"error": "Failed to save expense record.", "details": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     @action(
         detail=False,

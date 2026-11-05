@@ -55,7 +55,7 @@ router.register(r'credit-repayments', CreditRepaymentViewSet, basename='credit-r
 router.register(r'sales-analysis-detailed', DetailedSalesAnalysisViewSet, basename='sales-analysis-detailed')
 
 # Business operations
-router.register(r'expenses', ExpenseViewSet, basename='expense')
+router.register(r'expenses', ExpenseViewSet, basename='expenses')
 router.register(r'customers', CustomerViewSet, basename='customer')
 router.register(r'branches', RetailBranchViewSet, basename='branch')
 router.register(r'pending-approvals', PendingApprovalViewSet, basename='pending-approval')
