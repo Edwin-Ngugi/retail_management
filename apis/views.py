@@ -7088,7 +7088,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 other_total
             )
 
-            # Receivables Calculation (Cumulative Lifetime Recovered Receivables)
+            # Receivables Calculation (Cumulative Lifetime vs Period Recovered)
             st_credit_filter = (
                 Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) |
                 Q(payment_method='Credit') |
@@ -7229,8 +7229,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "debtors": {
                     "total_customer_debts": float(total_customer_debtors),
                     "total_customer_debts_formatted": f"KSh {total_customer_debtors:,.2f}",
-                    "total_recovered": float(total_recovered_lifetime),
-                    "total_recovered_formatted": f"KSh {total_recovered_lifetime:,.2f}",
+                    "total_recovered": float(period_credit_repayments_total),
+                    "total_recovered_formatted": f"KSh {period_credit_repayments_total:,.2f}",
+                    "total_recovered_lifetime": float(total_recovered_lifetime),
+                    "total_recovered_lifetime_formatted": f"KSh {total_recovered_lifetime:,.2f}",
                     "unpaid_count": unpaid_invoices_count,
                 },
                 "inventory": {
