@@ -1834,7 +1834,10 @@ class SaleTransaction(models.Model):
     @property
     def credit_payment_amount(self):
         if self.payment_method == self.PaymentMethod.CREDIT:
-            return quantize_money(self.total_amount or ZERO)
+            # Credit portion is total amount minus any initial upfront partial payments
+            upfront_paid = self.amount_paid or ZERO
+            credit_due = max(ZERO, (self.total_amount or ZERO) - upfront_paid)
+            return quantize_money(credit_due)
 
         if self.payment_method == self.PaymentMethod.SPLIT:
             payments_qs = getattr(self, "payments", None) or getattr(self, "split_payments", None)
@@ -1914,7 +1917,8 @@ class SaleTransaction(models.Model):
             raw_method = str(self.payment_method or "").upper().replace("-", "_").replace(" ", "_")
 
             if raw_method == "CREDIT":
-                totals["CREDIT"] += Decimal(str(self.total_amount or 0))
+                totals["CREDIT"] += max(ZERO, Decimal(str(self.total_amount or 0)) - amt)
+                totals["CASH"] += amt
             elif "PAYBILL" in raw_method:
                 totals["PAYBILL"] += amt
             elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
@@ -1956,7 +1960,7 @@ class SaleTransaction(models.Model):
         if self.balance_due <= ZERO:
             return "PAID"
 
-        if self.credit_repayments > ZERO:
+        if self.credit_repayments > ZERO or (self.amount_paid or ZERO) > ZERO:
             return "PARTIALLY_PAID"
 
         return "UNPAID"
@@ -1965,8 +1969,15 @@ class SaleTransaction(models.Model):
         super().clean()
 
         if self.payment_method == self.PaymentMethod.CREDIT:
-            self.is_paid = False
-            self.amount_paid = ZERO
+            repayment_total = self.credit_repayments if self.pk else ZERO
+            
+            # Preserve existing upfront payment or recorded repayments
+            if self.amount_paid is None:
+                self.amount_paid = repayment_total
+            
+            total = self.total_amount or ZERO
+            total_recovered = (self.amount_paid or ZERO) + repayment_total
+            self.is_paid = (total_recovered >= total) and (total > ZERO)
         else:
             self.is_paid = True
             if self.amount_paid is None or self.amount_paid == ZERO:
