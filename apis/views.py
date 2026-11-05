@@ -1107,7 +1107,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         period_type = self.request.query_params.get("period_type") or self.request.query_params.get("periodType")
 
         # 1. Branch Filter
-        if branch_id and str(branch_id).lower() != "all":
+        if branch_id and str(branch_id).lower() not in ["all", "none", "", "null"]:
             if str(branch_id).isdigit():
                 queryset = queryset.filter(
                     Q(branch_id=int(branch_id)) | Q(transaction__branch_id=int(branch_id))
@@ -1190,50 +1190,123 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
 
         return queryset
 
-    def perform_create(self, serializer):
-        user = _authenticated_user(self.request)
-        
-        raw_method = (
-            self.request.data.get("payment_method") 
-            or self.request.data.get("method") 
-            or "CASH"
-        )
-        
-        payment_method = (
-            str(raw_method)
-            .strip()
-            .upper()
-            .replace(" ", "_")
-            .replace("-", "_")
-        )
-
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
         try:
-            repayment = serializer.save(
-                created_by=user,
-                payment_method=payment_method
+            raw_data = request.data if isinstance(request.data, dict) else {}
+
+            customer_id = raw_data.get("customer") or raw_data.get("customer_id")
+            amount_raw = raw_data.get("amount")
+            
+            if not customer_id or amount_raw in (None, ""):
+                return Response(
+                    {"error": "Customer and a valid payment amount are required."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            amount = Decimal(str(amount_raw))
+            if amount <= Decimal("0.00"):
+                return Response(
+                    {"error": "Repayment amount must be greater than zero."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Normalize payment method
+            raw_method = (
+                raw_data.get("payment_method") 
+                or raw_data.get("method") 
+                or "CASH"
+            )
+            payment_method = (
+                str(raw_method)
+                .strip()
+                .upper()
+                .replace(" ", "_")
+                .replace("-", "_")
             )
 
-        except DjangoValidationError as e:
-            raise DRFValidationError(
-                e.message_dict if hasattr(e, "message_dict") else str(e)
-            )
+            # Resolve Customer
+            customer_obj = Customer.objects.filter(pk=customer_id).first()
+            if not customer_obj:
+                return Response(
+                    {"error": "Selected customer does not exist."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
-        if repayment.branch_id:
-            channel_layer = get_channel_layer()
-            if channel_layer:
+            # Resolve Branch
+            branch_param = (
+                raw_data.get("branch")
+                or raw_data.get("branch_id")
+                or request.query_params.get("branch")
+                or request.query_params.get("branch_id")
+            )
+            branch_obj = None
+            if branch_param and str(branch_param).lower() not in ["all", "none", "", "null"]:
+                clean_param = str(branch_param).strip()
+                if clean_param.isdigit():
+                    branch_obj = RetailBranch.objects.filter(pk=int(clean_param)).first()
+                if not branch_obj:
+                    branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
+
+            if not branch_obj:
+                branch_obj = getattr(customer_obj, "branch", None)
+
+            # Resolve User / Creator
+            user = _authenticated_user(request)
+            retailer_user = user or (branch_obj.retailer if branch_obj else None)
+
+            # Date handling
+            date_input = raw_data.get("date")
+            repayment_date = timezone.localdate()
+            if date_input:
                 try:
-                    async_to_sync(channel_layer.group_send)(
-                        f"analytics_branch_{repayment.branch_id}",
-                        {
-                            "type": "analytics_update",
-                            "event": "REPAYMENT_RECORDED",
-                            "customer_id": repayment.customer_id,
-                            "payment_method": repayment.payment_method,
-                            "amount": float(repayment.amount),
-                        },
-                    )
-                except Exception:
+                    repayment_date = datetime.strptime(str(date_input).strip(), "%Y-%m-%d").date()
+                except ValueError:
                     pass
+
+            reference_number = str(raw_data.get("reference_number") or raw_data.get("tx_code") or "").strip()
+            notes = str(raw_data.get("notes") or "").strip()
+
+            # Create repayment safely
+            repayment = CreditRepayment.objects.create(
+                customer=customer_obj,
+                branch=branch_obj,
+                retailer=retailer_user,
+                created_by=user,
+                amount=amount,
+                payment_method=payment_method,
+                reference_number=reference_number,
+                notes=notes,
+                date=repayment_date,
+            )
+
+            # Broadcast WebSocket updates
+            if repayment.branch_id:
+                channel_layer = get_channel_layer()
+                if channel_layer:
+                    try:
+                        async_to_sync(channel_layer.group_send)(
+                            f"analytics_branch_{repayment.branch_id}",
+                            {
+                                "type": "analytics_update",
+                                "event": "REPAYMENT_RECORDED",
+                                "customer_id": repayment.customer_id,
+                                "payment_method": repayment.payment_method,
+                                "amount": float(repayment.amount),
+                            },
+                        )
+                    except Exception:
+                        pass
+
+            serializer = self.get_serializer(repayment)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            logger.exception("Failed to create customer credit repayment")
+            return Response(
+                {"error": "Failed to record customer repayment.", "details": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 
 # ============================================================
