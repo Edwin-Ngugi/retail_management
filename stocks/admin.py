@@ -784,7 +784,7 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
 
             if method in ["SPLIT", "SPLIT PAYMENT"]:
                 if balance_due > 0 or not obj.is_paid:
-                    return mark_safe('<span style="color: #888888; font-weight: bold;">&#10004;</span>')
+                    return mark_safe('<span style="color: #dc3545; font-weight: bold;">&#10008;</span>')
                 return mark_safe('<span style="color: #28a745; font-weight: bold;">&#10004;</span>')
 
             if obj.is_paid or balance_due <= 0:
