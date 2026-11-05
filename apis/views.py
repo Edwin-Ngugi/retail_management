@@ -8817,82 +8817,97 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     # =========================================================================
     @action(detail=False, methods=['get'], url_path='profit-loss')
     def profit_report(self, request):
-            try:
-                branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+        try:
+            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-                # 1. ACCRUAL REVENUE AGGREGATION (CASH + CREDIT SALES ISSUED)
-                sales_qs = SaleTransaction.objects.filter(
-                    sale_date__date__gte=start_date,
-                    sale_date__date__lte=end_date
-                )
+            # ------------------------------------------------------------------
+            # 1. ACCRUAL REVENUE AGGREGATION (CASH + SPLIT + CREDIT SALES ISSUED)
+            # ------------------------------------------------------------------
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__range=(start_dt, end_dt)
+            )
 
-                expenses_qs = Expense.objects.filter(
-                    date__gte=start_date,
-                    date__lte=end_date
-                ).exclude(
-                    description__icontains='Supplier Repayment'
-                )
+            expenses_qs = Expense.objects.filter(
+                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            ).exclude(
+                description__icontains='Supplier Repayment'
+            )
 
-                if branch_obj:
-                    sales_qs = sales_qs.filter(branch=branch_obj)
-                    expenses_qs = expenses_qs.filter(branch=branch_obj)
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                expenses_qs = expenses_qs.filter(branch=branch_obj)
 
-                revenue = sales_qs.aggregate(
-                    total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
-                )['total']
+            revenue = sales_qs.aggregate(
+                total=Coalesce(Sum('total_amount'), ZERO, output_field=DecimalField())
+            )['total']
 
-                # 2. COST OF GOODS SOLD (COGS)
-                items_qs = SaleItem.objects.filter(
-                    transaction__in=sales_qs
-                ).select_related('item', 'transaction')
+            # ------------------------------------------------------------------
+            # 2. COST OF GOODS SOLD (COGS)
+            # ------------------------------------------------------------------
+            items_qs = SaleItem.objects.filter(
+                transaction__in=sales_qs
+            ).select_related('item', 'transaction')
 
-                cogs_expr = ExpressionWrapper(
-                    F('quantity_sold') * F('unit_cost_price'),
-                    output_field=DecimalField(max_digits=12, decimal_places=2)
-                )
-                
-                direct_cogs = items_qs.filter(unit_cost_price__gt=0).aggregate(
-                    total=Coalesce(Sum(cogs_expr), ZERO, output_field=DecimalField())
-                )['total']
+            # Calculate direct COGS where unit_cost_price > 0
+            direct_cogs_expr = ExpressionWrapper(
+                F('quantity_sold') * F('unit_cost_price'),
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            )
+            
+            direct_cogs = items_qs.filter(unit_cost_price__gt=0).aggregate(
+                total=Coalesce(Sum(direct_cogs_expr), ZERO, output_field=DecimalField())
+            )['total']
 
-                cogs = direct_cogs
+            cogs = direct_cogs
 
-                zero_cost_items = items_qs.filter(Q(unit_cost_price=0) | Q(unit_cost_price__isnull=True))
+            # Fallback for items recorded with 0 unit_cost_price using BranchItemPricing
+            zero_cost_items = items_qs.filter(Q(unit_cost_price=0) | Q(unit_cost_price__isnull=True))
 
-                for line in zero_cost_items:
+            if zero_cost_items.exists():
+                for line in zero_cost_items.select_related('transaction', 'item'):
                     b_id = line.transaction.branch_id
                     pricing = BranchItemPricing.objects.filter(branch_id=b_id, item=line.item).first()
                     cost_unit = pricing.unit_cost_price if (pricing and pricing.unit_cost_price > 0) else ZERO
                     cogs += Decimal(str(line.quantity_sold or 0)) * Decimal(str(cost_unit))
 
-                gross_profit = revenue - cogs
-                
-                operating_expenses = expenses_qs.aggregate(
-                    total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-                )['total']
+            gross_profit = revenue - cogs
+            
+            # ------------------------------------------------------------------
+            # 3. OPERATING EXPENSES & NET PROFIT
+            # ------------------------------------------------------------------
+            operating_expenses = expenses_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
 
-                operating_profit = gross_profit - operating_expenses
+            operating_profit = gross_profit - operating_expenses
 
-                finance_costs_and_tax = ZERO
-                net_profit = operating_profit - finance_costs_and_tax
+            finance_costs_and_tax = ZERO
+            net_profit = operating_profit - finance_costs_and_tax
 
-                return Response({
-                    "period": start_date.strftime('%B %Y') if start_date.month == end_date.month else f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}",
-                    "revenue": float(quantize_money(revenue)),
-                    "cogs": float(quantize_money(cogs)),
-                    "gross_profit": float(quantize_money(gross_profit)),
-                    "operating_expenses": float(quantize_money(operating_expenses)),
-                    "operating_profit": float(quantize_money(operating_profit)),
-                    "finance_costs_and_tax": float(quantize_money(finance_costs_and_tax)),
-                    "net_profit": float(quantize_money(net_profit)),
-                }, status=status.HTTP_200_OK)
+            period_display = (
+                start_date.strftime('%B %Y') 
+                if start_date and end_date and start_date.month == end_date.month and start_date.year == end_date.year 
+                else f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}" if start_date and end_date else timezone.localdate().strftime('%B %Y')
+            )
 
-            except Exception as e:
-                logger.exception("Profit Report Error")
-                return Response({
-                    "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
-                    "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
-                }, status=status.HTTP_200_OK)
+            return Response({
+                "period": period_display,
+                "revenue": float(quantize_money(revenue)),
+                "cogs": float(quantize_money(cogs)),
+                "gross_profit": float(quantize_money(gross_profit)),
+                "operating_expenses": float(quantize_money(operating_expenses)),
+                "operating_profit": float(quantize_money(operating_profit)),
+                "finance_costs_and_tax": float(quantize_money(finance_costs_and_tax)),
+                "net_profit": float(quantize_money(net_profit)),
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("Profit Report Error")
+            return Response({
+                "period": timezone.localdate().strftime('%B %Y'),
+                "revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0,
+                "operating_expenses": 0.0, "operating_profit": 0.0, "net_profit": 0.0
+            }, status=status.HTTP_200_OK)
 
 
     # =========================================================================
@@ -8906,20 +8921,27 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # BASE QUERYSETS
             # -----------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
-                Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
-            )
+            # Exclude purely CREDIT sales from direct cash flow inflows
+            sales_qs = SaleTransaction.objects.filter(
+                sale_date__range=(start_dt, end_dt)
+            ).exclude(
+                payment_method=SaleTransaction.PaymentMethod.CREDIT
+            ).prefetch_related('split_payments', 'payments')
+
+            # Realized cash inflows from customer credit repayments
             repayments_qs = CreditRepayment.objects.filter(
                 Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
             )
+
             purchases_qs = Purchase.objects.filter(
                 Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
             )
+
             supplier_payments_qs = SupplierPayment.objects.filter(
                 created_at__range=(start_dt, end_dt)
             )
-            
-            # Pure expenses excluding supplier repayments
+
+            # Operating expenses excluding supplier settlements
             expenses_qs = Expense.objects.filter(
                 Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
             ).exclude(description__icontains='Supplier Repayment')
@@ -8934,62 +8956,100 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # 1. OPERATING ACTIVITIES
             # -----------------------------------------------------------------
+            # A) Realized liquid cash sales (excluding credit sales)
             realized_sales_cash = ZERO
             for s in sales_qs:
-                if not getattr(s, 'is_invoice', False):
-                    bd = s.liquid_payments_breakdown
-                    realized_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
+                bd = s.liquid_payments_breakdown
+                realized_sales_cash += (
+                    bd.get('CASH', ZERO) + 
+                    bd.get('MPESA', ZERO) + 
+                    bd.get('PAYBILL', ZERO) + 
+                    bd.get('SEND_MONEY', ZERO) + 
+                    bd.get('BANK_TRANSFER', ZERO)
+                )
 
-            customer_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            # B) Liquid cash received from customer credit repayments
+            customer_repayments = ZERO
+            for rep in repayments_qs:
+                rep_amt = rep.amount or ZERO
+                pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
+
+                if pm in ['SPLIT', 'SPLIT_PAYMENT']:
+                    split_details = getattr(rep, 'split_details', None) or {}
+                    if isinstance(split_details, dict) and split_details:
+                        c_amt = Decimal(str(split_details.get('cash', 0) or 0))
+                        p_amt = Decimal(str(split_details.get('paybill', 0) or 0))
+                        s_amt = Decimal(str(split_details.get('send_money', 0) or split_details.get('mpesa', 0) or 0))
+                        customer_repayments += (c_amt + p_amt + s_amt)
+                    else:
+                        customer_repayments += rep_amt
+                else:
+                    customer_repayments += rep_amt
+
             customer_receipts = realized_sales_cash + customer_repayments
 
-            # Supplier Outflows (Direct Cash Purchases + Supplier Repayments)
+            # Supplier Outflows (Direct Cash Purchases + Supplier Settlements)
             direct_purchases = purchases_qs.exclude(
                 payment_method='CREDIT'
             ).filter(
                 supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO))['total']
+            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
 
-            actual_supplier_payments = supplier_payments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            actual_supplier_payments = supplier_payments_qs.aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
+            
             supplier_payments = direct_purchases + actual_supplier_payments
 
-            # Filter non-opex items out of OpEx calculation
+            # Filter non-operating expense items out of OpEx calculation
             non_opex_filter = Q(description__icontains='salary') | Q(description__icontains='wage') | \
-                             Q(description__icontains='equipment') | Q(description__icontains='asset') | \
-                             Q(description__icontains='loan') | Q(description__icontains='drawing') | \
-                             Q(description__icontains='capital')
+                              Q(description__icontains='equipment') | Q(description__icontains='asset') | \
+                              Q(description__icontains='loan') | Q(description__icontains='drawing') | \
+                              Q(description__icontains='capital')
 
-            operating_expenses = expenses_qs.exclude(non_opex_filter).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            operating_expenses = expenses_qs.exclude(non_opex_filter).aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
 
             salaries_and_wages = expenses_qs.filter(
                 Q(description__icontains='salary') | Q(description__icontains='wage')
-            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            ).aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
 
             net_operating_cash = customer_receipts - supplier_payments - operating_expenses - salaries_and_wages
 
             # -----------------------------------------------------------------
-            # 2. INVESTING ACTIVITIES (Calculates or defaults to 0.0)
+            # 2. INVESTING ACTIVITIES
             # -----------------------------------------------------------------
             equipment_purchased = expenses_qs.filter(
                 Q(description__icontains='equipment') | Q(description__icontains='asset') | Q(description__icontains='machinery')
-            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            ).aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
 
             net_investing_cash = -equipment_purchased
 
             # -----------------------------------------------------------------
-            # 3. FINANCING ACTIVITIES (Calculates or defaults to 0.0)
+            # 3. FINANCING ACTIVITIES
             # -----------------------------------------------------------------
             capital_plus_loan_received = expenses_qs.filter(
                 Q(description__icontains='capital') | Q(description__icontains='loan received')
-            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            ).aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
 
             loan_repayment = expenses_qs.filter(
                 description__icontains='loan repayment'
-            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            ).aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
 
             drawings = expenses_qs.filter(
                 Q(description__icontains='drawing') | Q(description__icontains='drawings')
-            ).aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            ).aggregate(
+                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
+            )['total']
 
             net_financing_cash = capital_plus_loan_received - loan_repayment - drawings
 
@@ -9001,7 +9061,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             closing_cash = opening_cash + net_increase_in_cash
 
             return Response({
-                "period": start_date.strftime('%B %Y'),
+                "period": start_date.strftime('%B %Y') if start_date else timezone.localdate().strftime('%B %Y'),
                 "operating_activities": {
                     "customer_receipts": float(quantize_money(customer_receipts)),
                     "supplier_payments": float(quantize_money(supplier_payments)),
@@ -9026,7 +9086,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
         except Exception:
             logger.exception("Cash Flow Report Error")
-            # Always return full zero-structure even on exception
             return Response({
                 "period": timezone.localdate().strftime('%B %Y'),
                 "operating_activities": {
@@ -9062,7 +9121,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # ------------------------------------------------------------------
             # 1. Period Liquid Cash Inflows
             # ------------------------------------------------------------------
-            sales_qs = SaleTransaction.objects.filter(**sales_filter)
+            sales_qs = SaleTransaction.objects.filter(**sales_filter).prefetch_related('split_payments', 'payments')
             repayments_qs = CreditRepayment.objects.filter(**repay_filter)
 
             if branch_obj:
@@ -9074,9 +9133,31 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             tot_sales_cash = ZERO
             for s in sales_qs:
                 bd = s.liquid_payments_breakdown
-                tot_sales_cash += bd.get('CASH', ZERO) + bd.get('MPESA', ZERO) + bd.get('PAYBILL', ZERO)
+                tot_sales_cash += (
+                    bd.get('CASH', ZERO) + 
+                    bd.get('MPESA', ZERO) + 
+                    bd.get('PAYBILL', ZERO) + 
+                    bd.get('SEND_MONEY', ZERO) + 
+                    bd.get('BANK_TRANSFER', ZERO)
+                )
 
-            tot_repayments = repayments_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            tot_repayments = ZERO
+            for rep in repayments_qs:
+                rep_amt = rep.amount or ZERO
+                pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
+
+                if pm in ['SPLIT', 'SPLIT_PAYMENT']:
+                    split_details = getattr(rep, 'split_details', None) or {}
+                    if isinstance(split_details, dict) and split_details:
+                        c_amt = Decimal(str(split_details.get('cash', 0) or 0))
+                        p_amt = Decimal(str(split_details.get('paybill', 0) or 0))
+                        s_amt = Decimal(str(split_details.get('send_money', 0) or split_details.get('mpesa', 0) or 0))
+                        tot_repayments += (c_amt + p_amt + s_amt)
+                    else:
+                        tot_repayments += rep_amt
+                else:
+                    tot_repayments += rep_amt
+
             tot_inflows = tot_sales_cash + tot_repayments
 
             # ------------------------------------------------------------------
@@ -9111,14 +9192,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # ------------------------------------------------------------------
             # 3. Customer Debts & Inventory Stock Assets
             # ------------------------------------------------------------------
-            credit_sales_qs = SaleTransaction.objects.filter(
-                sale_date__lte=end_dt,
-                payment_method=SaleTransaction.PaymentMethod.CREDIT
-            )
+            # Include all sales with outstanding balance_due (not limited strictly to payment_method=CREDIT)
+            all_pending_sales = SaleTransaction.objects.filter(sale_date__lte=end_dt)
             if branch_obj:
-                credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
+                all_pending_sales = all_pending_sales.filter(branch=branch_obj)
 
-            customer_debts = sum((s.balance_due for s in credit_sales_qs), ZERO)
+            customer_debts = sum((s.balance_due for s in all_pending_sales if s.balance_due > ZERO), ZERO)
 
             inventory_stock = ZERO
             pricing_qs = BranchItemPricing.objects.all().select_related('item', 'branch')
@@ -9247,10 +9326,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # QUERYSETS
             # -----------------------------------------------------------------
+            # Include sales that either are not purely CREDIT, OR have liquid split_payments attached
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__date__gte=start_date,
                 sale_date__date__lte=end_date
-            ).exclude(payment_method='CREDIT')
+            ).filter(
+                Q(split_payments__isnull=False) | Q(payments__isnull=False) | ~Q(payment_method='CREDIT')
+            ).distinct().prefetch_related('split_payments', 'payments')
 
             repayments_qs = CreditRepayment.objects.filter(
                 date__gte=start_date,
@@ -9294,18 +9376,33 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             tot_send_money = ZERO
             tot_bank = ZERO
 
-            for sale in sales_qs.prefetch_related('split_payments'):
+            # Process Sales & Child Split Payments
+            for sale in sales_qs:
                 bd = sale.liquid_payments_breakdown
                 tot_cash += bd.get('CASH', ZERO)
                 tot_paybill += bd.get('PAYBILL', ZERO)
                 tot_send_money += bd.get('SEND_MONEY', ZERO) + bd.get('MPESA', ZERO)
                 tot_bank += bd.get('BANK_TRANSFER', ZERO)
 
+            # Process Credit Repayments & Split Repayments
             for rep in repayments_qs:
                 rep_amt = rep.amount or ZERO
                 pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
 
-                if 'PAYBILL' in pm:
+                if pm in ['SPLIT', 'SPLIT_PAYMENT']:
+                    # Extract split details payload if attached to repayment
+                    split_details = getattr(rep, 'split_details', None) or {}
+                    if isinstance(split_details, dict) and split_details:
+                        c_amt = Decimal(str(split_details.get('cash', 0) or 0))
+                        p_amt = Decimal(str(split_details.get('paybill', 0) or 0))
+                        s_amt = Decimal(str(split_details.get('send_money', 0) or split_details.get('mpesa', 0) or 0))
+                        
+                        tot_cash += c_amt
+                        tot_paybill += p_amt
+                        tot_send_money += s_amt
+                    else:
+                        tot_cash += rep_amt
+                elif 'PAYBILL' in pm:
                     tot_paybill += rep_amt
                 elif 'SEND_MONEY' in pm or 'SENDMONEY' in pm or 'MPESA' in pm:
                     tot_send_money += rep_amt
@@ -9317,7 +9414,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # 2. ACTUAL LIQUID OUTFLOWS ONLY
             # -----------------------------------------------------------------
-            # Calculate actual cash spent on purchases (exclude unpaid credit balances)
             direct_cash_purchases = purchases_qs.exclude(
                 payment_method='CREDIT'
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
