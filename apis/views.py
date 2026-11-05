@@ -3729,11 +3729,22 @@ def _authenticated_user(request):
 
 def _parse_business_date(date_str):
     if not date_str:
-        return timezone.localdate()
+        return timezone.now()
+    
+    # If already a datetime object
+    if isinstance(date_str, datetime):
+        return date_str if timezone.is_aware(date_str) else timezone.make_aware(date_str)
+        
+    # If already a date object
+    if isinstance(date_str, date):
+        return timezone.make_aware(datetime.combine(date_str, datetime.min.time()))
+
     try:
-        return datetime.strptime(str(date_str).split("T")[0], "%Y-%m-%d").date()
+        clean_str = str(date_str).strip().split("T")[0]
+        parsed_d = datetime.strptime(clean_str, "%Y-%m-%d").date()
+        return timezone.make_aware(datetime.combine(parsed_d, datetime.min.time()))
     except (ValueError, TypeError):
-        return timezone.localdate()
+        return timezone.now()
 
 
 def _resolve_branch(branch_param):

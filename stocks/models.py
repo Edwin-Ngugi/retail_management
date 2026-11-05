@@ -1285,7 +1285,11 @@ class Purchase(models.Model):
 
     @db_transaction.atomic
     def save(self, *args, **kwargs):
-        if isinstance(self.purchase_date, datetime) is False and isinstance(self.purchase_date, date):
+        # 1. Normalize purchase_date to an aware datetime
+        if isinstance(self.purchase_date, datetime):
+            if timezone.is_naive(self.purchase_date):
+                self.purchase_date = timezone.make_aware(self.purchase_date)
+        elif isinstance(self.purchase_date, date):
             self.purchase_date = timezone.make_aware(
                 datetime.combine(self.purchase_date, datetime.min.time())
             )
@@ -1316,6 +1320,13 @@ class Purchase(models.Model):
             reference=f"PURCHASE-{self.pk}",
         )
 
+        # 2. Extract date safely for StockMovement
+        movement_date = (
+            self.purchase_date.date()
+            if isinstance(self.purchase_date, datetime)
+            else self.purchase_date
+        )
+
         StockMovement.objects.create(
             branch=self.branch,
             item=self.item,
@@ -1323,7 +1334,7 @@ class Purchase(models.Model):
             movement_type=StockMovement.MovementType.PURCHASE,
             quantity=self.quantity,
             unit_cost_price=self.unit_cost_price,
-            date=self.purchase_date.date(),
+            date=movement_date,  # ✅ Safe, will not crash on date objects
             created_at=self.purchase_date,
             reference=f"PURCHASE-{self.pk}",
             reference_id=self.pk,
