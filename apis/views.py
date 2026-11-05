@@ -9203,13 +9203,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='cash-book')
     def cash_book(self, request):
         try:
-            # Extract query parameters directly or via helper
             branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
             start_date_param = request.query_params.get('start_date') or request.query_params.get('startDate')
             end_date_param = request.query_params.get('end_date') or request.query_params.get('endDate')
             period_type = request.query_params.get('period_type') or request.query_params.get('periodType') or 'month'
 
-            # Compute fallback start/end dates if missing
             now = datetime.now()
             year = int(request.query_params.get('year', now.year))
             month = int(request.query_params.get('month', now.month))
@@ -9233,13 +9231,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 _, last_day = calendar.monthrange(year, month)
                 end_date = date(year, month, last_day)
 
-            # Base QuerySets
+            # Base Querysets aligned with models.py
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__date__gte=start_date,
                 sale_date__date__lte=end_date
-            ).exclude(
-                Q(payment_method__iexact='CREDIT') | Q(receipt_number__startswith='INV')
-            )
+            ).exclude(payment_method='CREDIT')
 
             repayments_qs = CreditRepayment.objects.filter(
                 date__gte=start_date,
@@ -9261,7 +9257,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 created_at__date__lte=end_date
             )
 
-            # Apply Branch Filter safely
             if branch_id and str(branch_id).lower() not in ['all', 'none', '', 'null']:
                 try:
                     clean_branch_id = int(branch_id)
@@ -9277,48 +9272,40 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 supplier_payments_qs = supplier_payments_qs.filter(purchase__branch_id=clean_branch_id)
 
             # -----------------------------------------------------------------
-            # 1. CHANNEL INFLOWS (PREVENT DOUBLE COUNTING OF SPLIT PAYMENTS)
+            # 1. CHANNEL INFLOWS (Sales + Repayments routed by PaymentMethod)
             # -----------------------------------------------------------------
-            split_sale_ids = SalePayment.objects.filter(transaction__in=sales_qs).values_list('transaction_id', flat=True).distinct()
+            tot_cash = ZERO
+            tot_paybill = ZERO
+            tot_send_money = ZERO
+            tot_bank = ZERO
 
-            # A) Single-Method Sale Transactions
-            non_split_sales = sales_qs.exclude(pk__in=split_sale_ids).exclude(payment_method__iexact='SPLIT')
-            
-            single_sales_totals = non_split_sales.aggregate(
-                cash=Coalesce(Sum('total_amount', filter=Q(payment_method__iexact='CASH')), ZERO, output_field=DecimalField()),
-                paybill=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='SEND') | Q(payment_method__icontains='MPESA') | Q(payment_method__icontains='M_PESA')), ZERO, output_field=DecimalField()),
-                bank=Coalesce(Sum('total_amount', filter=Q(payment_method__icontains='BANK') | Q(payment_method__icontains='TRANSFER')), ZERO, output_field=DecimalField()),
-            )
+            # Process Sales Inflows using liquid_payments_breakdown property
+            for sale in sales_qs.prefetch_related('split_payments'):
+                bd = sale.liquid_payments_breakdown
+                tot_cash += bd.get('CASH', ZERO)
+                tot_paybill += bd.get('PAYBILL', ZERO)
+                tot_send_money += bd.get('SEND_MONEY', ZERO) + bd.get('MPESA', ZERO)
+                tot_bank += bd.get('BANK_TRANSFER', ZERO)
 
-            # B) Split Payment Child Entries ONLY
-            split_payments_qs = SalePayment.objects.filter(transaction__in=sales_qs)
-            split_totals = split_payments_qs.aggregate(
-                cash=Coalesce(Sum('amount', filter=Q(method__iexact='CASH')), ZERO, output_field=DecimalField()),
-                paybill=Coalesce(Sum('amount', filter=Q(method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('amount', filter=Q(method__icontains='SEND') | Q(method__icontains='MPESA') | Q(method__icontains='M_PESA')), ZERO, output_field=DecimalField()),
-                bank=Coalesce(Sum('amount', filter=Q(method__icontains='BANK') | Q(method__icontains='TRANSFER')), ZERO, output_field=DecimalField()),
-            )
+            # Route CreditRepayment models dynamically by payment_method enum
+            for rep in repayments_qs:
+                rep_amt = rep.amount or ZERO
+                pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
 
-            # C) Credit Repayments Totals Routed strictly by Repayment Method
-            repayment_totals = repayments_qs.aggregate(
-                cash=Coalesce(Sum('amount', filter=Q(payment_method__iexact='CASH')), ZERO, output_field=DecimalField()),
-                paybill=Coalesce(Sum('amount', filter=Q(payment_method__icontains='PAYBILL')), ZERO, output_field=DecimalField()),
-                send_money=Coalesce(Sum('amount', filter=Q(payment_method__icontains='SEND') | Q(payment_method__icontains='MPESA') | Q(payment_method__icontains='M_PESA')), ZERO, output_field=DecimalField()),
-                bank=Coalesce(Sum('amount', filter=Q(payment_method__icontains='BANK') | Q(payment_method__icontains='TRANSFER')), ZERO, output_field=DecimalField()),
-            )
-
-            # Consolidated Channel Sums
-            tot_cash = single_sales_totals['cash'] + split_totals['cash'] + repayment_totals['cash']
-            tot_paybill = single_sales_totals['paybill'] + split_totals['paybill'] + repayment_totals['paybill']
-            tot_send_money = single_sales_totals['send_money'] + split_totals['send_money'] + repayment_totals['send_money']
-            tot_bank = single_sales_totals['bank'] + split_totals['bank'] + repayment_totals['bank']
+                if 'PAYBILL' in pm:
+                    tot_paybill += rep_amt
+                elif 'SEND_MONEY' in pm or 'SENDMONEY' in pm or 'MPESA' in pm:
+                    tot_send_money += rep_amt
+                elif 'BANK' in pm or 'TRANSFER' in pm:
+                    tot_bank += rep_amt
+                else:
+                    tot_cash += rep_amt
 
             # -----------------------------------------------------------------
-            # 2. OUTFLOWS (PURCHASES & OPERATING EXPENSES)
+            # 2. OUTFLOWS (Direct Purchases + Supplier Repayments + Expenses)
             # -----------------------------------------------------------------
             direct_purchases = purchases_qs.exclude(
-                payment_method__iexact='CREDIT'
+                payment_method='CREDIT'
             ).filter(
                 supplier_payments__isnull=True
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
