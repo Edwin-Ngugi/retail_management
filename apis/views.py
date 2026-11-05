@@ -2002,7 +2002,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
     """
     ViewSet for recording, viewing, and managing inventory purchases/restocks.
     Handles single and batch purchase entries, payment methods, supplier linkages,
-    and automated Weighted Average Cost (WAC) updates.
+    partial payments, and automated Weighted Average Cost (WAC) updates.
     """
     serializer_class = PurchaseSerializer
     permission_classes = [permissions.AllowAny]
@@ -2117,6 +2117,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         raw_data = request.data
 
         # 1. Standardize payload parsing
+        amount_paid_input = None
         if isinstance(raw_data, dict) and "items" in raw_data and isinstance(raw_data["items"], list):
             items_payload = raw_data.get("items", [])
             po_number_input = raw_data.get("po_number")
@@ -2124,6 +2125,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             payment_method_input = raw_data.get("payment_method")
             purchase_date_input = raw_data.get("purchase_date")
             branch_input = raw_data.get("branch") or raw_data.get("branch_id")
+            amount_paid_input = raw_data.get("amount_paid")
         elif isinstance(raw_data, list):
             items_payload = raw_data
         else:
@@ -2167,6 +2169,10 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 .replace(" ", "_")
                 .replace("-", "_")
             )
+            
+            # Prevent CREDIT from being chosen directly as payment channel
+            if payment_method == "CREDIT":
+                payment_method = "CASH"
 
             raw_parsed_date = _parse_business_date(
                 purchase_date_input
@@ -2263,8 +2269,14 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 created_purchases.append(purchase)
                 processed_items.add((cur_branch, item))
 
-            # 4. Single calculation pass after all items are inserted
+            # 4. Total calculation and partial payment assignment
             po_header.recalculate_totals()
+
+            if amount_paid_input not in (None, ""):
+                custom_paid = Decimal(str(amount_paid_input))
+                po_header.amount_paid = min(max(ZERO, custom_paid), po_header.total_amount)
+                po_header.save(update_fields=["amount_paid"])
+
             for branch, item in processed_items:
                 recalculate_wac_sales_cost(branch, item)
 
@@ -2285,6 +2297,9 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 {
                     "message": "Batch purchase order recorded successfully.",
                     "po_number": po_header.po_number,
+                    "total_amount": float(po_header.total_amount),
+                    "amount_paid": float(po_header.amount_paid),
+                    "balance_due": float(po_header.balance_due),
                     "count": len(created_purchases),
                 },
                 status=status.HTTP_201_CREATED,
