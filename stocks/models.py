@@ -1429,7 +1429,14 @@ class PurchaseOrderItem(models.Model):
             }
         )
 
-        # 2. Use update_or_create to ensure only ONE StockMovement exists per line item
+        # 2. Extract date safely (prevents AttributeError if already a date object)
+        po_date = self.purchase_order.purchase_date
+        if hasattr(po_date, 'date') and callable(getattr(po_date, 'date')):
+            movement_date = po_date.date()
+        else:
+            movement_date = po_date
+
+        # 3. Use update_or_create to ensure only ONE StockMovement exists per line item
         ref_code = f"PO-{self.purchase_order.pk}-{self.pk}"
         StockMovement.objects.update_or_create(
             branch=self.purchase_order.branch,
@@ -1440,7 +1447,7 @@ class PurchaseOrderItem(models.Model):
                 "movement_type": StockMovement.MovementType.PURCHASE,
                 "quantity": self.quantity,
                 "unit_cost_price": self.unit_cost_price,
-                "date": self.purchase_order.purchase_date.date(),
+                "date": movement_date,  # ✅ SAFE DATE EXTRACTION
                 "created_at": self.purchase_order.purchase_date,
                 "reference_id": self.purchase_order.pk,
                 "notes": f"Purchase Order ({self.purchase_order.po_number})",
