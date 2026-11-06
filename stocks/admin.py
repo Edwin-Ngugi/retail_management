@@ -964,10 +964,10 @@ class CreditRepaymentAdmin(admin.ModelAdmin):
 
 
 @admin.register(CreditRepaymentSplit)
-class CreditRepaymentSplitAdmin(TenantAwareModelAdmin):
+class CreditRepaymentSplitAdmin(admin.ModelAdmin):
     """
     Standalone Admin UI for inspecting individual repayment split records across all branches.
-    Inherits from TenantAwareModelAdmin for safe multi-tenancy queryset scoping.
+    Safely scopes queryset by tenant retailer through repayment.branch relation.
     """
     list_display = (
         "id",
@@ -994,13 +994,14 @@ class CreditRepaymentSplitAdmin(TenantAwareModelAdmin):
     ordering = ("-created_at",)
 
     def get_queryset(self, request):
-        # Apply parent TenantAwareModelAdmin filtering first, then optimize queries
-        qs = super().get_queryset(request)
-        return qs.select_related(
+        qs = super().get_queryset(request).select_related(
             "repayment",
             "repayment__customer",
             "repayment__branch",
         )
+        if request.user.is_superuser:
+            return qs
+        return qs.filter(repayment__branch__retailer=request.user)
 
     @admin.display(description="Repayment ID", ordering="repayment__id")
     def get_repayment_id(self, obj):
@@ -1010,7 +1011,7 @@ class CreditRepaymentSplitAdmin(TenantAwareModelAdmin):
     def get_customer_name(self, obj):
         if obj.repayment and getattr(obj.repayment, "customer", None):
             return getattr(obj.repayment.customer, "name", "-")
-        return "-" 
+        return "-"
 
 
 # =============================================================================
