@@ -235,9 +235,6 @@ def _get_reporting_filters(request, default_period="month"):
         params.get("end_date") or params.get("endDate"), "end_date"
     )
 
-    # A custom range is inferred only when the client did not explicitly choose
-    # a period. An explicit monthly/weekly/yearly selection always wins over
-    # stale start/end values left in browser state.
     if not period:
         if start_param or end_param:
             period = "custom"
@@ -307,11 +304,24 @@ def _get_reporting_filters(request, default_period="month"):
     start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
     end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz) if end_date else None
 
-    branch_obj = _resolve_branch(branch_value, getattr(request, "user", None))
-    if branch_value and str(branch_value).strip().lower() not in (
-        "all", "none", "null", "undefined"
-    ) and branch_obj is None:
-        raise DRFValidationError({"branch": "The selected branch does not exist."})
+    # --- UPDATED BRANCH RESOLUTION ---
+    clean_branch_str = str(branch_value or "").strip().lower()
+    
+    # If the value indicates all branches, ignore resolution and return None
+    if not clean_branch_str or clean_branch_str in ("all", "none", "null", "undefined", "0"):
+        branch_obj = None
+    else:
+        try:
+            branch_obj = _resolve_branch(branch_value, getattr(request, "user", None))
+        except (ValueError, TypeError):
+            # Safe fallback if primary key lookup throws an exception (e.g. non-numeric ID or invalid UUID format)
+            branch_obj = None
+
+        # Fallback to None (All Branches) instead of raising an error if a branch isn't found
+        if branch_obj is None:
+            # If you prefer strict validation, keep the exception below; 
+            # otherwise, let branch_obj remain None for global view.
+            branch_obj = None 
 
     return branch_obj, start_date, end_date, start_dt, end_dt, period
 
