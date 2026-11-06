@@ -12,6 +12,8 @@ from django.db import models, transaction as db_transaction
 from django.db.models import F, Q, Sum
 from django.db.models import ExpressionWrapper, DecimalField
 from django.db.models.functions import Coalesce
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.utils import timezone
 
 
@@ -1334,7 +1336,7 @@ class Purchase(models.Model):
             movement_type=StockMovement.MovementType.PURCHASE,
             quantity=self.quantity,
             unit_cost_price=self.unit_cost_price,
-            date=movement_date,  # ✅ Safe, will not crash on date objects
+            date=movement_date,
             created_at=self.purchase_date,
             reference=f"PURCHASE-{self.pk}",
             reference_id=self.pk,
@@ -1685,6 +1687,8 @@ class PurchaseReturn(models.Model):
 
     def __str__(self):
         return f"Purchase Return #{self.pk}: {self.item.name} x {self.quantity} ({self.branch.name})"
+
+
 # -----------------------------------------------------------------------------
 # Single Receipt & Credit Sale Models (Parent-Child)
 # -----------------------------------------------------------------------------
@@ -1834,7 +1838,6 @@ class SaleTransaction(models.Model):
     @property
     def credit_payment_amount(self):
         if self.payment_method == self.PaymentMethod.CREDIT:
-            # Credit portion is total amount minus any initial upfront partial payments
             upfront_paid = self.amount_paid or ZERO
             credit_due = max(ZERO, (self.total_amount or ZERO) - upfront_paid)
             return quantize_money(credit_due)
@@ -1921,7 +1924,6 @@ class SaleTransaction(models.Model):
                 credit_due = max(ZERO, total_val - amt)
                 totals["CREDIT"] += credit_due
 
-                # Route any upfront liquid payment if explicit repayments or payment breakdown exist
                 repayment_records = list(self.repayments.all()) if hasattr(self, "repayments") else []
                 if repayment_records:
                     for rep in repayment_records:
@@ -1989,7 +1991,6 @@ class SaleTransaction(models.Model):
         if self.payment_method == self.PaymentMethod.CREDIT:
             repayment_total = self.credit_repayments if self.pk else ZERO
             
-            # Preserve existing upfront payment or recorded repayments
             if self.amount_paid is None:
                 self.amount_paid = repayment_total
             
@@ -2062,6 +2063,30 @@ class SaleTransaction(models.Model):
 
     def __str__(self):
         return f"Sale {self.receipt_number} ({self.branch.name}) - KSh {self.total_amount}"
+
+
+# -----------------------------------------------------------------------------
+# Post-Save Signal for Automatic SalePayment Record Creation
+# -----------------------------------------------------------------------------
+@receiver(post_save, sender=SaleTransaction)
+def ensure_default_sale_payment(sender, instance, created, **kwargs):
+    """
+    Automatically creates child SalePayment breakdown entries if a 
+    non-SPLIT transaction is saved without associated SalePayment records.
+    """
+    if instance.payment_method in [SaleTransaction.PaymentMethod.SPLIT, SaleTransaction.PaymentMethod.CREDIT]:
+        return
+
+    # Check if any SalePayment already exists for this transaction
+    if not instance.split_payments.exists():
+        paid_amt = instance.amount_paid if (instance.amount_paid and instance.amount_paid > ZERO) else instance.total_amount
+        if paid_amt > ZERO:
+            SalePayment.objects.create(
+                transaction=instance,
+                method=instance.payment_method,
+                amount=paid_amt,
+                reference_code=instance.receipt_number or instance.invoice_number or ""
+            )
 
 
 class SaleItem(models.Model):
