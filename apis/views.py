@@ -8574,7 +8574,7 @@ def _extract_sp_method(sp):
 def _cash_period_data(branch_obj, start_date, end_date):
     """
     Calculates exact aggregated cash inflows across CASH, PAYBILL, SEND_MONEY, and BANK_TRANSFER,
-    properly incorporating CreditRepayments and Split payments while adhering to models.py structure.
+    properly routing both Sale and CreditRepayment split payment lines into their respective channels.
     """
     start_dt = timezone.make_aware(datetime.combine(start_date, time.min))
     end_dt = timezone.make_aware(datetime.combine(end_date, time.max))
@@ -8601,46 +8601,69 @@ def _cash_period_data(branch_obj, start_date, end_date):
         split_records = list(sale.split_payments.all())
 
         if norm_method == "SPLIT" or split_records:
-            # Aggregate individual liquid split lines (skipping CREDIT portion)
+            # Route individual liquid split lines (skipping CREDIT portion)
             for sp in split_records:
                 sp_raw = _extract_sp_method(sp)
                 sp_channel = normalize_payment_channel(sp_raw)
+
+                if sp_channel in ("MPESA", "MOBILE_MONEY", "TILL", "BUY_GOODS"):
+                    sp_channel = "SEND_MONEY"
+
                 if sp_channel in inflow_channels and sp_channel != "CREDIT":
                     inflow_channels[sp_channel] += Decimal(str(sp.amount or ZERO))
 
         elif norm_method == "CREDIT":
-            # For credit sales, only count initial upfront deposit paid at point of sale if any
+            # Count initial upfront cash deposit paid at point of sale if any
             if sale.amount_paid and sale.amount_paid > ZERO:
-                # Default upfront deposit to CASH unless specified otherwise
                 inflow_channels["CASH"] += Decimal(str(sale.amount_paid))
 
-        elif norm_method in inflow_channels:
-            # Standard single non-credit cash/mobile payment
+        elif norm_method in inflow_channels or norm_method in ("MPESA", "MOBILE_MONEY", "TILL", "BUY_GOODS"):
             sale_paid = Decimal(str(sale.amount_paid if sale.amount_paid and sale.amount_paid > ZERO else sale.total_amount or ZERO))
-            inflow_channels[norm_method] += sale_paid
+            
+            if norm_method in ("MPESA", "MOBILE_MONEY", "TILL", "BUY_GOODS"):
+                norm_method = "SEND_MONEY"
+
+            if norm_method in inflow_channels:
+                inflow_channels[norm_method] += sale_paid
 
     # 2. Customer Debt Repayments (CreditRepayment)
-    # Query using date range and match via direct branch OR transaction branch
     repayments_qs = CreditRepayment.objects.filter(
-        date__gte=start_date,
-        date__lte=end_date
-    )
+        Q(date__gte=start_date, date__lte=end_date) |
+        Q(created_at__date__gte=start_date, created_at__date__lte=end_date)
+    ).prefetch_related("splits")
 
     if branch_obj:
         repayments_qs = repayments_qs.filter(
-            Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+            Q(branch=branch_obj) | 
+            Q(transaction__branch=branch_obj) | 
+            Q(branch__isnull=True)
         )
 
-    for repayment in repayments_qs:
-        rep_channel = normalize_payment_channel(getattr(repayment, "payment_method", "CASH"))
-        rep_amount = Decimal(str(repayment.amount or ZERO))
+    for repayment in repayments_qs.distinct():
+        raw_method = getattr(repayment, "payment_method", "CASH")
+        norm_rep_method = normalize_payment_channel(raw_method)
 
-        # Map MPESA variations directly into SEND_MONEY to match Cashbook summary categories
-        if rep_channel in ("MPESA", "MOBILE_MONEY", "TILL", "BUY_GOODS"):
-            rep_channel = "SEND_MONEY"
+        # CASE A: Explicit Split Debt Repayment -> Route each split line to its channel
+        if norm_rep_method == "SPLIT":
+            split_records = list(repayment.splits.all()) if hasattr(repayment, "splits") else []
+            for sp in split_records:
+                sp_channel = normalize_payment_channel(getattr(sp, "method", "CASH"))
+                
+                if sp_channel in ("MPESA", "MOBILE_MONEY", "TILL", "BUY_GOODS"):
+                    sp_channel = "SEND_MONEY"
 
-        if rep_channel in inflow_channels and rep_channel != "CREDIT":
-            inflow_channels[rep_channel] += rep_amount
+                if sp_channel in inflow_channels and sp_channel != "CREDIT":
+                    inflow_channels[sp_channel] += Decimal(str(sp.amount or ZERO))
+
+        # CASE B: Single Payment Method Repayment (CASH, PAYBILL, SEND_MONEY, BANK_TRANSFER)
+        else:
+            rep_amount = Decimal(str(repayment.amount or ZERO))
+
+            if norm_rep_method in ("MPESA", "MOBILE_MONEY", "TILL", "BUY_GOODS"):
+                norm_rep_method = "SEND_MONEY"
+
+            if norm_rep_method in inflow_channels and norm_rep_method != "CREDIT":
+                inflow_channels[norm_rep_method] += rep_amount
 
     # Group any remaining MPESA balances into SEND_MONEY for Cashbook UI display
     if inflow_channels["MPESA"] > ZERO:
@@ -8661,7 +8684,6 @@ def _cash_period_data(branch_obj, start_date, end_date):
         total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField())
     )["total"]
 
-    # Exclude unpaid supplier credit purchases
     purchases_total = purchase_qs.exclude(payment_method="CREDIT").aggregate(
         total=Coalesce(Sum("amount_paid"), ZERO, output_field=DecimalField())
     )["total"]

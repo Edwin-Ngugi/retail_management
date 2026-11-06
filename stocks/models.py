@@ -3024,7 +3024,42 @@ class DailyFinancialReport(models.Model):
     def __str__(self):
         branch_name = self.branch.name if self.branch else "All Branches"
         return f"Report {self.date} ({branch_name})"
+class CreditRepaymentSplit(models.Model):
+    METHOD_CHOICES = [
+        ("CASH", "Cash"),
+        ("PAYBILL", "Paybill"),
+        ("SEND_MONEY", "Send Money"),
+        ("BANK_TRANSFER", "Bank Transfer"),
+    ]
 
+    repayment = models.ForeignKey(
+        CreditRepayment,
+        on_delete=models.CASCADE,
+        related_name="splits",
+    )
+    method = models.CharField(max_length=30, choices=METHOD_CHOICES)
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+    reference_code = models.CharField(max_length=100, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Repayment Split ({self.method}): KSh {self.amount}"
+
+
+@receiver(post_save, sender=CreditRepayment)
+def ensure_credit_repayment_splits(sender, instance, created, **kwargs):
+    """
+    Validation guard: Only processes child split payments when payment_method is explicitly 'SPLIT'.
+    """
+    if instance.payment_method != CreditRepayment.PaymentMethod.SPLIT:
+        return
+
+    # If updated to SPLIT but splits were already created manually via API/Admin, do nothing
+    pass
 
 # =============================================================================
 # WAC RECALCULATION
