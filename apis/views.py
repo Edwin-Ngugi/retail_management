@@ -9258,31 +9258,34 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     # =========================================================================
     # CASHBOOK REPORT (/management-reports/cash-book/)
     # =========================================================================
+    # =========================================================================
+    # CASHBOOK REPORT (/management-reports/cash-book/)
+    # =========================================================================
     @action(detail=False, methods=['get'], url_path='cash-book')
     def cash_book(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
+            # Query all non-canceled sales within date bounds
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__gte=start_dt,
                 sale_date__lte=end_dt
-            ).filter(
-                Q(split_payments__isnull=False) | Q(payments__isnull=False) | ~Q(payment_method='CREDIT')
-            ).distinct().prefetch_related('split_payments', 'payments')
+            ).prefetch_related('split_payments', 'payments')
 
+            # Repayments filter handling both DateField and DateTimeField schema variations
             repayments_qs = CreditRepayment.objects.filter(
-                date__gte=start_date,
-                date__lte=end_date
+                Q(date__gte=start_date, date__lte=end_date) | 
+                Q(created_at__gte=start_dt, created_at__lte=end_dt)
             )
 
             expenses_qs = Expense.objects.filter(
-                date__gte=start_date,
-                date__lte=end_date
+                Q(date__gte=start_date, date__lte=end_date) |
+                Q(created_at__gte=start_dt, created_at__lte=end_dt)
             ).exclude(description__icontains='Supplier Repayment')
 
             purchases_qs = Purchase.objects.filter(
-                purchase_date__gte=start_dt,
-                purchase_date__lte=end_dt
+                Q(purchase_date__gte=start_dt, purchase_date__lte=end_dt) |
+                Q(created_at__gte=start_dt, created_at__lte=end_dt)
             )
 
             supplier_payments_qs = SupplierPayment.objects.filter(
@@ -9336,7 +9339,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     tot_cash += rep_amt
 
             direct_cash_purchases = purchases_qs.exclude(
-                payment_method=Purchase.PaymentMethod.CREDIT
+                payment_method__iexact='CREDIT'
             ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
 
             supplier_repayments = supplier_payments_qs.aggregate(
