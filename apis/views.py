@@ -170,7 +170,7 @@ def _parse_business_date(raw_value, default=None):
         )
 
 
-def _resolve_branch(branch_value):
+def _resolve_branch(branch_value, user=None):
     if not branch_value:
         return None
 
@@ -182,25 +182,21 @@ def _resolve_branch(branch_value):
             branch_value.get("id")
             or branch_value.get("pk")
             or branch_value.get("branch_id")
+            or branch_value.get("name")
         )
 
-    if not branch_value:
+    clean_val = str(branch_value or "").strip()
+    if not clean_val or clean_val.lower() in ("all", "none", "null", "undefined"):
         return None
 
-    if str(branch_value).isdigit():
-        return (
-            RetailBranch.objects
-            .filter(id=int(branch_value))
-            .first()
-        )
+    # 1. Look up by Primary Key ID if numeric
+    if clean_val.isdigit():
+        branch_obj = RetailBranch.objects.filter(id=int(clean_val)).first()
+        if branch_obj:
+            return branch_obj
 
-    return (
-        RetailBranch.objects
-        .filter(
-            name__iexact=str(branch_value).strip()
-        )
-        .first()
-    )
+    # 2. Look up case-insensitively by Branch Name fallback
+    return RetailBranch.objects.filter(name__iexact=clean_val).first()
 
 def _get_reporting_filters(request, default_period="month"):
     """Resolve branch and period dates consistently across reporting endpoints."""
