@@ -8802,62 +8802,82 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             drawings_filter = Q(description__icontains="drawing")
             salary_filter = Q(description__icontains="salary") | Q(description__icontains="wage")
 
-            equipment_purchased = expense_qs.filter(equipment_filter).aggregate(
+            equipment_purchased = (expense_qs.filter(equipment_filter).aggregate(
                 total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-            )["total"] or ZERO
-            capital_plus_loan_received = expense_qs.filter(financing_in_filter).aggregate(
+            )["total"] or ZERO)
+
+            capital_plus_loan_received = (expense_qs.filter(financing_in_filter).aggregate(
                 total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-            )["total"] or ZERO
-            loan_repayment = expense_qs.filter(loan_repayment_filter).aggregate(
+            )["total"] or ZERO)
+
+            loan_repayment = (expense_qs.filter(loan_repayment_filter).aggregate(
                 total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-            )["total"] or ZERO
-            drawings = expense_qs.filter(drawings_filter).aggregate(
+            )["total"] or ZERO)
+
+            drawings = (expense_qs.filter(drawings_filter).aggregate(
                 total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-            )["total"] or ZERO
-            salaries_and_wages = expense_qs.filter(salary_filter).aggregate(
+            )["total"] or ZERO)
+
+            salaries_and_wages = (expense_qs.filter(salary_filter).aggregate(
                 total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-            )["total"] or ZERO
+            )["total"] or ZERO)
 
             excluded_non_operating = equipment_filter | financing_in_filter | loan_repayment_filter | drawings_filter | salary_filter
-            operating_expenses = expense_qs.exclude(excluded_non_operating).aggregate(
+            operating_expenses = (expense_qs.exclude(excluded_non_operating).aggregate(
                 total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-            )["total"] or ZERO
+            )["total"] or ZERO)
 
-            customer_receipts = period["inflows"]
-            supplier_payments = period["purchases"]
+            customer_receipts = Decimal(str(period.get("inflows") or ZERO))
+            supplier_payments = Decimal(str(period.get("purchases") or ZERO))
+            
             net_operating_cash = customer_receipts - supplier_payments - operating_expenses - salaries_and_wages
             net_investing_cash = -equipment_purchased
             net_financing_cash = capital_plus_loan_received - loan_repayment - drawings
             net_increase_in_cash = net_operating_cash + net_investing_cash + net_financing_cash
 
-            if start_date > date(1900, 1, 1):
-                prior_end = start_date - timedelta(days=1)
-                prior = _cash_period_data(branch_obj, date(1900, 1, 1), prior_end)
-                prior_expenses = prior["expense_queryset"]
-                prior_equipment = prior_expenses.filter(equipment_filter).aggregate(
-                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-                )["total"] or ZERO
-                prior_capital = prior_expenses.filter(financing_in_filter).aggregate(
-                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-                )["total"] or ZERO
-                prior_loan = prior_expenses.filter(loan_repayment_filter).aggregate(
-                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-                )["total"] or ZERO
-                prior_drawings = prior_expenses.filter(drawings_filter).aggregate(
-                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-                )["total"] or ZERO
-                prior_salary = prior_expenses.filter(salary_filter).aggregate(
-                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-                )["total"] or ZERO
-                prior_opex = prior_expenses.exclude(excluded_non_operating).aggregate(
-                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-                )["total"] or ZERO
-                opening_cash = (
-                    prior["inflows"] - prior["purchases"] - prior_opex - prior_salary
-                    - prior_equipment + prior_capital - prior_loan - prior_drawings
-                )
-            else:
-                opening_cash = ZERO
+            opening_cash = ZERO
+            if start_date and start_date > date(1900, 1, 1):
+                try:
+                    prior_end = start_date - timedelta(days=1)
+                    if prior_end >= date(1900, 1, 1):
+                        prior = _cash_period_data(branch_obj, date(1900, 1, 1), prior_end)
+                        prior_expenses = prior["expense_queryset"]
+                        
+                        prior_equipment = (prior_expenses.filter(equipment_filter).aggregate(
+                            total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                        )["total"] or ZERO)
+                        
+                        prior_capital = (prior_expenses.filter(financing_in_filter).aggregate(
+                            total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                        )["total"] or ZERO)
+                        
+                        prior_loan = (prior_expenses.filter(loan_repayment_filter).aggregate(
+                            total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                        )["total"] or ZERO)
+                        
+                        prior_drawings = (prior_expenses.filter(drawings_filter).aggregate(
+                            total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                        )["total"] or ZERO)
+                        
+                        prior_salary = (prior_expenses.filter(salary_filter).aggregate(
+                            total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                        )["total"] or ZERO)
+                        
+                        prior_opex = (prior_expenses.exclude(excluded_non_operating).aggregate(
+                            total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                        )["total"] or ZERO)
+                        
+                        prior_inflows = Decimal(str(prior.get("inflows") or ZERO))
+                        prior_purchases = Decimal(str(prior.get("purchases") or ZERO))
+
+                        opening_cash = (
+                            prior_inflows - prior_purchases - prior_opex - prior_salary
+                            - prior_equipment + prior_capital - prior_loan - prior_drawings
+                        )
+                except Exception as prior_err:
+                    logger.warning("Opening cash calculation fallback: %s", prior_err)
+                    opening_cash = ZERO
+
             closing_cash = opening_cash + net_increase_in_cash
 
             period_display = (
@@ -8889,7 +8909,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             }, status=status.HTTP_200_OK)
         except Exception as exc:
             logger.exception("Cash Flow Report Error: %s", exc)
-            return Response({"error": "Cash flow calculation failed; inspect the server traceback."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"error": f"Cash flow calculation failed: {str(exc)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # =========================================================================
     # BALANCE SHEET REPORT
@@ -9003,7 +9023,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     def cash_book(self, request):
         try:
             branch_obj, start_date, end_date, _start_dt, _end_dt = self._get_branch_and_dates(request)
-            period = _cash_period_data(branch_obj, start_date, end_date)
+            
+            # Normalize date types for safe formatting
+            clean_start = start_date.date() if isinstance(start_date, datetime) else (start_date or timezone.localdate())
+            clean_end = end_date.date() if isinstance(end_date, datetime) else (end_date or timezone.localdate())
+
+            period = _cash_period_data(branch_obj, clean_start, clean_end)
 
             channels = {
                 "CASH": ZERO,
@@ -9043,7 +9068,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 summary_entries.append({
                     "id": f"SUMMARY-{channel}",
                     "reference": f"SUM-{channel}",
-                    "date": str(end_date),
+                    "date": str(clean_end),
                     "description": description,
                     "type": "INFLOW",
                     "payment_method": channel,
@@ -9060,7 +9085,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 {
                     "id": "SUMMARY-PURCHASES", 
                     "reference": "SUM-PURCHASES",
-                    "date": str(end_date), 
+                    "date": str(clean_end), 
                     "description": "Total Supplier Cash Purchases & Settlements",
                     "type": "OUTFLOW", 
                     "payment_method": "PURCHASE", 
@@ -9072,7 +9097,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 {
                     "id": "SUMMARY-EXPENSES", 
                     "reference": "SUM-EXPENSES",
-                    "date": str(end_date), 
+                    "date": str(clean_end), 
                     "description": "Total Operating Expenses",
                     "type": "OUTFLOW", 
                     "payment_method": "EXPENSE", 
@@ -9088,8 +9113,8 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             net_position = total_inflows - total_outflows
 
             period_label = (
-                f"DATE: {start_date.strftime('%d %b %Y')}" if start_date == end_date
-                else f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+                f"DATE: {clean_start.strftime('%d %b %Y')}" if clean_start == clean_end
+                else f"{clean_start.strftime('%b %d, %Y')} - {clean_end.strftime('%b %d, %Y')}"
             )
 
             return Response({
@@ -9111,7 +9136,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         except Exception as exc:
             logger.exception("Cash Book Aggregation Error: %s", exc)
             return Response(
-                {"error": "Cashbook calculation failed; inspect the server traceback."}, 
+                {"error": f"Cashbook calculation failed: {str(exc)}"}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
