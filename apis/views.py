@@ -4043,30 +4043,11 @@ class CashbookViewSet(viewsets.ViewSet):
         year_param = request.query_params.get("year")
         payment_method_param = request.query_params.get("payment_method")
 
-        today = timezone.localdate()
-
-        if period_type == "month" or (month_param and year_param):
-            yr = int(year_param) if year_param else today.year
-            mth = int(month_param) if month_param else today.month
-            _, last_day = calendar.monthrange(yr, mth)
-            start_date = date(yr, mth, 1)
-            end_date = date(yr, mth, last_day)
-        elif period_type == "year" and year_param:
-            yr = int(year_param)
-            start_date = date(yr, 1, 1)
-            end_date = date(yr, 12, 31)
-        else:
-            business_date = _parse_business_date(date_param) if date_param else today
-            start_date = business_date
-            end_date = business_date
-
-        tz = timezone.get_current_timezone()
-        start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-        end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
-
-        branch_obj = None
-        if branch_param and str(branch_param).lower() != "all":
-            branch_obj = _resolve_branch(branch_param, user)
+        # Use the same canonical period parser as the executive financial statements.
+        # Explicit period_type takes precedence over stale month/year parameters.
+        branch_obj, start_date, end_date, start_dt, end_dt, period_type = (
+            _get_reporting_filters(request, default_period="day")
+        )
 
         # 1. Fetch Sales Inflows
         sales_qs = SaleTransaction.objects.filter(
@@ -8688,8 +8669,24 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
         except Exception as e:
             logger.exception("Cash Flow Report Error: %s", e)
+            # Preserve the requested period in the fallback instead of misleadingly
+            # labelling a daily/weekly report with the server's current month.
+            try:
+                _branch, requested_start, requested_end, _start_dt, _end_dt, _period = (
+                    _get_reporting_filters(request, default_period="month")
+                )
+                if requested_start == requested_end:
+                    fallback_period = f"DATE: {requested_start.strftime('%d %b %Y')}"
+                else:
+                    fallback_period = (
+                        f"{requested_start.strftime('%b %d, %Y')} - "
+                        f"{requested_end.strftime('%b %d, %Y')}"
+                    )
+            except Exception:
+                fallback_period = "Selected reporting period"
             return Response({
-                "period": timezone.localdate().strftime('%B %Y'),
+                "period": fallback_period,
+                "error": "Cash flow could not be calculated. Check the server log for the underlying error.",
                 "operating_activities": {
                     "customer_receipts": 0.0, "supplier_payments": 0.0,
                     "operating_expenses": 0.0, "salaries_and_wages": 0.0,
@@ -9007,6 +9004,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             ]
 
             return Response({
+                "period": (
+                    f"DATE: {start_date.strftime('%d %b %Y')}"
+                    if start_date == end_date else
+                    f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+                ),
                 "summary": {
                     "total_inflows": float(tot_inflow),
                     "total_outflows": float(tot_outflow),
@@ -9023,7 +9025,20 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
         except Exception as e:
             logger.exception("Cash Book Aggregation Error: %s", e)
+            try:
+                _branch, requested_start, requested_end, _start_dt, _end_dt, _period = (
+                    _get_reporting_filters(request, default_period="day")
+                )
+                fallback_period = (
+                    f"DATE: {requested_start.strftime('%d %b %Y')}"
+                    if requested_start == requested_end else
+                    f"{requested_start.strftime('%b %d, %Y')} - {requested_end.strftime('%b %d, %Y')}"
+                )
+            except Exception:
+                fallback_period = "Selected reporting period"
             return Response({
+                "period": fallback_period,
+                "error": "Cashbook could not be calculated. Check the server log for the underlying error.",
                 "summary": {
                     "total_inflows": 0.0, "total_outflows": 0.0, "net_position": 0.0,
                     "total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0
