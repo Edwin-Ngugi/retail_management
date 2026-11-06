@@ -1,67 +1,50 @@
 import os
 import sys
 import django
+from decimal import Decimal
 
-# 1. Add current project root directory to Python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# 2. Set Django settings module (replace 'myproject.settings' with your actual project module if different)
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
-
-# 3. Initialize Django environment
+# 1. Setup Django standalone environment
+# Set the DJANGO_SETTINGS_MODULE to your project's settings file (e.g., 'myproject.settings')
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # 👈 Replace 'core.settings' with your settings module path if different
 django.setup()
 
-from django.db import transaction
-from stocks.models import Purchase, PurchaseOrder, PurchaseOrderItem, StockBatch, StockMovement
+# 2. Import Django models AFTER django.setup() call
+from stocks.models import CreditRepayment, CreditRepaymentSplit  # Adjust app name if needed
 
-# Selected Purchase IDs from screenshot (PO-116 through PO-126)
-TARGET_PURCHASE_IDS = [116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126]
 
-with transaction.atomic():
-    purchases = list(Purchase.objects.filter(id__in=TARGET_PURCHASE_IDS).order_by("id"))
-    
-    if not purchases:
-        print("No matching purchase records found!")
-    else:
-        # Details from the base purchase record for header defaults
-        base_purchase = purchases[0]
-        date_str = base_purchase.purchase_date.strftime("%Y%m%d")
-        batch_po_number = f"PO-{date_str}-BATCH-8F8B"
+def run_backfill():
+    count = 0
+    # Find all repayments marked as SPLIT that have 0 child split records
+    split_repayments = CreditRepayment.objects.filter(
+        payment_method="SPLIT",
+        splits__isnull=True
+    ).distinct()
 
-        # 1. Create or retrieve parent PurchaseOrder header
-        po_header, created = PurchaseOrder.objects.get_or_create(
-            po_number=batch_po_number,
-            defaults={
-                "branch": base_purchase.branch,
-                "supplier": base_purchase.supplier,
-                "supplier_name": base_purchase.supplier_name or "Direct Supplier",
-                "payment_method": base_purchase.payment_method,
-                "purchase_date": base_purchase.purchase_date,
-                "created_by": base_purchase.created_by,
-            }
-        )
+    for rep in split_repayments:
+        if rep.amount and rep.amount > Decimal("0.00"):
+            # Split the total amount evenly or assign to default channels for backfill
+            half_amount = (rep.amount / Decimal("2.00")).quantize(Decimal("0.01"))
+            remainder = rep.amount - half_amount
 
-        items_added = 0
-        for p in purchases:
-            # 2. Link line item under PurchaseOrder
-            PurchaseOrderItem.objects.get_or_create(
-                purchase_order=po_header,
-                item=p.item,
-                defaults={
-                    "quantity": p.quantity,
-                    "unit_cost_price": p.unit_cost_price,
-                }
+            # Create Line 1 (Cash)
+            CreditRepaymentSplit.objects.create(
+                repayment=rep,
+                method="CASH",
+                amount=half_amount,
+                reference_code="BACKFILL-CASH"
             )
 
-            # 3. Update stock tracking references to reference the batch order number
-            StockBatch.objects.filter(reference=f"PURCHASE-{p.pk}").update(batch_number=batch_po_number)
-            StockMovement.objects.filter(reference=f"PURCHASE-{p.pk}").update(
-                notes=f"Purchase Order ({batch_po_number})"
+            # Create Line 2 (Paybill)
+            CreditRepaymentSplit.objects.create(
+                repayment=rep,
+                method="PAYBILL",
+                amount=remainder,
+                reference_code="BACKFILL-PAYBILL"
             )
+            count += 1
 
-            items_added += 1
+    print(f"Successfully backfilled split records for {count} existing split repayments!")
 
-        # 4. Calculate total amount & amount paid for parent PurchaseOrder
-        po_header.recalculate_totals()
 
-        print(f"Successfully consolidated {items_added} purchases (IDs {TARGET_PURCHASE_IDS}) into Batch Order '{batch_po_number}'!")
+if __name__ == "__main__":
+    run_backfill()

@@ -3044,22 +3044,17 @@ class CreditRepaymentSplit(models.Model):
         validators=[MinValueValidator(Decimal("0.01"))],
     )
     reference_code = models.CharField(max_length=100, blank=True, null=True)
+    date = models.DateField(blank=True, null=True, help_text="Inherited from parent repayment date")
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        # Automatically sync date from parent CreditRepayment
+        if not self.date and self.repayment and self.repayment.date:
+            self.date = self.repayment.date
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"Repayment Split ({self.method}): KSh {self.amount}"
-
-
-@receiver(post_save, sender=CreditRepayment)
-def ensure_credit_repayment_splits(sender, instance, created, **kwargs):
-    """
-    Validation guard: Only processes child split payments when payment_method is explicitly 'SPLIT'.
-    """
-    if instance.payment_method != CreditRepayment.PaymentMethod.SPLIT:
-        return
-
-    # If updated to SPLIT but splits were already created manually via API/Admin, do nothing
-    pass
 
 # =============================================================================
 # WAC RECALCULATION
