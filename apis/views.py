@@ -202,6 +202,124 @@ def _resolve_branch(branch_value):
         .first()
     )
 
+def _get_reporting_filters(request, default_period="month"):
+    """Resolve branch and period dates consistently across reporting endpoints."""
+    params = request.query_params
+    today = timezone.localdate()
+
+    def parse_optional_date(value, field_name):
+        if value in (None, ""):
+            return None
+        raw = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if timezone.is_aware(parsed):
+                parsed = timezone.localtime(parsed)
+            return parsed.date()
+        except (TypeError, ValueError):
+            try:
+                return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                raise DRFValidationError({field_name: "Invalid date. Use YYYY-MM-DD."})
+
+    branch_value = params.get("branch") or params.get("branch_id")
+    raw_period = (
+        params.get("period_type") or params.get("periodType") or params.get("period")
+    )
+    period = str(raw_period or "").strip().lower()
+
+    selected_date = parse_optional_date(
+        params.get("selectedDate") or params.get("selected_date") or params.get("date"),
+        "date",
+    )
+    start_param = parse_optional_date(
+        params.get("start_date") or params.get("startDate"), "start_date"
+    )
+    end_param = parse_optional_date(
+        params.get("end_date") or params.get("endDate"), "end_date"
+    )
+
+    # A custom range is inferred only when the client did not explicitly choose
+    # a period. An explicit monthly/weekly/yearly selection always wins over
+    # stale start/end values left in browser state.
+    if not period:
+        if start_param or end_param:
+            period = "custom"
+        elif params.get("year") and not params.get("month"):
+            period = "year"
+        elif params.get("month"):
+            period = "month"
+        else:
+            period = str(default_period or "").strip().lower()
+
+    if period in ("all", "all_time", "all-time"):
+        start_date, end_date = date(1900, 1, 1), today
+        period = "all"
+    elif period in ("custom", "range"):
+        if not start_param or not end_param:
+            raise DRFValidationError({
+                "date_range": "Both start_date and end_date are required for a custom range."
+            })
+        start_date, end_date, period = start_param, end_param, "custom"
+    elif period in ("day", "daily"):
+        start_date = end_date = selected_date or today
+        period = "day"
+    elif period in ("week", "weekly"):
+        selected = selected_date or today
+        start_date = selected - timedelta(days=selected.weekday())
+        end_date = start_date + timedelta(days=6)
+        period = "week"
+    elif period in ("month", "monthly"):
+        selected = selected_date or today
+        try:
+            year = int(params.get("year") or selected.year)
+            month = int(params.get("month") or selected.month)
+            start_date = date(year, month, 1)
+            end_date = date(year, month, calendar.monthrange(year, month)[1])
+        except (TypeError, ValueError):
+            raise DRFValidationError({
+                "period": "Invalid month/year. Supply a valid month (1-12) and year."
+            })
+        period = "month"
+    elif period in ("year", "yearly", "annual", "annually"):
+        selected = selected_date or today
+        try:
+            year = int(params.get("year") or selected.year)
+            start_date, end_date = date(year, 1, 1), date(year, 12, 31)
+        except (TypeError, ValueError):
+            raise DRFValidationError({"year": "Invalid year."})
+        period = "year"
+    elif start_param or end_param:
+        if not start_param or not end_param:
+            raise DRFValidationError({"date_range": "Provide both start_date and end_date."})
+        start_date, end_date, period = start_param, end_param, "custom"
+    elif selected_date:
+        start_date = end_date = selected_date
+        period = "day"
+    elif not period:
+        start_date = end_date = None
+        period = "all"
+    else:
+        raise DRFValidationError({
+            "period_type": f"Unsupported period '{period}'. Use day, week, month, year, custom, or all."
+        })
+
+    if start_date and end_date and end_date < start_date:
+        raise DRFValidationError({"date_range": "end_date must be on or after start_date."})
+
+    tz = timezone.get_current_timezone()
+    start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
+    end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz) if end_date else None
+
+    branch_obj = _resolve_branch(branch_value, getattr(request, "user", None))
+    if branch_value and str(branch_value).strip().lower() not in (
+        "all", "none", "null", "undefined"
+    ) and branch_obj is None:
+        raise DRFValidationError({"branch": "The selected branch does not exist."})
+
+    return branch_obj, start_date, end_date, start_dt, end_dt, period
+
+
 
 def _recalculate_wac(item, branch):
     """
@@ -1080,113 +1198,25 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = (
             CreditRepayment.objects
-            .select_related(
-                "customer",
-                "branch",
-                "transaction",
-            )
+            .select_related("customer", "branch", "transaction")
             .all()
-            .order_by("-id")
+            .order_by("-date", "-created_at")
+        )
+
+        branch_obj, start_date, end_date, _start_dt, _end_dt, _period = (
+            _get_reporting_filters(self.request, default_period="")
         )
 
         customer_id = self.request.query_params.get("customer")
-        branch_id = (
-            self.request.query_params.get("branch")
-            or self.request.query_params.get("branch_id")
-        )
-
-        month_param = self.request.query_params.get("month")
-        year_param = self.request.query_params.get("year")
-        date_param = (
-            self.request.query_params.get("date") 
-            or self.request.query_params.get("selectedDate")
-        )
-        start_date_param = self.request.query_params.get("startDate") or self.request.query_params.get("start_date")
-        end_date_param = self.request.query_params.get("endDate") or self.request.query_params.get("end_date")
-
-        period_type = self.request.query_params.get("period_type") or self.request.query_params.get("periodType")
-
-        # 1. Branch Filter
-        if branch_id and str(branch_id).lower() not in ["all", "none", "", "null"]:
-            if str(branch_id).isdigit():
-                queryset = queryset.filter(
-                    Q(branch_id=int(branch_id)) | Q(transaction__branch_id=int(branch_id))
-                )
-            else:
-                queryset = queryset.filter(
-                    Q(branch__name__iexact=str(branch_id).strip())
-                    | Q(transaction__branch__name__iexact=str(branch_id).strip())
-                )
-
+        if branch_obj:
+            queryset = queryset.filter(
+                Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+            )
         if customer_id:
             queryset = queryset.filter(customer_id=customer_id)
-
-        # 2. Dynamic Date Range Filtering
-        if period_type:
-            period_type = str(period_type).lower().strip()
-
-        tz = timezone.get_current_timezone()
-
-        # A. Custom Range (startDate & endDate)
-        if start_date_param and end_date_param:
-            try:
-                s_date = datetime.strptime(start_date_param, "%Y-%m-%d").date()
-                e_date = datetime.strptime(end_date_param, "%Y-%m-%d").date()
-                s_dt = timezone.make_aware(datetime.combine(s_date, datetime.min.time()), tz)
-                e_dt = timezone.make_aware(datetime.combine(e_date, datetime.max.time()), tz)
-                queryset = queryset.filter(
-                    Q(date__range=(s_date, e_date)) | Q(created_at__range=(s_dt, e_dt))
-                )
-            except ValueError:
-                pass
-
-        # B. Specific Day Filter
-        elif date_param or period_type == "day":
-            if date_param:
-                try:
-                    target_date = datetime.strptime(date_param, "%Y-%m-%d").date()
-                    s_dt = timezone.make_aware(datetime.combine(target_date, datetime.min.time()), tz)
-                    e_dt = timezone.make_aware(datetime.combine(target_date, datetime.max.time()), tz)
-                    queryset = queryset.filter(
-                        Q(date=target_date) | Q(created_at__range=(s_dt, e_dt))
-                    )
-                except ValueError:
-                    pass
-
-        # C. Month Filter
-        elif period_type == "month" or (month_param and year_param):
-            try:
-                today = timezone.localdate()
-                yr = int(year_param) if year_param else today.year
-                mth = int(month_param) if month_param else today.month
-                _, last_day = calendar.monthrange(yr, mth)
-                start_date = date(yr, mth, 1)
-                end_date = date(yr, mth, last_day)
-
-                s_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-                e_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
-
-                queryset = queryset.filter(
-                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(s_dt, e_dt))
-                )
-            except (ValueError, TypeError):
-                pass
-
-        # D. Year Filter
-        elif period_type == "year" and year_param:
-            try:
-                yr = int(year_param)
-                start_date = date(yr, 1, 1)
-                end_date = date(yr, 12, 31)
-
-                s_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-                e_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
-
-                queryset = queryset.filter(
-                    Q(date__range=(start_date, end_date)) | Q(created_at__range=(s_dt, e_dt))
-                )
-            except (ValueError, TypeError):
-                pass
+        if start_date and end_date:
+            # CreditRepayment.date is authoritative; created_at is audit metadata.
+            queryset = queryset.filter(date__range=(start_date, end_date))
 
         return queryset
 
@@ -1512,9 +1542,9 @@ class ItemViewSet(viewsets.ModelViewSet):
                 year = int(year_param)
                 month = int(month_param)
                 _, last_day = calendar.monthrange(year, month)
-                start_date = datetime(year, month, 1, 0, 0, 0)
-                end_date = datetime(year, month, last_day, 23, 59, 59)
-                date_filter = Q(created_at__gte=start_date, created_at__lte=end_date)
+                start_date = date(year, month, 1)
+                end_date = date(year, month, last_day)
+                date_filter = Q(updated_at__date__range=(start_date, end_date))
             except ValueError:
                 pass
 
@@ -4045,17 +4075,17 @@ class CashbookViewSet(viewsets.ViewSet):
 
         # 2. Fetch Expense Outflows
         expenses_qs = Expense.objects.filter(
-            Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            Q(date__range=(start_date, end_date))
         )
 
         # 3. Fetch Credit Repayments Inflows
         repayments_qs = CreditRepayment.objects.filter(
-            Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+            Q(date__range=(start_date, end_date))
         )
 
         # 4. Fetch Purchase Orders / Supplier Transactions
         purchases_qs = Purchase.objects.filter(
-            Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+            Q(purchase_date__range=(start_dt, end_dt))
         )
 
         # 5. Fetch Inbound Stock Movements
@@ -4067,7 +4097,7 @@ class CashbookViewSet(viewsets.ViewSet):
         ]
         stock_movements_qs = StockMovement.objects.filter(
             movement_type__in=inbound_types,
-            created_at__range=(start_dt, end_dt),
+            date__range=(start_date, end_date),
         ).select_related("item", "branch")
 
         # --- BRANCH SCOPE FILTERING (GLOBAL UNFILTERED BY USER) ---
@@ -4320,43 +4350,9 @@ class BalanceSheetViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def _date_range(self, request):
-        today = timezone.localdate()
-        period_type = (
-            request.query_params.get("period_type")
-            or request.query_params.get("periodType")
-            or "day"
-        ).lower()
-
-        date_param = request.query_params.get("date") or request.query_params.get("selectedDate")
-        month_param = request.query_params.get("month")
-        year_param = request.query_params.get("year")
-
-        try:
-            if period_type == "month":
-                year = int(year_param) if year_param else today.year
-                month = int(month_param) if month_param else today.month
-                _, last_day = calendar.monthrange(year, month)
-                start_date = date(year, month, 1)
-                end_date = date(year, month, last_day)
-
-            elif period_type == "year":
-                year = int(year_param) if year_param else today.year
-                start_date = date(year, 1, 1)
-                end_date = date(year, 12, 31)
-
-            else:
-                if date_param:
-                    start_date = datetime.strptime(str(date_param).split("T")[0], "%Y-%m-%d").date()
-                else:
-                    start_date = today
-                end_date = start_date
-                period_type = "day"
-
-        except (TypeError, ValueError):
-            start_date = today
-            end_date = today
-            period_type = "day"
-
+        _branch, start_date, end_date, _start_dt, _end_dt, period_type = (
+            _get_reporting_filters(request, default_period="day")
+        )
         return period_type, start_date, end_date
 
     def _sale_cash_and_receivable(self, sales_qs):
@@ -4415,16 +4411,12 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         # 1. Base Querysets (Global Unfiltered by User)
         sales_qs = SaleTransaction.objects.filter(sale_date__lte=cutoff_dt).prefetch_related("split_payments")
 
-        repayments_qs = CreditRepayment.objects.filter(
-            Q(created_at__lte=cutoff_dt) | Q(date__lte=end_date)
-        )
+        repayments_qs = CreditRepayment.objects.filter(date__lte=end_date)
 
-        expenses_qs = Expense.objects.filter(
-            Q(date__lte=end_date) | Q(created_at__lte=cutoff_dt)
-        )
+        expenses_qs = Expense.objects.filter(date__lte=end_date)
 
         purchases_qs = Purchase.objects.filter(
-            Q(purchase_date__lte=cutoff_dt) | Q(created_at__lte=cutoff_dt)
+            purchase_date__lte=cutoff_dt
         ).select_related("item", "branch")
 
         supplier_payments_qs = SupplierPayment.objects.filter(
@@ -4439,7 +4431,7 @@ class BalanceSheetViewSet(viewsets.ViewSet):
         ]
         stock_movements_qs = StockMovement.objects.filter(
             movement_type__in=inbound_types,
-            created_at__lte=cutoff_dt,
+            date__lte=end_date,
         )
 
         customers_qs = Customer.objects.all()
@@ -6650,32 +6642,10 @@ class DashboardOverviewAPIView(APIView):
 
     def get(self, request, *args, **kwargs):
         try:
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = (
+                _get_reporting_filters(request, default_period="day")
+            )
             branch_param = request.query_params.get("branch", "").strip()
-            date_str = request.query_params.get("date")
-            start_date_str = request.query_params.get("startDate")
-            end_date_str = request.query_params.get("endDate")
-
-            today = timezone.localdate()
-            start_date = today
-            end_date = today
-
-            # 1. Parse Date Boundaries
-            if start_date_str and end_date_str:
-                try:
-                    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-                    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-            elif date_str:
-                try:
-                    start_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    end_date = start_date
-                except ValueError:
-                    pass
-
-            tz = timezone.get_current_timezone()
-            start_dt = timezone.make_aware(datetime.combine(start_date, datetime.min.time()), tz)
-            end_dt = timezone.make_aware(datetime.combine(end_date, datetime.max.time()), tz)
 
             # 2. Base Querysets
             sales_qs = SaleTransaction.objects.all()
@@ -6685,32 +6655,27 @@ class DashboardOverviewAPIView(APIView):
             pricings_qs = BranchItemPricing.objects.all()
             approvals_qs = PendingApproval.objects.filter(status=PendingApproval.Status.PENDING)
 
-            # 3. Branch Filter (Handles numeric ID or string branch name)
-            if branch_param and branch_param.lower() not in ["all", "undefined", "null", ""]:
-                if branch_param.isdigit():
-                    b_id = int(branch_param)
-                    sales_qs = sales_qs.filter(branch_id=b_id)
-                    sale_items_qs = sale_items_qs.filter(transaction__branch_id=b_id)
-                    repayments_qs = repayments_qs.filter(branch_id=b_id)
-                    purchases_qs = purchases_qs.filter(branch_id=b_id)
-                    pricings_qs = pricings_qs.filter(branch_id=b_id)
-                else:
-                    sales_qs = sales_qs.filter(branch__name__iexact=branch_param)
-                    sale_items_qs = sale_items_qs.filter(transaction__branch__name__iexact=branch_param)
-                    repayments_qs = repayments_qs.filter(branch__name__iexact=branch_param)
-                    purchases_qs = purchases_qs.filter(branch__name__iexact=branch_param)
-                    pricings_qs = pricings_qs.filter(branch__name__iexact=branch_param)
+            # 3. Apply the resolved branch consistently.
+            if branch_obj:
+                sales_qs = sales_qs.filter(branch=branch_obj)
+                sale_items_qs = sale_items_qs.filter(transaction__branch=branch_obj)
+                repayments_qs = repayments_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+                )
+                purchases_qs = purchases_qs.filter(branch=branch_obj)
+                pricings_qs = pricings_qs.filter(branch=branch_obj)
 
-            # 4. Apply Date Filters
+            # 4. Apply the selected period using each model's business date.
             period_sales = sales_qs.filter(sale_date__range=(start_dt, end_dt))
-            period_sale_items = sale_items_qs.filter(transaction__sale_date__range=(start_dt, end_dt))
-            
-            try:
-                period_repayments = repayments_qs.filter(date__range=(start_date, end_date))
-            except Exception:
-                period_repayments = repayments_qs.filter(created_at__range=(start_dt, end_dt))
-
-            period_purchases = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
+            period_sale_items = sale_items_qs.filter(
+                transaction__sale_date__range=(start_dt, end_dt)
+            )
+            period_repayments = repayments_qs.filter(
+                date__range=(start_date, end_date)
+            )
+            period_purchases = purchases_qs.filter(
+                purchase_date__range=(start_dt, end_dt)
+            )
 
             zero_dec = Value(0, output_field=DecimalField(max_digits=15, decimal_places=2))
 
@@ -6878,120 +6843,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         return clean
 
     def _get_branch_and_dates(self, request):
-        branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
-        period_type = (request.query_params.get("period_type") or "").lower().strip()
+        return _get_reporting_filters(request, default_period="month")
 
-        start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
-        end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
-        date_param = request.query_params.get("date") or request.query_params.get("selectedDate")
-        month_param = request.query_params.get("month")
-        year_param = request.query_params.get("year")
-
-        today = timezone.localdate()
-        start_date = None
-        end_date = None
-
-        # 1. Custom or Explicit Date Range
-        if start_param and end_param:
-            try:
-                start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
-                end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
-                period_type = period_type or "custom"
-            except ValueError:
-                pass
-
-        # 2. Daily or Weekly View
-        elif period_type in ["day", "weekly"] and date_param:
-            try:
-                parsed_date = datetime.strptime(str(date_param).strip(), "%Y-%m-%d").date()
-                if period_type == "day":
-                    start_date, end_date = parsed_date, parsed_date
-                else:
-                    start_date = parsed_date
-                    end_date = parsed_date + timedelta(days=6)
-            except ValueError:
-                pass
-
-        # 3. Monthly View
-        elif period_type == "month" or (month_param and year_param):
-            try:
-                yr = int(year_param) if year_param else today.year
-                mth = int(month_param) if month_param else today.month
-                _, last_day = calendar.monthrange(yr, mth)
-                start_date = date(yr, mth, 1)
-                end_date = date(yr, mth, last_day)
-                period_type = "month"
-            except (ValueError, TypeError):
-                pass
-
-        # 4. Yearly View
-        elif period_type == "year" or (year_param and not month_param):
-            try:
-                yr = int(year_param) if year_param else today.year
-                start_date = date(yr, 1, 1)
-                end_date = date(yr, 12, 31)
-                period_type = "year"
-            except (ValueError, TypeError):
-                pass
-
-        # Note: If no date parameters are passed, start_date and end_date stay None (All-Time mode)
-
-        tz = timezone.get_current_timezone()
-        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
-        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz) if end_date else None
-
-        # Flexible Branch Resolution (Numeric ID vs Name string)
-        branch_obj = None
-        if branch_param and str(branch_param).strip().lower() not in ["all", "none", "", "null"]:
-            clean_param = str(branch_param).strip()
-            if clean_param.isdigit():
-                branch_obj = RetailBranch.objects.filter(pk=int(clean_param)).first()
-            if not branch_obj:
-                branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
-
-        return branch_obj, start_date, end_date, start_dt, end_dt, period_type
 
     def _get_filter_params(self, request):
-            branch_id = request.query_params.get('branch_id')
-            start_date_str = request.query_params.get('start_date')
-            end_date_str = request.query_params.get('end_date')
-            year = request.query_params.get('year')
-            month = request.query_params.get('month')
-
-            today = timezone.now().date()
-            start_date = None
-            end_date = None
-
-            if start_date_str and end_date_str:
-                try:
-                    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-                    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-                except ValueError:
-                    pass
-
-            if not start_date or not end_date:
-                if year and month:
-                    try:
-                        y, m = int(year), int(month)
-                        start_date = date(y, m, 1)
-                        last_day = calendar.monthrange(y, m)[1]
-                        end_date = date(y, m, last_day)
-                    except ValueError:
-                        pass
-                elif year:
-                    try:
-                        y = int(year)
-                        start_date = date(y, 1, 1)
-                        end_date = date(y, 12, 31)
-                    except ValueError:
-                        pass
-
-            if not start_date or not end_date:
-                start_date = date(today.year, today.month, 1)
-                last_day = calendar.monthrange(today.year, today.month)[1]
-                end_date = date(today.year, today.month, last_day)
-
-            return branch_id, start_date, end_date
+        branch, start_date, end_date, _start_dt, _end_dt, _period = (
+            _get_reporting_filters(request, default_period="month")
+        )
+        return (branch.pk if branch else None), start_date, end_date
 
     # =========================================================================
     # DASHBOARD & FINANCIALS
@@ -7049,6 +6908,18 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     return quantize_money(credit_total)
 
                 if is_credit_sale_check(sale_obj, c_ids):
+                    if method == "CREDIT":
+                        credit_due = getattr(sale_obj, "credit_payment_amount", None)
+                        if credit_due is not None:
+                            return quantize_money(credit_due)
+                        upfront_paid = quantize_money(
+                            getattr(sale_obj, "amount_paid", ZERO) or ZERO
+                        )
+                        return quantize_money(max(ZERO, sale_amount - upfront_paid))
+
+                    balance_due = getattr(sale_obj, "balance_due", None)
+                    if balance_due is not None:
+                        return quantize_money(max(ZERO, balance_due))
                     return sale_amount
                 return ZERO
 
@@ -7071,18 +6942,26 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
                     )
 
-            # Filtered QuerySets for Selected Period Range
-            sales_qs = base_sales_qs.filter(sale_date__range=(start_dt, end_dt))
-            expenses_qs = base_expenses_qs.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            purchases_qs = base_purchases_qs.filter(
-                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
-            )
-            supplier_payments_qs = base_supplier_pmts_qs.filter(created_at__range=(start_dt, end_dt))
-            customer_repayments_qs = base_credit_repay_qs.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
-            )
+            # Filter each model by its actual business-date field.
+            # DateField: date__range=(start_date, end_date)
+            # DateTimeField: datetime__range=(start_dt, end_dt)
+            sales_qs = base_sales_qs
+            expenses_qs = base_expenses_qs
+            purchases_qs = base_purchases_qs
+            supplier_payments_qs = base_supplier_pmts_qs
+            customer_repayments_qs = base_credit_repay_qs
+
+            if start_date and end_date:
+                sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
+                expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
+                purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
+                customer_repayments_qs = customer_repayments_qs.filter(
+                    date__range=(start_date, end_date)
+                )
+            if start_dt and end_dt:
+                supplier_payments_qs = supplier_payments_qs.filter(
+                    created_at__range=(start_dt, end_dt)
+                )
 
             credit_transaction_ids = set(
                 base_credit_repay_qs
@@ -7208,7 +7087,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 Q(split_payments__method='CREDIT') |
                 Q(split_payments__method='Credit')
             )
-            all_credit_sales = base_sales_qs.filter(st_credit_filter, sale_date__lte=end_dt).distinct()
+            all_credit_sales = base_sales_qs.filter(st_credit_filter).distinct()
+            if end_dt:
+                all_credit_sales = all_credit_sales.filter(sale_date__lte=end_dt)
             gross_credit_issued = ZERO
 
             all_credit_ids = set(
@@ -7225,9 +7106,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             repay_agg_lifetime = base_credit_repay_qs.aggregate(total=Sum('amount'))
             total_recovered_lifetime = quantize_money(repay_agg_lifetime['total'] or ZERO)
 
-            repay_agg_to_date = base_credit_repay_qs.filter(
-                Q(date__lte=end_date) | Q(created_at__lte=end_dt)
-            ).aggregate(total=Sum('amount'))
+            repayments_to_date_qs = base_credit_repay_qs
+            if end_date:
+                repayments_to_date_qs = repayments_to_date_qs.filter(date__lte=end_date)
+            repay_agg_to_date = repayments_to_date_qs.aggregate(total=Sum('amount'))
             all_repayments_to_date = quantize_money(repay_agg_to_date['total'] or ZERO)
 
             total_customer_debtors = max(ZERO, gross_credit_issued - all_repayments_to_date)
@@ -7382,7 +7264,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='sales-register')
     def sales_register(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -7563,9 +7445,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='sales-collections')
     def sales_collections(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)))
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -7600,7 +7482,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='sales-returns-discounts')
     def sales_returns_discounts(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
             sale_items_qs = SaleItem.objects.filter(transaction__sale_date__range=(start_dt, end_dt))
             returns_qs = CustomerReturn.objects.filter(date__range=(start_date, end_date))
 
@@ -7758,11 +7640,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='cash-overview')
     def cash_overview(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
 
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(payment_method='CREDIT')
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)))
+            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)))
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -7788,9 +7670,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='cash-inflows')
     def cash_inflows(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(payment_method='CREDIT')
-            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)))
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -7842,8 +7724,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='cash-expenses')
     def cash_expenses(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
+            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)))
 
             if branch_obj:
                 expenses_qs = expenses_qs.filter(branch=branch_obj)
@@ -8034,7 +7916,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='stock-levels')
     def stock_levels(self, request):
         try:
-            branch_obj, _, _, _, _ = self._get_branch_and_dates(request)
+            branch_obj, _, _, _, _, _period = self._get_branch_and_dates(request)
             pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
             if branch_obj:
                 pricings_qs = pricings_qs.filter(branch=branch_obj)
@@ -8067,7 +7949,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='stock-inwards')
     def stock_inwards(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
             inbound_types = [
                 StockMovement.MovementType.PURCHASE,
                 StockMovement.MovementType.CUSTOMER_RETURN,
@@ -8076,7 +7958,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 StockMovement.MovementType.OPENING_STOCK,
             ]
 
-            movements_qs = StockMovement.objects.filter(movement_type__in=inbound_types, created_at__range=(start_dt, end_dt))
+            movements_qs = StockMovement.objects.filter(movement_type__in=inbound_types, date__range=(start_date, end_date))
             if branch_obj:
                 movements_qs = movements_qs.filter(branch=branch_obj)
 
@@ -8102,7 +7984,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='stock-outwards')
     def stock_outwards(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
             outbound_types = [
                 StockMovement.MovementType.SALE,
                 StockMovement.MovementType.SUPPLIER_RETURN,
@@ -8111,7 +7993,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 StockMovement.MovementType.ADJUSTMENT_OUT,
             ]
 
-            movements_qs = StockMovement.objects.filter(movement_type__in=outbound_types, created_at__range=(start_dt, end_dt))
+            movements_qs = StockMovement.objects.filter(movement_type__in=outbound_types, date__range=(start_date, end_date))
             if branch_obj:
                 movements_qs = movements_qs.filter(branch=branch_obj)
 
@@ -8137,7 +8019,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='stock-transfers')
     def stock_transfers(self, request):
         try:
-            branch_obj, start_date, end_date, _, _ = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, _, _, _period = self._get_branch_and_dates(request)
             qs = StockTransfer.objects.filter(date__range=(start_date, end_date))
             if branch_obj:
                 qs = qs.filter(Q(from_branch=branch_obj) | Q(to_branch=branch_obj))
@@ -8158,7 +8040,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='stock-adjustments')
     def stock_adjustments(self, request):
         try:
-            branch_obj, start_date, end_date, _, _ = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, _, _, _period = self._get_branch_and_dates(request)
             qs = DamageRecord.objects.filter(date__range=(start_date, end_date))
             if branch_obj:
                 qs = qs.filter(branch=branch_obj)
@@ -8179,8 +8061,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='purchases-overview')
     def purchases_overview(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)))
             returns_qs = SupplierReturn.objects.filter(date__range=(start_date, end_date))
 
             if branch_obj:
@@ -8209,7 +8091,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='purchase-requisitions')
     def purchase_requisitions(self, request):
         try:
-            branch_obj, _, _, _, _ = self._get_branch_and_dates(request)
+            branch_obj, _, _, _, _, _period = self._get_branch_and_dates(request)
             pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
             if branch_obj:
                 pricings_qs = pricings_qs.filter(branch=branch_obj)
@@ -8315,7 +8197,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='goods-received')
     def goods_received(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
 
             inbound_types = [
                 StockMovement.MovementType.PURCHASE,
@@ -8327,7 +8209,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             movements_qs = StockMovement.objects.filter(
                 movement_type__in=inbound_types
             ).filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                Q(date__range=(start_date, end_date))
             )
 
             if branch_obj:
@@ -8364,11 +8246,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='supplier-invoices')
     def supplier_invoices(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
             credit_purchases = Purchase.objects.filter(
                 payment_method=Purchase.PaymentMethod.CREDIT
             ).filter(
-                Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                Q(purchase_date__range=(start_dt, end_dt))
             )
             if branch_obj:
                 credit_purchases = credit_purchases.filter(branch=branch_obj)
@@ -8393,7 +8275,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='purchase-returns')
     def purchase_returns(self, request):
         try:
-            branch_obj, start_date, end_date, _, _ = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, _, _, _period = self._get_branch_and_dates(request)
             returns_qs = SupplierReturn.objects.filter(date__range=(start_date, end_date))
             if branch_obj:
                 returns_qs = returns_qs.filter(branch=branch_obj)
@@ -8416,7 +8298,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='supplier-payments')
     def supplier_payments(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
             payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
             if branch_obj:
                 payments_qs = payments_qs.filter(purchase__branch=branch_obj)
@@ -8440,7 +8322,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='suppliers-list')
     def suppliers_list(self, request):
         try:
-            branch_obj, _, _, _, _ = self._get_branch_and_dates(request)
+            branch_obj, _, _, _, _, _period = self._get_branch_and_dates(request)
             suppliers = Supplier.objects.all()
             results = []
 
@@ -8468,8 +8350,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='purchase-reports')
     def purchase_reports(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)))
             if branch_obj:
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
 
@@ -8562,92 +8444,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_branch_and_dates(self, request):
-        """
-        Unifies date parsing across P&L, Cash Flow, Balance Sheet, and Cashbook.
-        Strictly respects period_type over default/stale query parameters.
-        """
-        branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
-        period_type = str(
-            request.query_params.get('period_type') or 
-            request.query_params.get('periodType') or 
-            'month'
-        ).lower().strip()
-
-        now = timezone.localdate()
-
-        def parse_date(val):
-            if not val:
-                return None
-            clean_str = str(val).strip()
-            if len(clean_str) >= 10:
-                clean_str = clean_str[:10]
-            try:
-                return datetime.strptime(clean_str, '%Y-%m-%d').date()
-            except ValueError:
-                return None
-
-        selected_date = parse_date(
-            request.query_params.get('selectedDate') or request.query_params.get('date')
+        branch, start_date, end_date, start_dt, end_dt, _period = (
+            _get_reporting_filters(request, default_period="month")
         )
-        start_date_param = parse_date(
-            request.query_params.get('start_date') or request.query_params.get('startDate')
-        )
-        end_date_param = parse_date(
-            request.query_params.get('end_date') or request.query_params.get('endDate')
-        )
+        return branch, start_date, end_date, start_dt, end_dt
 
-        try:
-            year = int(request.query_params.get('year', now.year))
-        except (ValueError, TypeError):
-            year = now.year
-
-        try:
-            month = int(request.query_params.get('month', now.month))
-        except (ValueError, TypeError):
-            month = now.month
-
-        # ROUTING LOGIC: Explicit period_type check FIRST
-        if period_type in ['day', 'daily'] and selected_date:
-            start_date = selected_date
-            end_date = selected_date
-        elif period_type in ['weekly', 'week'] and selected_date:
-            start_date = selected_date - timedelta(days=selected_date.weekday())
-            end_date = start_date + timedelta(days=6)
-        elif period_type == 'custom' and start_date_param and end_date_param:
-            start_date = start_date_param
-            end_date = end_date_param
-        elif period_type == 'year':
-            start_date = date(year, 1, 1)
-            end_date = date(year, 12, 31)
-        elif period_type == 'month':
-            _, last_day = calendar.monthrange(year, month)
-            start_date = date(year, month, 1)
-            end_date = date(year, month, last_day)
-        else:
-            if selected_date:
-                start_date = selected_date
-                end_date = selected_date
-            elif start_date_param and end_date_param:
-                start_date = start_date_param
-                end_date = end_date_param
-            else:
-                _, last_day = calendar.monthrange(year, month)
-                start_date = date(year, month, 1)
-                end_date = date(year, month, last_day)
-
-        tz = timezone.get_current_timezone()
-        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
-        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
-
-        branch_obj = None
-        if branch_id and str(branch_id).lower() not in ['all', 'none', '', 'null', 'undefined']:
-            clean_branch = str(branch_id).strip()
-            if clean_branch.isdigit():
-                branch_obj = RetailBranch.objects.filter(pk=int(clean_branch)).first()
-            if not branch_obj:
-                branch_obj = RetailBranch.objects.filter(name__iexact=clean_branch).first()
-
-        return branch_obj, start_date, end_date, start_dt, end_dt
 
     # =========================================================================
     # PROFIT & LOSS REPORT
@@ -8663,8 +8464,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             )
 
             expenses_qs = Expense.objects.filter(
-                Q(date__gte=start_date, date__lte=end_date) |
-                Q(created_at__gte=start_dt, created_at__lte=end_dt)
+                Q(date__range=(start_date, end_date))
             ).exclude(description__icontains='Supplier Repayment')
 
             if branch_obj:
@@ -8744,13 +8544,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             ).prefetch_related('split_payments', 'payments')
 
             repayments_qs = CreditRepayment.objects.filter(
-                Q(date__gte=start_date, date__lte=end_date) |
-                Q(created_at__gte=start_dt, created_at__lte=end_dt)
+                Q(date__range=(start_date, end_date))
             )
 
             purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__gte=start_dt, purchase_date__lte=end_dt) |
-                Q(created_at__gte=start_dt, created_at__lte=end_dt)
+                Q(purchase_date__range=(start_dt, end_dt))
             )
 
             supplier_payments_qs = SupplierPayment.objects.filter(
@@ -8759,8 +8557,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             )
 
             expenses_qs = Expense.objects.filter(
-                Q(date__gte=start_date, date__lte=end_date) |
-                Q(created_at__gte=start_dt, created_at__lte=end_dt)
+                Q(date__range=(start_date, end_date))
             ).exclude(description__icontains='Supplier Repayment')
 
             if branch_obj:
@@ -8919,15 +8716,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
             sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).prefetch_related('split_payments', 'payments')
-            repayments_qs = CreditRepayment.objects.filter(
-                Q(date__lte=end_date) | Q(created_at__lte=end_dt)
-            )
-            expenses_qs = Expense.objects.filter(
-                Q(date__lte=end_date) | Q(created_at__lte=end_dt)
-            ).exclude(description__icontains='Supplier Repayment')
-            purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__lte=end_dt) | Q(created_at__lte=end_dt)
-            )
+            repayments_qs = CreditRepayment.objects.filter(date__lte=end_date)
+            expenses_qs = Expense.objects.filter(date__lte=end_date).exclude(description__icontains='Supplier Repayment')
+            purchases_qs = Purchase.objects.filter(purchase_date__lte=end_dt)
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
@@ -9017,9 +8808,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 total_revenue += Decimal(str(s.total_amount or ZERO))
                 total_cogs += s.total_cost
 
-            tot_all_expenses = Expense.objects.filter(
-                Q(date__lte=end_date) | Q(created_at__lte=end_dt)
-            ).exclude(description__icontains='Supplier Repayment')
+            tot_all_expenses = Expense.objects.filter(date__lte=end_date).exclude(description__icontains='Supplier Repayment')
             if branch_obj:
                 tot_all_expenses = tot_all_expenses.filter(branch=branch_obj)
 
@@ -9073,18 +8862,15 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             ).prefetch_related('split_payments', 'payments')
 
             repayments_qs = CreditRepayment.objects.filter(
-                Q(date__gte=start_date, date__lte=end_date) |
-                Q(created_at__gte=start_dt, created_at__lte=end_dt)
+                Q(date__range=(start_date, end_date))
             )
 
             expenses_qs = Expense.objects.filter(
-                Q(date__gte=start_date, date__lte=end_date) |
-                Q(created_at__gte=start_dt, created_at__lte=end_dt)
+                Q(date__range=(start_date, end_date))
             ).exclude(description__icontains='Supplier Repayment')
 
             purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__gte=start_dt, purchase_date__lte=end_dt) |
-                Q(created_at__gte=start_dt, created_at__lte=end_dt)
+                Q(purchase_date__range=(start_dt, end_dt))
             )
 
             supplier_payments_qs = SupplierPayment.objects.filter(
@@ -9266,12 +9052,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             )
 
             repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                Q(date__range=(start_date, end_date))
             )
 
             # Pure operating expenses excluding supplier repayments
             expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                Q(date__range=(start_date, end_date))
             ).exclude(
                 description__icontains='Supplier Repayment'
             )
@@ -9456,13 +9242,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
-            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt)))
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt)))
+            repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)))
+            purchases_qs = Purchase.objects.filter(Q(purchase_date__range=(start_dt, end_dt)))
             supplier_payments_qs = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
             
             # Pure operating expenses excluding supplier repayments
             expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date)) | Q(created_at__range=(start_dt, end_dt))
+                Q(date__range=(start_date, end_date))
             ).exclude(description__icontains='Supplier Repayment')
 
             if branch_obj:
@@ -9650,14 +9436,12 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).exclude(
                 Q(payment_method='CREDIT') | Q(receipt_number__startswith='INV')
             )
-            repayments_qs = CreditRepayment.objects.filter(Q(date__lte=end_date) | Q(created_at__lte=end_dt))
+            repayments_qs = CreditRepayment.objects.filter(date__lte=end_date)
             
             # Pure operating expenses excluding supplier repayments
-            expenses_qs = Expense.objects.filter(
-                Q(date__lte=end_date) | Q(created_at__lte=end_dt)
-            ).exclude(description__icontains='Supplier Repayment')
+            expenses_qs = Expense.objects.filter(date__lte=end_date).exclude(description__icontains='Supplier Repayment')
             
-            purchases_qs = Purchase.objects.filter(Q(purchase_date__lte=end_dt) | Q(created_at__lte=end_dt))
+            purchases_qs = Purchase.objects.filter(purchase_date__lte=end_dt)
             supplier_payments_qs = SupplierPayment.objects.filter(created_at__lte=end_dt)
 
             if branch_obj:
@@ -10376,72 +10160,11 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def _get_filters(self, request):
-        branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
-        period_type = (request.query_params.get("period_type") or request.query_params.get("period") or "").lower()
-        selected_date_str = request.query_params.get("selectedDate") or request.query_params.get("date")
-        year_param = request.query_params.get("year")
-        month_param = request.query_params.get("month")
+        branch, start_date, end_date, start_dt, end_dt, _period = (
+            _get_reporting_filters(request, default_period="month")
+        )
+        return branch, start_date, end_date, start_dt, end_dt
 
-        start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
-        end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
-
-        start_date = None
-        end_date = None
-        today = timezone.now().date()
-
-        if period_type in ["day", "daily"]:
-            ref_date = today
-            if selected_date_str:
-                try:
-                    ref_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-            start_date = ref_date
-            end_date = ref_date
-
-        elif period_type in ["week", "weekly"]:
-            ref_date = today
-            if selected_date_str:
-                try:
-                    ref_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-            start_date = ref_date - timedelta(days=ref_date.weekday())
-            end_date = start_date + timedelta(days=6)
-
-        elif period_type in ["month", "monthly"]:
-            y = int(year_param) if year_param and str(year_param).isdigit() else today.year
-            m = int(month_param) if month_param and str(month_param).isdigit() else today.month
-            start_date = date(y, m, 1)
-            last_day = calendar.monthrange(y, m)[1]
-            end_date = date(y, m, last_day)
-
-        elif period_type in ["year", "yearly"]:
-            y = int(year_param) if year_param and str(year_param).isdigit() else today.year
-            start_date = date(y, 1, 1)
-            end_date = date(y, 12, 31)
-
-        if not start_date or not end_date:
-            if start_param and end_param:
-                try:
-                    start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
-                    end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-
-        tz = timezone.get_current_timezone()
-        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
-        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz) if end_date else None
-
-        branch_obj = None
-        if branch_param and str(branch_param).strip().lower() not in ["all", "none", "", "null"]:
-            clean_param = str(branch_param).strip()
-            if clean_param.isdigit():
-                branch_obj = RetailBranch.objects.filter(pk=int(clean_param)).first()
-            if not branch_obj:
-                branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
-
-        return branch_obj, start_date, end_date, start_dt, end_dt
 
     # --------------------------------------------------------------------------
     # 1. /purchases-analytics/purchases-overview/
@@ -10460,7 +10183,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
 
             if start_dt and end_dt:
                 po_qs = po_qs.filter(
-                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                    Q(purchase_date__range=(start_dt, end_dt))
                 )
             if start_date and end_date:
                 return_qs = return_qs.filter(date__range=(start_date, end_date))
@@ -10539,7 +10262,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                 po_qs = po_qs.filter(branch=branch_obj)
             if start_dt and end_dt:
                 po_qs = po_qs.filter(
-                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                    Q(purchase_date__range=(start_dt, end_dt))
                 )
 
             results = []
@@ -10634,7 +10357,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                 po_qs = po_qs.filter(branch=branch_obj)
             if start_dt and end_dt:
                 po_qs = po_qs.filter(
-                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                    Q(purchase_date__range=(start_dt, end_dt))
                 )
 
             results = []
@@ -10669,7 +10392,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                 po_qs = po_qs.filter(branch=branch_obj)
             if start_dt and end_dt:
                 po_qs = po_qs.filter(
-                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                    Q(purchase_date__range=(start_dt, end_dt))
                 )
 
             results = []
@@ -10750,7 +10473,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
 
                 if start_dt and end_dt:
                     po_qs = po_qs.filter(
-                        Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                        Q(purchase_date__range=(start_dt, end_dt))
                     )
 
                 po_count = po_qs.count()
@@ -10798,7 +10521,7 @@ class PurchaseAnalyticsViewSet(viewsets.ViewSet):
                 adhoc_po_qs = adhoc_po_qs.filter(branch=branch_obj)
             if start_dt and end_dt:
                 adhoc_po_qs = adhoc_po_qs.filter(
-                    Q(purchase_date__range=(start_dt, end_dt)) | Q(created_at__range=(start_dt, end_dt))
+                    Q(purchase_date__range=(start_dt, end_dt))
                 )
 
             adhoc_suppliers = adhoc_po_qs.values_list('supplier_name', flat=True).distinct()
@@ -11247,73 +10970,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         return all_found
 
     def _get_branch_and_dates(self, request):
-        branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
-        period_type = (request.query_params.get("period_type") or request.query_params.get("period") or "").lower()
-        selected_date_str = request.query_params.get("selectedDate") or request.query_params.get("date")
-        year_param = request.query_params.get("year")
-        month_param = request.query_params.get("month")
+        return _get_reporting_filters(request, default_period="month")
 
-        start_param = request.query_params.get("start_date") or request.query_params.get("startDate")
-        end_param = request.query_params.get("end_date") or request.query_params.get("endDate")
-
-        start_date = None
-        end_date = None
-
-        today = timezone.now().date()
-
-        if period_type in ["day", "daily"]:
-            ref_date = today
-            if selected_date_str:
-                try:
-                    ref_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-            start_date = ref_date
-            end_date = ref_date
-
-        elif period_type in ["week", "weekly"]:
-            ref_date = today
-            if selected_date_str:
-                try:
-                    ref_date = datetime.strptime(str(selected_date_str).strip(), "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-            start_date = ref_date - timedelta(days=ref_date.weekday())
-            end_date = start_date + timedelta(days=6)
-
-        elif period_type in ["month", "monthly"]:
-            y = int(year_param) if year_param and str(year_param).isdigit() else today.year
-            m = int(month_param) if month_param and str(month_param).isdigit() else today.month
-            start_date = date(y, m, 1)
-            last_day = calendar.monthrange(y, m)[1]
-            end_date = date(y, m, last_day)
-
-        elif period_type in ["year", "yearly"]:
-            y = int(year_param) if year_param and str(year_param).isdigit() else today.year
-            start_date = date(y, 1, 1)
-            end_date = date(y, 12, 31)
-
-        if not start_date or not end_date:
-            if start_param and end_param:
-                try:
-                    start_date = datetime.strptime(str(start_param).strip(), "%Y-%m-%d").date()
-                    end_date = datetime.strptime(str(end_param).strip(), "%Y-%m-%d").date()
-                except ValueError:
-                    pass
-
-        tz = timezone.get_current_timezone()
-        start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz) if start_date else None
-        end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz) if end_date else None
-
-        branch_obj = None
-        if branch_param and str(branch_param).strip().lower() not in ["all", "none", "", "null"]:
-            clean_param = str(branch_param).strip()
-            if clean_param.isdigit():
-                branch_obj = RetailBranch.objects.filter(pk=int(clean_param)).first()
-            if not branch_obj:
-                branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
-
-        return branch_obj, start_date, end_date, start_dt, end_dt
 
     def _generate_executive_insights(self, summary, fast_movers, slow_movers):
         notes = []
@@ -11368,7 +11026,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='detailed-report')
     def detailed_report(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
             sales_qs = SaleTransaction.objects.all()
             returns_qs = CustomerReturn.objects.all()
             repayment_qs = CreditRepayment.objects.all()
@@ -11509,6 +11167,21 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             daily_map = {}
             transaction_items_map = {}
 
+            # Decide the chart bucket once for the entire selected range.
+            trend_granularity = period_type
+            if trend_granularity == "custom":
+                span_days = (end_date - start_date).days + 1
+                if span_days <= 14:
+                    trend_granularity = "custom_day"
+                elif span_days <= 62:
+                    trend_granularity = "custom_week"
+                elif span_days <= 366:
+                    trend_granularity = "custom_month"
+                else:
+                    trend_granularity = "custom_year"
+            elif trend_granularity == "all":
+                trend_granularity = "all_year"
+
             for line in sale_items_qs:
                 qty = Decimal(str(line.quantity_sold or 0))
                 price = Decimal(str(line.unit_selling_price or 0))
@@ -11545,11 +11218,54 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 products_map[i_id]["discounts"] += line_disc_total
 
                 sale_dt = line.transaction.sale_date if line.transaction else None
-                day_str = sale_dt.strftime('%Y-%m-%d') if hasattr(sale_dt, 'strftime') else str(sale_dt)[:10] if sale_dt else "Unknown"
-                if day_str not in daily_map:
-                    daily_map[day_str] = {"date": day_str, "revenue": ZERO, "cogs": ZERO}
-                daily_map[day_str]["revenue"] += line_rev
-                daily_map[day_str]["cogs"] += line_cost
+                if sale_dt and timezone.is_aware(sale_dt):
+                    sale_dt = timezone.localtime(sale_dt)
+
+                if not sale_dt:
+                    sale_dt = timezone.localtime(timezone.now())
+
+                # Keep the x-axis readable for each selected period.
+                granularity = trend_granularity
+
+                if granularity == "day":
+                    bucket_key = sale_dt.strftime("%Y-%m-%d-%H")
+                    bucket_label = sale_dt.strftime("%H:00")
+                elif granularity == "week":
+                    bucket_key = sale_dt.strftime("%Y-%m-%d")
+                    bucket_label = sale_dt.strftime("%a")
+                elif granularity == "month":
+                    week_number = ((sale_dt.day - 1) // 7) + 1
+                    bucket_key = f"{sale_dt.year:04d}-{sale_dt.month:02d}-W{week_number}"
+                    bucket_label = f"Week {week_number}"
+                elif granularity == "year":
+                    bucket_key = sale_dt.strftime("%Y-%m")
+                    bucket_label = sale_dt.strftime("%b")
+                elif granularity == "custom_month":
+                    bucket_key = sale_dt.strftime("%Y-%m")
+                    bucket_label = sale_dt.strftime("%b %Y")
+                elif granularity in ("custom_year", "all_year"):
+                    bucket_key = sale_dt.strftime("%Y")
+                    bucket_label = sale_dt.strftime("%Y")
+                elif granularity == "custom_day":
+                    bucket_key = sale_dt.strftime("%Y-%m-%d")
+                    bucket_label = sale_dt.strftime("%d %b")
+                elif granularity == "custom_week":
+                    week_start = sale_dt.date() - timedelta(days=sale_dt.weekday())
+                    bucket_key = week_start.strftime("%Y-%m-%d")
+                    bucket_label = f"Week of {week_start.strftime('%d %b')}"
+                else:
+                    bucket_key = sale_dt.strftime("%Y")
+                    bucket_label = sale_dt.strftime("%Y")
+
+                if bucket_key not in daily_map:
+                    daily_map[bucket_key] = {
+                        "date": bucket_label,
+                        "period_start": bucket_key,
+                        "revenue": ZERO,
+                        "cogs": ZERO,
+                    }
+                daily_map[bucket_key]["revenue"] += line_rev
+                daily_map[bucket_key]["cogs"] += line_cost
 
                 if line.transaction_id:
                     if line.transaction_id not in transaction_items_map:
@@ -11565,6 +11281,66 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         "line_profit": float(line_rev - line_cost)
                     })
 
+            # Include empty periods as zeroes so the axis always shows the
+            # complete selected week/month/year, not only dates with transactions.
+            def ensure_trend_bucket(key, label):
+                daily_map.setdefault(key, {
+                    "date": label,
+                    "period_start": key,
+                    "revenue": ZERO,
+                    "cogs": ZERO,
+                })
+
+            if trend_granularity == "day":
+                for hour in range(24):
+                    key = f"{start_date:%Y-%m-%d}-{hour:02d}"
+                    ensure_trend_bucket(key, f"{hour:02d}:00")
+            elif trend_granularity == "week":
+                cursor = start_date
+                while cursor <= end_date:
+                    key = cursor.strftime("%Y-%m-%d")
+                    ensure_trend_bucket(key, cursor.strftime("%a"))
+                    cursor += timedelta(days=1)
+            elif trend_granularity == "month":
+                last_day = calendar.monthrange(start_date.year, start_date.month)[1]
+                max_week = ((last_day - 1) // 7) + 1
+                for week_number in range(1, max_week + 1):
+                    key = f"{start_date.year:04d}-{start_date.month:02d}-W{week_number}"
+                    ensure_trend_bucket(key, f"Week {week_number}")
+            elif trend_granularity == "year":
+                for month_number in range(1, 13):
+                    key = f"{start_date.year:04d}-{month_number:02d}"
+                    ensure_trend_bucket(key, calendar.month_abbr[month_number])
+            elif trend_granularity == "custom_day":
+                cursor = start_date
+                while cursor <= end_date:
+                    key = cursor.strftime("%Y-%m-%d")
+                    ensure_trend_bucket(key, cursor.strftime("%d %b"))
+                    cursor += timedelta(days=1)
+            elif trend_granularity == "custom_week":
+                cursor = start_date - timedelta(days=start_date.weekday())
+                last_week = end_date - timedelta(days=end_date.weekday())
+                while cursor <= last_week:
+                    key = cursor.strftime("%Y-%m-%d")
+                    ensure_trend_bucket(key, f"Week of {cursor.strftime('%d %b')}")
+                    cursor += timedelta(days=7)
+            elif trend_granularity == "custom_month":
+                cursor = date(start_date.year, start_date.month, 1)
+                while cursor <= end_date:
+                    key = cursor.strftime("%Y-%m")
+                    ensure_trend_bucket(key, cursor.strftime("%b %Y"))
+                    cursor = (
+                        date(cursor.year + 1, 1, 1)
+                        if cursor.month == 12
+                        else date(cursor.year, cursor.month + 1, 1)
+                    )
+            elif trend_granularity in ("custom_year", "all_year"):
+                first_year = start_date.year
+                last_year = end_date.year
+                for year_number in range(first_year, last_year + 1):
+                    key = str(year_number)
+                    ensure_trend_bucket(key, key)
+
             daily_trends = []
             for k, v in sorted(daily_map.items()):
                 if k == "Unknown":
@@ -11573,10 +11349,11 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 cogs_val = float(quantize_money(v["cogs"]))
                 profit_val = float(quantize_money(v["revenue"] - v["cogs"]))
                 daily_trends.append({
-                    "date": k,
+                    "date": v["date"],
+                    "period_start": v["period_start"],
                     "revenue": rev_val,
                     "cogs": cogs_val,
-                    "profit": max(0.0, profit_val)
+                    "profit": profit_val
                 })
 
             gross_profit = total_gross_revenue - total_cogs
@@ -11671,6 +11448,17 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             return Response({
                 "summary": summary_payload,
                 "daily_trends": daily_trends,
+                "trend_granularity": {
+                    "day": "hour",
+                    "week": "day",
+                    "month": "week",
+                    "year": "month",
+                    "custom_day": "day",
+                    "custom_week": "week",
+                    "custom_month": "month",
+                    "custom_year": "year",
+                    "all_year": "year",
+                }.get(trend_granularity, trend_granularity),
                 "payment_breakdown": payment_breakdown,
                 "payment_channel_breakdown": payment_channel_breakdown,
                 "fast_movers": fast_movers,
@@ -11705,7 +11493,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             export_type = (request.query_params.get("export_type") or request.query_params.get("type") or "summary").lower()
 
-            branch_obj, start_date, end_date, _, _ = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, _, _, _period = self._get_branch_and_dates(request)
             branch_name = branch_obj.name if branch_obj else "All Branches"
             period_str = f"{start_date.strftime('%b %d, %Y')} – {end_date.strftime('%b %d, %Y')}" if start_date and end_date else "All Time"
 
