@@ -8522,7 +8522,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 sale_date__lte=end_dt
             ).exclude(
                 payment_method__iexact='CREDIT'
-            ).prefetch_related('split_payments', 'payments')
+            ).prefetch_related('split_payments')
 
             repayments_qs = CreditRepayment.objects.filter(
                 Q(date__range=(start_date, end_date))
@@ -8702,7 +8702,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "net_increase_in_cash": 0.0,
                 "opening_cash": 0.0,
                 "closing_cash": 0.0,
-            }, status=status.HTTP_200_OK)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # =========================================================================
     # BALANCE SHEET REPORT
@@ -8712,7 +8712,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
 
-            sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).prefetch_related('split_payments', 'payments')
+            sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).prefetch_related('split_payments')
             repayments_qs = CreditRepayment.objects.filter(date__lte=end_date)
             expenses_qs = Expense.objects.filter(date__lte=end_date).exclude(description__icontains='Supplier Repayment')
             purchases_qs = Purchase.objects.filter(purchase_date__lte=end_dt)
@@ -8837,8 +8837,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
         except Exception as e:
             logger.exception("Balance Sheet Report Error: %s", e)
+            try:
+                _branch, _start_date, requested_end, _start_dt, _end_dt = self._get_branch_and_dates(request)
+                fallback_as_at_date = requested_end.strftime('%d %b %Y')
+            except Exception:
+                fallback_as_at_date = timezone.localdate().strftime('%d %b %Y')
             return Response({
-                "as_at_date": timezone.localdate().strftime('%d %b %Y'),
+                "as_at_date": fallback_as_at_date,
                 "assets": {"cash_bank_mpesa": 0.0, "customer_debts": 0.0, "inventory_stock": 0.0, "equipment": 0.0, "total_assets": 0.0},
                 "liabilities": {"supplier_debts": 0.0, "bank_overdraft": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
                 "equity": {"capital_and_retained_profits": 0.0},
@@ -8856,7 +8861,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             sales_qs = SaleTransaction.objects.filter(
                 sale_date__gte=start_dt,
                 sale_date__lte=end_dt
-            ).prefetch_related('split_payments', 'payments')
+            ).prefetch_related('split_payments')
 
             repayments_qs = CreditRepayment.objects.filter(
                 Q(date__range=(start_date, end_date))
@@ -9047,7 +9052,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "results": [],
                 "entries": [],
                 "records": []
-            }, status=status.HTTP_200_OK)        
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)        
 
     # =========================================================================
     # PDF EXPORT ACTIONS
