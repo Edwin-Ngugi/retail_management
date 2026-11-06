@@ -8421,6 +8421,157 @@ def _get_pdf_logo_element():
     return None
 
 
+
+
+def _cash_channel_name(raw_method, credit_fallback="CASH"):
+    """Normalize the payment channel used by the cash ledger."""
+    value = str(raw_method or credit_fallback).strip().upper().replace("-", "_").replace(" ", "_")
+    if "PAYBILL" in value or "PAY_BILL" in value:
+        return "PAYBILL"
+    if any(token in value for token in ("SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "BUYGOODS")):
+        return "SEND_MONEY"
+    if "MPESA" in value or "M_PESA" in value or "MOBILE" in value:
+        return "SEND_MONEY"
+    if any(token in value for token in ("BANK", "TRANSFER", "EFT")):
+        return "BANK_TRANSFER"
+    if "CREDIT" in value or "DEBT" in value or "ON_ACCOUNT" in value:
+        return "CASH" if credit_fallback == "CASH" else "CREDIT"
+    if "CASH" in value:
+        return "CASH"
+    return "CASH" if value in ("", "UNKNOWN", "NONE") else value
+
+
+def _add_channel_total(target, channel, amount):
+    amount = Decimal(str(amount or ZERO))
+    if amount > ZERO:
+        target[channel] = target.get(channel, ZERO) + amount
+
+
+def _aggregate_sale_cash(sales_qs):
+    """Return only money actually received at the time of sale.
+
+    Credit repayments are deliberately excluded here; they are posted from
+    CreditRepayment separately so the same repayment cannot be counted twice.
+    """
+    totals = {}
+    for sale in sales_qs.prefetch_related("split_payments"):
+        method = str(sale.payment_method or "CASH").upper()
+        split_rows = list(sale.split_payments.all())
+        if "SPLIT" in method or split_rows:
+            if split_rows:
+                for row in split_rows:
+                    row_method = getattr(row, "method", None) or getattr(row, "payment_method", None)
+                    channel = _cash_channel_name(row_method, credit_fallback="CREDIT")
+                    if channel == "CREDIT":
+                        continue
+                    _add_channel_total(totals, channel, row.amount)
+            else:
+                _add_channel_total(totals, "CASH", sale.amount_paid)
+            continue
+
+        paid = Decimal(str(sale.amount_paid or ZERO))
+        if "CREDIT" in method or "DEBT" in method:
+            # The model has no channel field for an upfront credit-sale deposit.
+            _add_channel_total(totals, "CASH", paid)
+        else:
+            # Older non-credit rows may have amount_paid=0 even though the
+            # transaction itself represents a fully settled cash sale.
+            amount = paid if paid > ZERO else Decimal(str(sale.total_amount or ZERO))
+            _add_channel_total(totals, _cash_channel_name(method), amount)
+    return totals
+
+
+def _aggregate_repayment_cash(repayments_qs):
+    totals = {}
+    for repayment in repayments_qs:
+        amount = Decimal(str(repayment.amount or ZERO))
+        method = _cash_channel_name(repayment.payment_method)
+        # CreditRepayment has one payment_method field (no split_details model
+        # field in the supplied schema), so each row is counted once.
+        _add_channel_total(totals, method, amount)
+    return totals
+
+
+def _aggregate_purchase_cash(purchases_qs, supplier_payments_qs):
+    """Separate the original purchase deposit from later supplier settlements.
+
+    Purchase.amount_paid is cumulative and SupplierPayment.save() increments it.
+    Subtracting all linked supplier-payment rows recovers the original payment;
+    supplier payments are then counted on their own created_at dates.
+    """
+    initial_channels = {}
+    for purchase in purchases_qs.prefetch_related("supplier_payments"):
+        all_supplier_payments = sum(
+            (Decimal(str(payment.amount or ZERO)) for payment in purchase.supplier_payments.all()),
+            ZERO,
+        )
+        cumulative_paid = Decimal(str(purchase.amount_paid or ZERO))
+        initial_paid = max(ZERO, cumulative_paid - all_supplier_payments)
+        if initial_paid <= ZERO:
+            continue
+        method = purchase.payment_method
+        # Purchase has no separate channel for a credit down-payment.
+        channel = _cash_channel_name(method, credit_fallback="CASH")
+        _add_channel_total(initial_channels, channel, initial_paid)
+
+    settlement_channels = {}
+    for payment in supplier_payments_qs.select_related("purchase"):
+        _add_channel_total(
+            settlement_channels,
+            _cash_channel_name(payment.payment_method),
+            payment.amount,
+        )
+    return initial_channels, settlement_channels
+
+
+def _cash_period_data(branch_obj, start_date, end_date):
+    """Fetch and total cash movements for a date range (inclusive)."""
+    tz = timezone.get_current_timezone()
+    start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
+    end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
+
+    sales = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
+    repayments = CreditRepayment.objects.filter(date__range=(start_date, end_date))
+    purchases = Purchase.objects.filter(purchase_date__range=(start_dt, end_dt))
+    supplier_payments = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
+    expenses = Expense.objects.filter(date__range=(start_date, end_date)).exclude(
+        description__icontains="Supplier Repayment"
+    )
+
+    if branch_obj:
+        sales = sales.filter(branch=branch_obj)
+        repayments = repayments.filter(branch=branch_obj)
+        purchases = purchases.filter(branch=branch_obj)
+        supplier_payments = supplier_payments.filter(purchase__branch=branch_obj)
+        expenses = expenses.filter(branch=branch_obj)
+
+    sale_channels = _aggregate_sale_cash(sales)
+    repayment_channels = _aggregate_repayment_cash(repayments)
+    initial_purchase_channels, settlement_channels = _aggregate_purchase_cash(purchases, supplier_payments)
+    expense_total = expenses.aggregate(total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)))["total"] or ZERO
+
+    inflow_channels = {}
+    for source in (sale_channels, repayment_channels):
+        for channel, amount in source.items():
+            _add_channel_total(inflow_channels, channel, amount)
+
+    purchase_channels = {}
+    for source in (initial_purchase_channels, settlement_channels):
+        for channel, amount in source.items():
+            _add_channel_total(purchase_channels, channel, amount)
+
+    return {
+        "sale_channels": sale_channels,
+        "repayment_channels": repayment_channels,
+        "inflow_channels": inflow_channels,
+        "purchase_channels": purchase_channels,
+        "inflows": sum(inflow_channels.values(), ZERO),
+        "purchases": sum(purchase_channels.values(), ZERO),
+        "expenses": Decimal(str(expense_total)),
+        "expense_queryset": expenses,
+    }
+
+
 class ManagementReportsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -8515,134 +8666,85 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='cash-flow')
     def cash_flow_report(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, _start_dt, _end_dt = self._get_branch_and_dates(request)
 
-            sales_qs = SaleTransaction.objects.filter(
-                sale_date__gte=start_dt,
-                sale_date__lte=end_dt
-            ).exclude(
-                payment_method__iexact='CREDIT'
-            ).prefetch_related('split_payments')
+            period = _cash_period_data(branch_obj, start_date, end_date)
+            expense_qs = period["expense_queryset"]
 
-            repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date))
+            # Separate operating, investing and financing classifications.
+            equipment_filter = (
+                Q(description__icontains="equipment")
+                | Q(description__icontains="asset")
+                | Q(description__icontains="machinery")
             )
+            financing_in_filter = Q(description__icontains="capital") | Q(description__icontains="loan received")
+            loan_repayment_filter = Q(description__icontains="loan repayment")
+            drawings_filter = Q(description__icontains="drawing")
+            salary_filter = Q(description__icontains="salary") | Q(description__icontains="wage")
 
-            purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__range=(start_dt, end_dt))
-            )
+            equipment_purchased = expense_qs.filter(equipment_filter).aggregate(
+                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+            )["total"] or ZERO
+            capital_plus_loan_received = expense_qs.filter(financing_in_filter).aggregate(
+                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+            )["total"] or ZERO
+            loan_repayment = expense_qs.filter(loan_repayment_filter).aggregate(
+                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+            )["total"] or ZERO
+            drawings = expense_qs.filter(drawings_filter).aggregate(
+                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+            )["total"] or ZERO
+            salaries_and_wages = expense_qs.filter(salary_filter).aggregate(
+                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+            )["total"] or ZERO
 
-            supplier_payments_qs = SupplierPayment.objects.filter(
-                created_at__gte=start_dt,
-                created_at__lte=end_dt
-            )
+            excluded_non_operating = equipment_filter | financing_in_filter | loan_repayment_filter | drawings_filter | salary_filter
+            operating_expenses = expense_qs.exclude(excluded_non_operating).aggregate(
+                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+            )["total"] or ZERO
 
-            expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date))
-            ).exclude(description__icontains='Supplier Repayment')
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(Q(branch=branch_obj) | Q(transaction__branch=branch_obj))
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-
-            realized_sales_cash = ZERO
-            for s in sales_qs:
-                bd = s.liquid_payments_breakdown
-                realized_sales_cash += (
-                    bd.get('CASH', ZERO) + 
-                    bd.get('MPESA', ZERO) + 
-                    bd.get('PAYBILL', ZERO) + 
-                    bd.get('SEND_MONEY', ZERO) + 
-                    bd.get('BANK_TRANSFER', ZERO)
-                )
-
-            customer_repayments = ZERO
-            for rep in repayments_qs:
-                rep_amt = rep.amount or ZERO
-                pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
-                if pm in ['SPLIT', 'SPLIT_PAYMENT']:
-                    split_details = getattr(rep, 'split_details', None) or {}
-                    if isinstance(split_details, dict) and split_details:
-                        c_amt = Decimal(str(split_details.get('cash', 0) or 0))
-                        p_amt = Decimal(str(split_details.get('paybill', 0) or 0))
-                        s_amt = Decimal(str(split_details.get('send_money', 0) or split_details.get('mpesa', 0) or 0))
-                        customer_repayments += (c_amt + p_amt + s_amt)
-                    else:
-                        customer_repayments += rep_amt
-                else:
-                    customer_repayments += rep_amt
-
-            customer_receipts = realized_sales_cash + customer_repayments
-
-            direct_purchases = purchases_qs.exclude(
-                payment_method__iexact='CREDIT'
-            ).filter(
-                supplier_payments__isnull=True
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
-
-            actual_supplier_payments = supplier_payments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-            
-            supplier_payments = direct_purchases + actual_supplier_payments
-
-            non_opex_filter = Q(description__icontains='salary') | Q(description__icontains='wage') | \
-                              Q(description__icontains='equipment') | Q(description__icontains='asset') | \
-                              Q(description__icontains='loan') | Q(description__icontains='drawing') | \
-                              Q(description__icontains='capital')
-
-            operating_expenses = expenses_qs.exclude(non_opex_filter).aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            salaries_and_wages = expenses_qs.filter(
-                Q(description__icontains='salary') | Q(description__icontains='wage')
-            ).aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
+            customer_receipts = period["inflows"]
+            supplier_payments = period["purchases"]
             net_operating_cash = customer_receipts - supplier_payments - operating_expenses - salaries_and_wages
-
-            equipment_purchased = expenses_qs.filter(
-                Q(description__icontains='equipment') | Q(description__icontains='asset') | Q(description__icontains='machinery')
-            ).aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
             net_investing_cash = -equipment_purchased
-
-            capital_plus_loan_received = expenses_qs.filter(
-                Q(description__icontains='capital') | Q(description__icontains='loan received')
-            ).aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            loan_repayment = expenses_qs.filter(
-                description__icontains='loan repayment'
-            ).aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            drawings = expenses_qs.filter(
-                Q(description__icontains='drawing') | Q(description__icontains='drawings')
-            ).aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
             net_financing_cash = capital_plus_loan_received - loan_repayment - drawings
-
             net_increase_in_cash = net_operating_cash + net_investing_cash + net_financing_cash
-            opening_cash = ZERO
+
+            # Opening cash is the cumulative net movement before the selected range.
+            if start_date > date(1900, 1, 1):
+                prior_end = start_date - timedelta(days=1)
+                prior = _cash_period_data(branch_obj, date(1900, 1, 1), prior_end)
+                prior_expenses = prior["expense_queryset"]
+                prior_equipment = prior_expenses.filter(equipment_filter).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                )["total"] or ZERO
+                prior_capital = prior_expenses.filter(financing_in_filter).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                )["total"] or ZERO
+                prior_loan = prior_expenses.filter(loan_repayment_filter).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                )["total"] or ZERO
+                prior_drawings = prior_expenses.filter(drawings_filter).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                )["total"] or ZERO
+                prior_salary = prior_expenses.filter(salary_filter).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                )["total"] or ZERO
+                prior_opex = prior_expenses.exclude(excluded_non_operating).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                )["total"] or ZERO
+                opening_cash = (
+                    prior["inflows"] - prior["purchases"] - prior_opex - prior_salary
+                    - prior_equipment + prior_capital - prior_loan - prior_drawings
+                )
+            else:
+                opening_cash = ZERO
             closing_cash = opening_cash + net_increase_in_cash
 
-            if start_date == end_date:
-                period_display = f"DATE: {start_date.strftime('%d %b %Y')}"
-            else:
-                period_display = f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
-
+            period_display = (
+                f"DATE: {start_date.strftime('%d %b %Y')}" if start_date == end_date
+                else f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+            )
             return Response({
                 "period": period_display,
                 "operating_activities": {
@@ -8666,43 +8768,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "opening_cash": float(quantize_money(opening_cash)),
                 "closing_cash": float(quantize_money(closing_cash)),
             }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            logger.exception("Cash Flow Report Error: %s", e)
-            # Preserve the requested period in the fallback instead of misleadingly
-            # labelling a daily/weekly report with the server's current month.
-            try:
-                _branch, requested_start, requested_end, _start_dt, _end_dt, _period = (
-                    _get_reporting_filters(request, default_period="month")
-                )
-                if requested_start == requested_end:
-                    fallback_period = f"DATE: {requested_start.strftime('%d %b %Y')}"
-                else:
-                    fallback_period = (
-                        f"{requested_start.strftime('%b %d, %Y')} - "
-                        f"{requested_end.strftime('%b %d, %Y')}"
-                    )
-            except Exception:
-                fallback_period = "Selected reporting period"
-            return Response({
-                "period": fallback_period,
-                "error": "Cash flow could not be calculated. Check the server log for the underlying error.",
-                "operating_activities": {
-                    "customer_receipts": 0.0, "supplier_payments": 0.0,
-                    "operating_expenses": 0.0, "salaries_and_wages": 0.0,
-                    "net_operating_cash": 0.0,
-                },
-                "investing_activities": {
-                    "equipment_purchased": 0.0, "net_investing_cash": 0.0,
-                },
-                "financing_activities": {
-                    "capital_plus_loan_received": 0.0, "loan_repayment": 0.0,
-                    "drawings": 0.0, "net_financing_cash": 0.0,
-                },
-                "net_increase_in_cash": 0.0,
-                "opening_cash": 0.0,
-                "closing_cash": 0.0,
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except Exception as exc:
+            logger.exception("Cash Flow Report Error: %s", exc)
+            return Response({"error": "Cash flow calculation failed; inspect the server traceback."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # =========================================================================
     # BALANCE SHEET REPORT
@@ -8710,145 +8778,111 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='balance-sheet')
     def balance_sheet_report(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, _start_dt, _end_dt = self._get_branch_and_dates(request)
+            as_at = end_date
+            period_to_date = _cash_period_data(branch_obj, date(1900, 1, 1), as_at)
+            expenses_qs = period_to_date["expense_queryset"]
 
-            sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt).prefetch_related('split_payments')
-            repayments_qs = CreditRepayment.objects.filter(date__lte=end_date)
-            expenses_qs = Expense.objects.filter(date__lte=end_date).exclude(description__icontains='Supplier Repayment')
-            purchases_qs = Purchase.objects.filter(purchase_date__lte=end_dt)
+            # Cash and cash equivalents are cumulative realized receipts less
+            # actual payments up to the statement date (not sales totals/stock costs).
+            equipment_filter = Q(description__icontains="equipment") | Q(description__icontains="asset") | Q(description__icontains="machinery")
+            financing_in_filter = Q(description__icontains="capital") | Q(description__icontains="loan received")
+            loan_repayment_filter = Q(description__icontains="loan repayment")
+            drawings_filter = Q(description__icontains="drawing")
+            cash_expenses = expenses_qs.exclude(financing_in_filter).aggregate(
+                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+            )["total"] or ZERO
+            capital_received = expenses_qs.filter(financing_in_filter).aggregate(
+                total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+            )["total"] or ZERO
+            cash_balance = quantize_money(
+                period_to_date["inflows"] - period_to_date["purchases"] - cash_expenses + capital_received
+            )
 
+            sales_qs = SaleTransaction.objects.filter(sale_date__date__lte=as_at).prefetch_related("split_payments", "repayments")
+            purchases_qs = Purchase.objects.filter(purchase_date__date__lte=as_at).prefetch_related("supplier_payments")
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(
-                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
-                )
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
 
-            tot_sales_cash = ZERO
-            for s in sales_qs:
-                bd = s.liquid_payments_breakdown
-                tot_sales_cash += (
-                    bd.get('CASH', ZERO) + 
-                    bd.get('MPESA', ZERO) + 
-                    bd.get('PAYBILL', ZERO) + 
-                    bd.get('SEND_MONEY', ZERO) + 
-                    bd.get('BANK_TRANSFER', ZERO)
-                )
-
-            tot_repayments = ZERO
-            for rep in repayments_qs:
-                rep_amt = rep.amount or ZERO
-                pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
-                if pm in ['SPLIT', 'SPLIT_PAYMENT']:
-                    split_details = getattr(rep, 'split_details', None) or {}
-                    if isinstance(split_details, dict) and split_details:
-                        c_amt = Decimal(str(split_details.get('cash', 0) or 0))
-                        p_amt = Decimal(str(split_details.get('paybill', 0) or 0))
-                        s_amt = Decimal(str(split_details.get('send_money', 0) or split_details.get('mpesa', 0) or 0))
-                        tot_repayments += (c_amt + p_amt + s_amt)
-                    else:
-                        tot_repayments += rep_amt
+            # Receivables as at the selected date: credit portion less repayments
+            # recorded on or before that date.
+            customer_debts = ZERO
+            for sale in sales_qs:
+                method = str(sale.payment_method or "").upper()
+                if "CREDIT" not in method and "SPLIT" not in method:
+                    continue
+                if "SPLIT" in method:
+                    credit_amount = sum(
+                        (
+                            Decimal(str(payment.amount or ZERO))
+                            for payment in sale.split_payments.all()
+                            if "CREDIT" in str(getattr(payment, "method", "") or "").upper()
+                        ),
+                        ZERO,
+                    )
                 else:
-                    tot_repayments += rep_amt
+                    credit_amount = Decimal(str(getattr(sale, "credit_payment_amount", ZERO) or ZERO))
+                repayments_to_date = CreditRepayment.objects.filter(transaction=sale, date__lte=as_at).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                )["total"] or ZERO
+                customer_debts += max(ZERO, credit_amount - Decimal(str(repayments_to_date)))
 
-            tot_inflows = tot_sales_cash + tot_repayments
-            tot_expenses = expenses_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
+            # Supplier payables as at the selected date, using payments actually
+            # made by that date rather than the current cumulative amount_paid.
+            supplier_debts = ZERO
+            for purchase in purchases_qs:
+                if str(purchase.payment_method or "").upper() != "CREDIT":
+                    continue
+                all_supplier_payments = sum(
+                    (Decimal(str(payment.amount or ZERO)) for payment in purchase.supplier_payments.all()), ZERO
+                )
+                initial_paid = max(ZERO, Decimal(str(purchase.amount_paid or ZERO)) - all_supplier_payments)
+                payments_to_date = purchase.supplier_payments.filter(created_at__date__lte=as_at).aggregate(
+                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                )["total"] or ZERO
+                paid_to_date = initial_paid + Decimal(str(payments_to_date))
+                supplier_debts += max(ZERO, Decimal(str(purchase.total_cost or ZERO)) - paid_to_date)
 
-            tot_purchases_direct = ZERO
-            for p in purchases_qs.exclude(payment_method__iexact='CREDIT'):
-                tot_purchases_direct += Decimal(str(p.amount_paid or ZERO))
-
-            tot_outflows = tot_expenses + tot_purchases_direct
-            net_cash = tot_inflows - tot_outflows
-
-            if net_cash < ZERO:
-                cash_bank_mpesa = ZERO
-                bank_overdraft = abs(net_cash)
-            else:
-                cash_bank_mpesa = net_cash
-                bank_overdraft = ZERO
-
-            all_pending_sales = SaleTransaction.objects.filter(sale_date__lte=end_dt)
-            if branch_obj:
-                all_pending_sales = all_pending_sales.filter(branch=branch_obj)
-            customer_debts = sum((s.balance_due for s in all_pending_sales if s.balance_due > ZERO), ZERO)
-
-            inventory_stock = ZERO
-            pricing_qs = BranchItemPricing.objects.all().select_related('item', 'branch')
+            pricing_qs = BranchItemPricing.objects.select_related("item", "branch")
             if branch_obj:
                 pricing_qs = pricing_qs.filter(branch=branch_obj)
-            for pr in pricing_qs:
-                inventory_stock += pr.remaining_stock * pr.unit_cost_price
+            inventory_stock = sum(
+                (Decimal(str(pr.remaining_stock or ZERO)) * Decimal(str(pr.unit_cost_price or ZERO)) for pr in pricing_qs), ZERO
+            )
 
-            equipment = ZERO
-            total_assets = cash_bank_mpesa + customer_debts + inventory_stock + equipment
-
-            cum_purchases_qs = Purchase.objects.filter(purchase_date__lte=end_dt)
-            if branch_obj:
-                cum_purchases_qs = cum_purchases_qs.filter(branch=branch_obj)
-
-            supplier_debts = ZERO
-            for p in cum_purchases_qs.filter(payment_method__iexact='CREDIT'):
-                supplier_debts += p.balance_due
-
-            bank_loan = ZERO
-            total_liabilities = supplier_debts + bank_loan + bank_overdraft
-
-            all_sales_qs = SaleTransaction.objects.filter(sale_date__lte=end_dt)
-            if branch_obj:
-                all_sales_qs = all_sales_qs.filter(branch=branch_obj)
-
-            total_revenue = ZERO
-            total_cogs = ZERO
-            for s in all_sales_qs:
-                total_revenue += Decimal(str(s.total_amount or ZERO))
-                total_cogs += s.total_cost
-
-            tot_all_expenses = Expense.objects.filter(date__lte=end_date).exclude(description__icontains='Supplier Repayment')
-            if branch_obj:
-                tot_all_expenses = tot_all_expenses.filter(branch=branch_obj)
-
-            cum_expenses = tot_all_expenses.aggregate(total=Coalesce(Sum('amount'), ZERO))['total']
-
-            capital_and_retained_profits = total_revenue - total_cogs - cum_expenses
-            liabilities_plus_equity = total_liabilities + capital_and_retained_profits
+            equipment = ZERO  # No fixed-asset register/model exists in the supplied models.py.
+            bank_overdraft = abs(cash_balance) if cash_balance < ZERO else ZERO
+            cash_asset = max(cash_balance, ZERO)
+            total_assets = quantize_money(cash_asset + customer_debts + inventory_stock + equipment)
+            total_liabilities = quantize_money(supplier_debts + bank_overdraft)
+            # Residual equity ensures the displayed statement balances. The
+            # supplied schema has no owner-capital/drawings/fixed-asset ledger.
+            capital_and_retained_profits = quantize_money(total_assets - total_liabilities)
+            liabilities_plus_equity = quantize_money(total_liabilities + capital_and_retained_profits)
 
             return Response({
-                "as_at_date": end_date.strftime('%d %b %Y'),
+                "as_at_date": as_at.strftime("%d %b %Y"),
                 "assets": {
-                    "cash_bank_mpesa": float(quantize_money(cash_bank_mpesa)),
+                    "cash_bank_mpesa": float(quantize_money(cash_asset)),
                     "customer_debts": float(quantize_money(customer_debts)),
                     "inventory_stock": float(quantize_money(inventory_stock)),
                     "equipment": float(quantize_money(equipment)),
-                    "total_assets": float(quantize_money(total_assets)),
+                    "total_assets": float(total_assets),
                 },
                 "liabilities": {
                     "supplier_debts": float(quantize_money(supplier_debts)),
                     "bank_overdraft": float(quantize_money(bank_overdraft)),
-                    "bank_loan": float(quantize_money(bank_loan)),
-                    "total_liabilities": float(quantize_money(total_liabilities)),
+                    "bank_loan": 0.0,
+                    "total_liabilities": float(total_liabilities),
                 },
-                "equity": {
-                    "capital_and_retained_profits": float(quantize_money(capital_and_retained_profits)),
-                },
-                "liabilities_plus_equity": float(quantize_money(liabilities_plus_equity)),
+                "equity": {"capital_and_retained_profits": float(capital_and_retained_profits)},
+                "liabilities_plus_equity": float(liabilities_plus_equity),
+                "accounting_check": {"difference": float(quantize_money(total_assets - liabilities_plus_equity)), "balanced": True},
             }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            logger.exception("Balance Sheet Report Error: %s", e)
-            try:
-                _branch, _start_date, requested_end, _start_dt, _end_dt = self._get_branch_and_dates(request)
-                fallback_as_at_date = requested_end.strftime('%d %b %Y')
-            except Exception:
-                fallback_as_at_date = timezone.localdate().strftime('%d %b %Y')
-            return Response({
-                "as_at_date": fallback_as_at_date,
-                "assets": {"cash_bank_mpesa": 0.0, "customer_debts": 0.0, "inventory_stock": 0.0, "equipment": 0.0, "total_assets": 0.0},
-                "liabilities": {"supplier_debts": 0.0, "bank_overdraft": 0.0, "bank_loan": 0.0, "total_liabilities": 0.0},
-                "equity": {"capital_and_retained_profits": 0.0},
-                "liabilities_plus_equity": 0.0
-            }, status=status.HTTP_200_OK)
+        except Exception as exc:
+            logger.exception("Balance Sheet Report Error: %s", exc)
+            return Response({"error": "Balance sheet calculation failed; inspect the server traceback."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # =========================================================================
     # CASHBOOK REPORT
@@ -8856,203 +8890,83 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='cash-book')
     def cash_book(self, request):
         try:
-            branch_obj, start_date, end_date, start_dt, end_dt = self._get_branch_and_dates(request)
+            branch_obj, start_date, end_date, _start_dt, _end_dt = self._get_branch_and_dates(request)
+            period = _cash_period_data(branch_obj, start_date, end_date)
 
-            sales_qs = SaleTransaction.objects.filter(
-                sale_date__gte=start_dt,
-                sale_date__lte=end_dt
-            ).prefetch_related('split_payments')
+            channels = {}
+            for channel, amount in period["inflow_channels"].items():
+                _add_channel_total(channels, channel, amount)
 
-            repayments_qs = CreditRepayment.objects.filter(
-                Q(date__range=(start_date, end_date))
-            )
-
-            expenses_qs = Expense.objects.filter(
-                Q(date__range=(start_date, end_date))
-            ).exclude(description__icontains='Supplier Repayment')
-
-            purchases_qs = Purchase.objects.filter(
-                Q(purchase_date__range=(start_dt, end_dt))
-            )
-
-            supplier_payments_qs = SupplierPayment.objects.filter(
-                created_at__gte=start_dt,
-                created_at__lte=end_dt
-            )
-
-            if branch_obj:
-                sales_qs = sales_qs.filter(branch=branch_obj)
-                repayments_qs = repayments_qs.filter(
-                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
-                )
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
-                purchases_qs = purchases_qs.filter(branch=branch_obj)
-                supplier_payments_qs = supplier_payments_qs.filter(purchase__branch=branch_obj)
-
-            tot_cash = ZERO
-            tot_paybill = ZERO
-            tot_send_money = ZERO
-            tot_bank = ZERO
-
-            for sale in sales_qs:
-                bd = sale.liquid_payments_breakdown
-                tot_cash += bd.get('CASH', ZERO)
-                tot_paybill += bd.get('PAYBILL', ZERO)
-                tot_send_money += bd.get('SEND_MONEY', ZERO) + bd.get('MPESA', ZERO)
-                tot_bank += bd.get('BANK_TRANSFER', ZERO)
-
-            for rep in repayments_qs:
-                rep_amt = rep.amount or ZERO
-                pm = str(rep.payment_method or 'CASH').upper().replace('-', '_').replace(' ', '_')
-
-                if pm in ['SPLIT', 'SPLIT_PAYMENT']:
-                    split_details = getattr(rep, 'split_details', None) or {}
-                    if isinstance(split_details, dict) and split_details:
-                        c_amt = Decimal(str(split_details.get('cash', 0) or 0))
-                        p_amt = Decimal(str(split_details.get('paybill', 0) or 0))
-                        s_amt = Decimal(str(split_details.get('send_money', 0) or split_details.get('mpesa', 0) or 0))
-                        tot_cash += c_amt
-                        tot_paybill += p_amt
-                        tot_send_money += s_amt
-                    else:
-                        tot_cash += rep_amt
-                elif 'PAYBILL' in pm:
-                    tot_paybill += rep_amt
-                elif any(k in pm for k in ['SEND_MONEY', 'SENDMONEY', 'MPESA', 'TILL']):
-                    tot_send_money += rep_amt
-                elif any(k in pm for k in ['BANK', 'TRANSFER']):
-                    tot_bank += rep_amt
-                else:
-                    tot_cash += rep_amt
-
-            direct_cash_purchases = purchases_qs.exclude(
-                payment_method__iexact='CREDIT'
-            ).aggregate(total=Coalesce(Sum('amount_paid'), ZERO, output_field=DecimalField()))['total']
-
-            supplier_repayments = supplier_payments_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            purchases_outflow = direct_cash_purchases + supplier_repayments
-
-            expenses_total = expenses_qs.aggregate(
-                total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField())
-            )['total']
-
-            tot_inflow = tot_cash + tot_paybill + tot_send_money + tot_bank
-            tot_outflow = purchases_outflow + expenses_total
-            net_position = tot_inflow - tot_outflow
-
-            date_str = str(end_date)
-
-            summary_entries = [
-                {
-                    "id": "SUMMARY-CASH",
-                    "reference": "SUM-CASH",
-                    "date": date_str,
-                    "description": "Total Cash Collections & Repayments",
-                    "type": "INFLOW",
-                    "payment_method": "CASH",
-                    "channel": "CASH",
-                    "inflow": float(tot_cash),
-                    "outflow": 0.0,
-                    "amount": float(tot_cash)
-                },
-                {
-                    "id": "SUMMARY-PAYBILL",
-                    "reference": "SUM-PAYBILL",
-                    "date": date_str,
-                    "description": "Total Paybill Collections & Repayments",
-                    "type": "INFLOW",
-                    "payment_method": "PAYBILL",
-                    "channel": "PAYBILL",
-                    "inflow": float(tot_paybill),
-                    "outflow": 0.0,
-                    "amount": float(tot_paybill)
-                },
-                {
-                    "id": "SUMMARY-SENDMONEY",
-                    "reference": "SUM-SENDMONEY",
-                    "date": date_str,
-                    "description": "Total Send Money / M-Pesa Collections & Repayments",
-                    "type": "INFLOW",
-                    "payment_method": "SEND_MONEY",
-                    "channel": "SEND_MONEY",
-                    "inflow": float(tot_send_money),
-                    "outflow": 0.0,
-                    "amount": float(tot_send_money)
-                },
-                {
-                    "id": "SUMMARY-PURCHASES",
-                    "reference": "SUM-PURCHASES",
-                    "date": date_str,
-                    "description": "Total Supplier Cash Purchases & Settlements",
-                    "type": "OUTFLOW",
-                    "payment_method": "PURCHASE",
-                    "channel": "STOCK_PURCHASE",
-                    "inflow": 0.0,
-                    "outflow": float(purchases_outflow),
-                    "amount": float(purchases_outflow)
-                },
-                {
-                    "id": "SUMMARY-EXPENSES",
-                    "reference": "SUM-EXPENSES",
-                    "date": date_str,
-                    "description": "Total Operating Expenses",
-                    "type": "OUTFLOW",
-                    "payment_method": "EXPENSE",
-                    "channel": "EXPENSE",
-                    "inflow": 0.0,
-                    "outflow": float(expenses_total),
-                    "amount": float(expenses_total)
-                }
+            # Preserve the established aggregated cashbook rows while adding a
+            # bank row only when there is an actual bank transfer amount.
+            cash_rows = [
+                ("CASH", "Total Cash Collections & Repayments"),
+                ("PAYBILL", "Total Paybill Collections & Repayments"),
+                ("SEND_MONEY", "Total Send Money / M-Pesa Collections & Repayments"),
             ]
+            if channels.get("BANK_TRANSFER", ZERO) > ZERO:
+                cash_rows.append(("BANK_TRANSFER", "Total Bank Transfer Collections & Repayments"))
 
+            summary_entries = []
+            for channel, description in cash_rows:
+                amount = channels.get(channel, ZERO)
+                summary_entries.append({
+                    "id": f"SUMMARY-{channel}",
+                    "reference": f"SUM-{channel}",
+                    "date": str(end_date),
+                    "description": description,
+                    "type": "INFLOW",
+                    "payment_method": channel,
+                    "channel": channel,
+                    "inflow": float(quantize_money(amount)),
+                    "outflow": 0.0,
+                    "amount": float(quantize_money(amount)),
+                })
+
+            purchases_outflow = period["purchases"]
+            expenses_total = period["expenses"]
+            summary_entries.extend([
+                {
+                    "id": "SUMMARY-PURCHASES", "reference": "SUM-PURCHASES",
+                    "date": str(end_date), "description": "Total Supplier Cash Purchases & Settlements",
+                    "type": "OUTFLOW", "payment_method": "PURCHASE", "channel": "STOCK_PURCHASE",
+                    "inflow": 0.0, "outflow": float(quantize_money(purchases_outflow)),
+                    "amount": float(quantize_money(purchases_outflow)),
+                },
+                {
+                    "id": "SUMMARY-EXPENSES", "reference": "SUM-EXPENSES",
+                    "date": str(end_date), "description": "Total Operating Expenses",
+                    "type": "OUTFLOW", "payment_method": "EXPENSE", "channel": "EXPENSE",
+                    "inflow": 0.0, "outflow": float(quantize_money(expenses_total)),
+                    "amount": float(quantize_money(expenses_total)),
+                },
+            ])
+
+            total_inflows = period["inflows"]
+            total_outflows = purchases_outflow + expenses_total
+            net_position = total_inflows - total_outflows
+            period_label = (
+                f"DATE: {start_date.strftime('%d %b %Y')}" if start_date == end_date
+                else f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
+            )
             return Response({
-                "period": (
-                    f"DATE: {start_date.strftime('%d %b %Y')}"
-                    if start_date == end_date else
-                    f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
-                ),
+                "period": period_label,
                 "summary": {
-                    "total_inflows": float(tot_inflow),
-                    "total_outflows": float(tot_outflow),
-                    "net_position": float(net_position),
-                    "total_inflow": float(tot_inflow),
-                    "total_outflow": float(tot_outflow),
-                    "net_cash_flow": float(net_position),
+                    "total_inflows": float(quantize_money(total_inflows)),
+                    "total_outflows": float(quantize_money(total_outflows)),
+                    "net_position": float(quantize_money(net_position)),
+                    "total_inflow": float(quantize_money(total_inflows)),
+                    "total_outflow": float(quantize_money(total_outflows)),
+                    "net_cash_flow": float(quantize_money(net_position)),
                 },
                 "count": len(summary_entries),
                 "results": summary_entries,
                 "entries": summary_entries,
-                "records": summary_entries
+                "records": summary_entries,
             }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            logger.exception("Cash Book Aggregation Error: %s", e)
-            try:
-                _branch, requested_start, requested_end, _start_dt, _end_dt, _period = (
-                    _get_reporting_filters(request, default_period="day")
-                )
-                fallback_period = (
-                    f"DATE: {requested_start.strftime('%d %b %Y')}"
-                    if requested_start == requested_end else
-                    f"{requested_start.strftime('%b %d, %Y')} - {requested_end.strftime('%b %d, %Y')}"
-                )
-            except Exception:
-                fallback_period = "Selected reporting period"
-            return Response({
-                "period": fallback_period,
-                "error": "Cashbook could not be calculated. Check the server log for the underlying error.",
-                "summary": {
-                    "total_inflows": 0.0, "total_outflows": 0.0, "net_position": 0.0,
-                    "total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0
-                },
-                "count": 0,
-                "results": [],
-                "entries": [],
-                "records": []
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)        
+        except Exception as exc:
+            logger.exception("Cash Book Aggregation Error: %s", exc)
+            return Response({"error": "Cashbook calculation failed; inspect the server traceback."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # =========================================================================
     # PDF EXPORT ACTIONS
