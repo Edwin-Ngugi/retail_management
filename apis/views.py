@@ -8569,7 +8569,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     def _get_branch_and_dates(self, request):
         """
         Extracts and sanitizes branch and date parameters across all report endpoints.
-        Strictly respects period_type over stale start_date/end_date query parameters.
+        Strictly prioritizes period_type over start_date/end_date query parameters.
         """
         branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
         period_type = str(
@@ -8591,12 +8591,11 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         except (ValueError, TypeError):
             month = now.month
 
-        # Robust Date Sanitizer (handles length > 10, invalid characters, whitespace)
+        # Strict Date Sanitizer
         def sanitize_date(val):
             if not val:
                 return None
             clean_str = str(val).strip()
-            # Handle corrupted dates like '2026-10-098' or ISO timestamps '2026-10-09T00:00:00'
             if len(clean_str) >= 10:
                 clean_str = clean_str[:10]
             try:
@@ -8614,7 +8613,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             request.query_params.get('end_date') or request.query_params.get('endDate')
         )
 
-        # Explicit routing based on period_type FIRST
+        # 1. EVALUATE PERIOD_TYPE FIRST BEFORE CHECKING START/END DATES
         if period_type in ['day', 'daily'] and selected_date:
             start_date = selected_date
             end_date = selected_date
@@ -8632,19 +8631,18 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             start_date = date(year, month, 1)
             end_date = date(year, month, last_day)
         else:
-            # Fallback evaluation
-            if start_date_param and end_date_param:
-                start_date = start_date_param
-                end_date = end_date_param
-            elif selected_date:
+            if selected_date:
                 start_date = selected_date
                 end_date = selected_date
+            elif start_date_param and end_date_param:
+                start_date = start_date_param
+                end_date = end_date_param
             else:
                 _, last_day = calendar.monthrange(year, month)
                 start_date = date(year, month, 1)
                 end_date = date(year, month, last_day)
 
-        # Datetime boundaries for query filtering
+        # Datetime boundaries for precise query filtering across DateTimeFields
         tz = timezone.get_current_timezone()
         start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
         end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
