@@ -8525,50 +8525,83 @@ def _aggregate_purchase_cash(purchases_qs, supplier_payments_qs):
 
 
 def _cash_period_data(branch_obj, start_date, end_date):
-    """Fetch and total cash movements for a date range (inclusive)."""
-    tz = timezone.get_current_timezone()
-    start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
-    end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
+    """
+    Calculates exact aggregated cash inflows across CASH, PAYBILL, and SEND_MONEY channels,
+    properly breaking down SPLIT transactions and Credit Repayments.
+    """
+    start_dt = timezone.make_aware(datetime.combine(start_date, time.min))
+    end_dt = timezone.make_aware(datetime.combine(end_date, time.max))
 
-    sales = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt))
-    repayments = CreditRepayment.objects.filter(date__range=(start_date, end_date))
-    purchases = Purchase.objects.filter(purchase_date__range=(start_dt, end_dt))
-    supplier_payments = SupplierPayment.objects.filter(created_at__range=(start_dt, end_dt))
-    expenses = Expense.objects.filter(date__range=(start_date, end_date)).exclude(
-        description__icontains="Supplier Repayment"
-    )
+    inflow_channels = {
+        "CASH": ZERO,
+        "PAYBILL": ZERO,
+        "SEND_MONEY": ZERO,
+        "BANK_TRANSFER": ZERO,
+    }
+
+    # 1. Fetch Sales within period
+    sales_qs = SaleTransaction.objects.filter(
+        sale_date__gte=start_dt,
+        sale_date__lte=end_dt
+    ).prefetch_related("split_payments")
 
     if branch_obj:
-        sales = sales.filter(branch=branch_obj)
-        repayments = repayments.filter(branch=branch_obj)
-        purchases = purchases.filter(branch=branch_obj)
-        supplier_payments = supplier_payments.filter(purchase__branch=branch_obj)
-        expenses = expenses.filter(branch=branch_obj)
+        sales_qs = sales_qs.filter(branch=branch_obj)
 
-    sale_channels = _aggregate_sale_cash(sales)
-    repayment_channels = _aggregate_repayment_cash(repayments)
-    initial_purchase_channels, settlement_channels = _aggregate_purchase_cash(purchases, supplier_payments)
-    expense_total = expenses.aggregate(total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2)))["total"] or ZERO
+    for sale in sales_qs:
+        norm_method = normalize_payment_channel(sale.payment_method)
 
-    inflow_channels = {}
-    for source in (sale_channels, repayment_channels):
-        for channel, amount in source.items():
-            _add_channel_total(inflow_channels, channel, amount)
+        if norm_method == "SPLIT":
+            # Breakdown each split payment line item individually
+            for sp in sale.split_payments.all():
+                sp_channel = normalize_payment_channel(sp.method)
+                if sp_channel in inflow_channels and sp_channel != "CREDIT":
+                    inflow_channels[sp_channel] += Decimal(str(sp.amount or ZERO))
+        elif norm_method in inflow_channels:
+            # Single non-credit method
+            sale_total = Decimal(str(sale.total_amount or ZERO))
+            inflow_channels[norm_method] += sale_total
 
-    purchase_channels = {}
-    for source in (initial_purchase_channels, settlement_channels):
-        for channel, amount in source.items():
-            _add_channel_total(purchase_channels, channel, amount)
+    # 2. Add Debt Repayments (CreditRepayment) within period
+    repayments_qs = CreditRepayment.objects.filter(
+        date__gte=start_date,
+        date__lte=end_date
+    )
+    if branch_obj:
+        repayments_qs = repayments_qs.filter(transaction__branch=branch_obj)
+
+    for repayment in repayments_qs:
+        rep_channel = normalize_payment_channel(getattr(repayment, "payment_method", "CASH"))
+        rep_amount = Decimal(str(repayment.amount or ZERO))
+        
+        # If mapped as MPESA/TILL, normalizer maps to SEND_MONEY
+        if rep_channel in inflow_channels and rep_channel != "CREDIT":
+            inflow_channels[rep_channel] += rep_amount
+
+    total_inflows = sum(inflow_channels.values(), ZERO)
+
+    # 3. Expenses and Purchases calculation
+    expense_qs = Expense.objects.filter(date__range=(start_date, end_date))
+    purchase_qs = Purchase.objects.filter(purchase_date__date__range=(start_date, end_date))
+
+    if branch_obj:
+        expense_qs = expense_qs.filter(branch=branch_obj)
+        purchase_qs = purchase_qs.filter(branch=branch_obj)
+
+    expenses_total = expense_qs.aggregate(
+        total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField())
+    )["total"]
+
+    purchases_total = purchase_qs.exclude(payment_method="CREDIT").aggregate(
+        total=Coalesce(Sum("amount_paid"), ZERO, output_field=DecimalField())
+    )["total"]
 
     return {
-        "sale_channels": sale_channels,
-        "repayment_channels": repayment_channels,
+        "inflows": total_inflows,
         "inflow_channels": inflow_channels,
-        "purchase_channels": purchase_channels,
-        "inflows": sum(inflow_channels.values(), ZERO),
-        "purchases": sum(purchase_channels.values(), ZERO),
-        "expenses": Decimal(str(expense_total)),
-        "expense_queryset": expenses,
+        "expenses": expenses_total,
+        "purchases": purchases_total,
+        "expense_queryset": expense_qs,
     }
 
 
