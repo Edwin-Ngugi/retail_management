@@ -8694,7 +8694,7 @@ def _cash_period_data(branch_obj, start_date, end_date):
         "expenses": expenses_total,
         "purchases": purchases_total,
         "expense_queryset": expense_qs,
-    }
+    } 
 
 
 class ManagementReportsViewSet(viewsets.ViewSet):
@@ -9008,21 +9008,38 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             branch_obj, start_date, end_date, _start_dt, _end_dt = self._get_branch_and_dates(request)
             period = _cash_period_data(branch_obj, start_date, end_date)
 
-            channels = {}
-            for raw_channel, amount in period["inflow_channels"].items():
-                norm_channel = normalize_payment_channel(raw_channel)
-                # Group MPESA into SEND_MONEY for display purposes in the Cashbook view if desired
-                if norm_channel == "MPESA":
-                    norm_channel = "SEND_MONEY"
-                channels[norm_channel] = channels.get(norm_channel, ZERO) + Decimal(str(amount or ZERO))
+            # 1. Cleanly aggregate raw inflow channels into standard UI keys
+            channels = {
+                "CASH": ZERO,
+                "PAYBILL": ZERO,
+                "SEND_MONEY": ZERO,
+                "BANK_TRANSFER": ZERO,
+            }
 
+            for raw_channel, amount in period.get("inflow_channels", {}).items():
+                amt = Decimal(str(amount or ZERO))
+                if amt <= ZERO:
+                    continue
+
+                ch_upper = str(raw_channel or "").upper().replace("-", "_").replace(" ", "_")
+
+                if "PAYBILL" in ch_upper:
+                    channels["PAYBILL"] += amt
+                elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "MPESA", "TILL", "BUY_GOODS"]):
+                    channels["SEND_MONEY"] += amt
+                elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
+                    channels["BANK_TRANSFER"] += amt
+                else:
+                    channels["CASH"] += amt
+
+            # 2. Define display rows
             cash_rows = [
                 ("CASH", "Total Cash Collections & Repayments"),
                 ("PAYBILL", "Total Paybill Collections & Repayments"),
                 ("SEND_MONEY", "Total Send Money / M-Pesa Collections & Repayments"),
             ]
 
-            if channels.get("BANK_TRANSFER", ZERO) > ZERO:
+            if channels["BANK_TRANSFER"] > ZERO:
                 cash_rows.append(("BANK_TRANSFER", "Total Bank Transfer Collections & Repayments"))
 
             summary_entries = []
@@ -9041,32 +9058,47 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     "amount": float(quantize_money(amount)),
                 })
 
-            purchases_outflow = period["purchases"]
-            expenses_total = period["expenses"]
+            # 3. Add Outflows (Purchases & Expenses)
+            purchases_outflow = Decimal(str(period.get("purchases") or ZERO))
+            expenses_total = Decimal(str(period.get("expenses") or ZERO))
+
             summary_entries.extend([
                 {
-                    "id": "SUMMARY-PURCHASES", "reference": "SUM-PURCHASES",
-                    "date": str(end_date), "description": "Total Supplier Cash Purchases & Settlements",
-                    "type": "OUTFLOW", "payment_method": "PURCHASE", "channel": "STOCK_PURCHASE",
-                    "inflow": 0.0, "outflow": float(quantize_money(purchases_outflow)),
+                    "id": "SUMMARY-PURCHASES", 
+                    "reference": "SUM-PURCHASES",
+                    "date": str(end_date), 
+                    "description": "Total Supplier Cash Purchases & Settlements",
+                    "type": "OUTFLOW", 
+                    "payment_method": "PURCHASE", 
+                    "channel": "STOCK_PURCHASE",
+                    "inflow": 0.0, 
+                    "outflow": float(quantize_money(purchases_outflow)),
                     "amount": float(quantize_money(purchases_outflow)),
                 },
                 {
-                    "id": "SUMMARY-EXPENSES", "reference": "SUM-EXPENSES",
-                    "date": str(end_date), "description": "Total Operating Expenses",
-                    "type": "OUTFLOW", "payment_method": "EXPENSE", "channel": "EXPENSE",
-                    "inflow": 0.0, "outflow": float(quantize_money(expenses_total)),
+                    "id": "SUMMARY-EXPENSES", 
+                    "reference": "SUM-EXPENSES",
+                    "date": str(end_date), 
+                    "description": "Total Operating Expenses",
+                    "type": "OUTFLOW", 
+                    "payment_method": "EXPENSE", 
+                    "channel": "EXPENSE",
+                    "inflow": 0.0, 
+                    "outflow": float(quantize_money(expenses_total)),
                     "amount": float(quantize_money(expenses_total)),
                 },
             ])
 
-            total_inflows = period["inflows"]
+            # Recalculate exact total inflows directly from normalized channels
+            total_inflows = sum(channels.values(), ZERO)
             total_outflows = purchases_outflow + expenses_total
             net_position = total_inflows - total_outflows
+
             period_label = (
                 f"DATE: {start_date.strftime('%d %b %Y')}" if start_date == end_date
                 else f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}"
             )
+
             return Response({
                 "period": period_label,
                 "summary": {
@@ -9082,9 +9114,13 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 "entries": summary_entries,
                 "records": summary_entries,
             }, status=status.HTTP_200_OK)
+
         except Exception as exc:
             logger.exception("Cash Book Aggregation Error: %s", exc)
-            return Response({"error": "Cashbook calculation failed; inspect the server traceback."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response(
+                {"error": "Cashbook calculation failed; inspect the server traceback."}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     # =========================================================================
     # PDF EXPORT ACTIONS

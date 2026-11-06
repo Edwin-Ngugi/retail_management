@@ -25,6 +25,7 @@ from .models import (
     PurchaseReturn,
     PurchaseOrder,
     PurchaseOrderItem,
+    CreditRepaymentSplit,
     RetailBranch,
     Sale,
     SaleItem,
@@ -867,12 +868,130 @@ class SalePaymentAdmin(TenantAwareModelAdmin):
     search_fields = ("reference_code", "transaction__receipt_number")
 
 
+class CreditRepaymentSplitInline(admin.TabularInline):
+    """
+    Renders split payment channels directly inside the CreditRepayment change form.
+    Allows cashiers/admins to break down split repayments by method and amount.
+    """
+    model = CreditRepaymentSplit
+    extra = 1
+    fields = ("method", "amount", "reference_code", "created_at")
+    readonly_fields = ("created_at",)
+    classes = ("collapse-entry",)
+
+
 @admin.register(CreditRepayment)
-class CreditRepaymentAdmin(TenantAwareModelAdmin):
-    list_display = ("customer", "transaction", "branch", "payment_method", "amount", "date", "created_by", "created_at")
-    list_filter = ("branch", "date", "payment_method")
-    search_fields = ("customer__name", "transaction__receipt_number", "branch__name", "notes")
-    autocomplete_fields = ["customer", "transaction", "branch", "created_by"]
+class CreditRepaymentAdmin(admin.ModelAdmin):
+    """
+    Admin configuration for primary CreditRepayment records.
+    Includes inline split rows, branch/customer filters, and quick calculations.
+    """
+    list_display = (
+        "id",
+        "customer",
+        "get_branch_name",
+        "payment_method",
+        "amount",
+        "get_split_count",
+        "date",
+        "created_at",
+    )
+    list_filter = (
+        "payment_method",
+        "branch",
+        "date",
+        "created_at",
+    )
+    search_fields = (
+        "customer__name",
+        "customer__phone_number",
+        "transaction__receipt_number",
+        "transaction__invoice_number",
+        "notes",
+    )
+    date_hierarchy = "date"
+    readonly_fields = ("created_at",)
+    autocomplete_fields = ("customer", "transaction", "branch", "created_by")
+    inlines = [CreditRepaymentSplitInline]
+
+    fieldsets = (
+        (
+            "Repayment Information",
+            {
+                "fields": (
+                    "customer",
+                    "transaction",
+                    "branch",
+                    "payment_method",
+                    "amount",
+                    "date",
+                )
+            },
+        ),
+        (
+            "Additional Details",
+            {
+                "fields": (
+                    "notes",
+                    "created_by",
+                    "created_at",
+                )
+            },
+        ),
+    )
+
+    @admin.display(description="Branch", ordering="branch__name")
+    def get_branch_name(self, obj):
+        if obj.branch:
+            return obj.branch.name
+        if obj.transaction and obj.transaction.branch:
+            return f"{obj.transaction.branch.name} (via Invoice)"
+        return "Unassigned Branch"
+
+    @admin.display(description="Split Lines")
+    def get_split_count(self, obj):
+        splits = obj.splits.all()
+        count = len(splits)
+        if count == 0:
+            return "-"
+        return f"{count} line(s)"
+
+
+@admin.register(CreditRepaymentSplit)
+class CreditRepaymentSplitAdmin(admin.ModelAdmin):
+    """
+    Standalone Admin UI for inspecting individual repayment split records across all branches.
+    """
+    list_display = (
+        "id",
+        "get_repayment_id",
+        "get_customer_name",
+        "method",
+        "amount",
+        "reference_code",
+        "created_at",
+    )
+    list_filter = (
+        "method",
+        "created_at",
+        "repayment__branch",
+    )
+    search_fields = (
+        "reference_code",
+        "repayment__customer__name",
+        "repayment__transaction__receipt_number",
+    )
+    readonly_fields = ("created_at",)
+    autocomplete_fields = ("repayment",)
+    ordering = ("-created_at",)
+
+    @admin.display(description="Repayment ID", ordering="repayment__id")
+    def get_repayment_id(self, obj):
+        return f"Repayment #{obj.repayment_id}"
+
+    @admin.display(description="Customer", ordering="repayment__customer__name")
+    def get_customer_name(self, obj):
+        return obj.repayment.customer.name if obj.repayment and obj.repayment.customer else "-"
 
 
 # =============================================================================
