@@ -8565,10 +8565,30 @@ def _cash_period_data(branch_obj, start_date, end_date):
     """
     Calculates exact aggregated cash inflows across CASH, PAYBILL, SEND_MONEY, and BANK_TRANSFER,
     properly routing both Sale and CreditRepayment split payment lines into their respective channels
-    while strictly preventing double counting.
+    while strictly preventing double counting and handling datetime type safety.
     """
-    start_dt = timezone.make_aware(datetime.combine(start_date, time.min))
-    end_dt = timezone.make_aware(datetime.combine(end_date, time.max))
+    # 1. Ensure date arguments are pure datetime.date instances
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+    if isinstance(end_date, datetime):
+        end_date = end_date.date()
+
+    # 2. Build timezone-aware start and end datetime bounds safely
+    current_tz = timezone.get_current_timezone()
+    
+    start_combined = datetime.combine(start_date, time.min)
+    end_combined = datetime.combine(end_date, time.max)
+
+    start_dt = (
+        timezone.make_aware(start_combined, current_tz)
+        if timezone.is_naive(start_combined)
+        else start_combined
+    )
+    end_dt = (
+        timezone.make_aware(end_combined, current_tz)
+        if timezone.is_naive(end_combined)
+        else end_combined
+    )
 
     inflow_channels = {
         "CASH": ZERO,
@@ -8577,7 +8597,7 @@ def _cash_period_data(branch_obj, start_date, end_date):
         "BANK_TRANSFER": ZERO,
     }
 
-    # 1. Direct Sales Inflows (Excludes Unpaid Credit Totals)
+    # 3. Direct Sales Inflows (Excludes Unpaid Credit Totals)
     sales_qs = SaleTransaction.objects.filter(
         sale_date__gte=start_dt,
         sale_date__lte=end_dt
@@ -8609,7 +8629,7 @@ def _cash_period_data(branch_obj, start_date, end_date):
             sale_paid = Decimal(str(sale.amount_paid if sale.amount_paid and sale.amount_paid > ZERO else sale.total_amount or ZERO))
             inflow_channels[norm_method] += sale_paid
 
-    # 2. Customer Debt Repayments (CreditRepayment)
+    # 4. Customer Debt Repayments (CreditRepayment)
     repayments_qs = CreditRepayment.objects.filter(
         date__gte=start_date,
         date__lte=end_date
@@ -8649,7 +8669,7 @@ def _cash_period_data(branch_obj, start_date, end_date):
 
     total_inflows = sum(inflow_channels.values(), ZERO)
 
-    # 3. Expenses and Supplier Purchases
+    # 5. Expenses and Supplier Purchases
     expense_qs = Expense.objects.filter(date__range=(start_date, end_date))
     purchase_qs = Purchase.objects.filter(purchase_date__range=(start_dt, end_dt))
 
@@ -8659,11 +8679,11 @@ def _cash_period_data(branch_obj, start_date, end_date):
 
     expenses_total = expense_qs.aggregate(
         total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField())
-    )["total"]
+    )["total"] or ZERO
 
     purchases_total = purchase_qs.exclude(payment_method="CREDIT").aggregate(
         total=Coalesce(Sum("amount_paid"), ZERO, output_field=DecimalField())
-    )["total"]
+    )["total"] or ZERO
 
     return {
         "inflows": total_inflows,
