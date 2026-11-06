@@ -886,6 +886,8 @@ class CreditRepaymentAdmin(admin.ModelAdmin):
     Admin configuration for primary CreditRepayment records.
     Includes inline split rows, branch/customer filters, and quick calculations.
     """
+    ordering = ("-id",)  # 👈 REQUIRED for autocomplete_fields in CreditRepaymentSplitAdmin
+    
     list_display = (
         "id",
         "customer",
@@ -978,7 +980,6 @@ class CreditRepaymentSplitAdmin(admin.ModelAdmin):
     list_filter = (
         "method",
         "created_at",
-        "repayment__branch",
     )
     search_fields = (
         "reference_code",
@@ -989,13 +990,22 @@ class CreditRepaymentSplitAdmin(admin.ModelAdmin):
     autocomplete_fields = ("repayment",)
     ordering = ("-created_at",)
 
+    def get_queryset(self, request):
+        # Prefetch relations to prevent N+1 queries and avoid NoneType errors
+        return super().get_queryset(request).select_related(
+            "repayment", 
+            "repayment__customer"
+        )
+
     @admin.display(description="Repayment ID", ordering="repayment__id")
     def get_repayment_id(self, obj):
-        return f"Repayment #{obj.repayment_id}"
+        return f"Repayment #{obj.repayment_id}" if obj.repayment_id else "-"
 
     @admin.display(description="Customer", ordering="repayment__customer__name")
     def get_customer_name(self, obj):
-        return obj.repayment.customer.name if obj.repayment and obj.repayment.customer else "-"
+        if obj.repayment and getattr(obj.repayment, "customer", None):
+            return getattr(obj.repayment.customer, "name", "-")
+        return "-"  
 
 
 # =============================================================================
