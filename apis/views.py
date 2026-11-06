@@ -8605,11 +8605,13 @@ def _cash_period_data(branch_obj, start_date, end_date):
     }
 
 
+
+
+
 def normalize_payment_channel(raw_method):
     """
-    Authoritative payment channel normalizer.
-    Maps string variants to canonical keys:
-    'CASH', 'PAYBILL', 'SEND_MONEY', 'BANK_TRANSFER', 'CREDIT', 'SPLIT', 'UNKNOWN'
+    Standardizes payment strings across all financial reports.
+    Returns: 'CASH', 'PAYBILL', 'SEND_MONEY', 'BANK_TRANSFER', 'CREDIT', 'SPLIT', or 'UNKNOWN'
     """
     if not raw_method:
         return "CASH"
@@ -8634,6 +8636,83 @@ def normalize_payment_channel(raw_method):
         return "SPLIT"
 
     return clean
+
+
+def _cash_period_data(branch_obj, start_date, end_date):
+    """
+    Calculates exact aggregated cash inflows across CASH, PAYBILL, and SEND_MONEY channels,
+    properly breaking down SPLIT transactions and Credit Repayments.
+    """
+    start_dt = timezone.make_aware(datetime.combine(start_date, time.min))
+    end_dt = timezone.make_aware(datetime.combine(end_date, time.max))
+
+    inflow_channels = {
+        "CASH": ZERO,
+        "PAYBILL": ZERO,
+        "SEND_MONEY": ZERO,
+        "BANK_TRANSFER": ZERO,
+    }
+
+    # 1. Sales & Split Payments
+    sales_qs = SaleTransaction.objects.filter(
+        sale_date__gte=start_dt,
+        sale_date__lte=end_dt
+    ).prefetch_related("split_payments")
+
+    if branch_obj:
+        sales_qs = sales_qs.filter(branch=branch_obj)
+
+    for sale in sales_qs:
+        norm_method = normalize_payment_channel(sale.payment_method)
+
+        if norm_method == "SPLIT":
+            for sp in sale.split_payments.all():
+                sp_channel = normalize_payment_channel(sp.method)
+                if sp_channel in inflow_channels and sp_channel != "CREDIT":
+                    inflow_channels[sp_channel] += Decimal(str(sp.amount or ZERO))
+        elif norm_method in inflow_channels:
+            sale_total = Decimal(str(sale.total_amount or ZERO))
+            inflow_channels[norm_method] += sale_total
+
+    # 2. Debt Repayments (CreditRepayment)
+    repayments_qs = CreditRepayment.objects.filter(
+        date__gte=start_date,
+        date__lte=end_date
+    )
+    if branch_obj:
+        repayments_qs = repayments_qs.filter(transaction__branch=branch_obj)
+
+    for repayment in repayments_qs:
+        rep_channel = normalize_payment_channel(getattr(repayment, "payment_method", "CASH"))
+        rep_amount = Decimal(str(repayment.amount or ZERO))
+        if rep_channel in inflow_channels and rep_channel != "CREDIT":
+            inflow_channels[rep_channel] += rep_amount
+
+    total_inflows = sum(inflow_channels.values(), ZERO)
+
+    # 3. Expenses and Supplier Purchases
+    expense_qs = Expense.objects.filter(date__range=(start_date, end_date))
+    purchase_qs = Purchase.objects.filter(purchase_date__date__range=(start_date, end_date))
+
+    if branch_obj:
+        expense_qs = expense_qs.filter(branch=branch_obj)
+        purchase_qs = purchase_qs.filter(branch=branch_obj)
+
+    expenses_total = expense_qs.aggregate(
+        total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField())
+    )["total"]
+
+    purchases_total = purchase_qs.exclude(payment_method="CREDIT").aggregate(
+        total=Coalesce(Sum("amount_paid"), ZERO, output_field=DecimalField())
+    )["total"]
+
+    return {
+        "inflows": total_inflows,
+        "inflow_channels": inflow_channels,
+        "expenses": expenses_total,
+        "purchases": purchases_total,
+        "expense_queryset": expense_qs,
+    }
 
 
 class ManagementReportsViewSet(viewsets.ViewSet):
@@ -8734,7 +8813,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             period = _cash_period_data(branch_obj, start_date, end_date)
             expense_qs = period["expense_queryset"]
 
-            # Separate operating, investing and financing classifications.
             equipment_filter = (
                 Q(description__icontains="equipment")
                 | Q(description__icontains="asset")
@@ -8773,7 +8851,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             net_financing_cash = capital_plus_loan_received - loan_repayment - drawings
             net_increase_in_cash = net_operating_cash + net_investing_cash + net_financing_cash
 
-            # Opening cash is the cumulative net movement before the selected range.
             if start_date > date(1900, 1, 1):
                 prior_end = start_date - timedelta(days=1)
                 prior = _cash_period_data(branch_obj, date(1900, 1, 1), prior_end)
@@ -8871,7 +8948,6 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                     continue
 
                 if norm_method == "SPLIT":
-                    # Sum ONLY the sub-payments explicitly marked as CREDIT
                     credit_amount = sum(
                         (
                             Decimal(str(payment.amount or ZERO))
@@ -8953,7 +9029,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             channels = {}
             for raw_channel, amount in period["inflow_channels"].items():
                 norm_channel = normalize_payment_channel(raw_channel)
-                _add_channel_total(channels, norm_channel, amount)
+                channels[norm_channel] = channels.get(norm_channel, ZERO) + Decimal(str(amount or ZERO))
 
             cash_rows = [
                 ("CASH", "Total Cash Collections & Repayments"),
