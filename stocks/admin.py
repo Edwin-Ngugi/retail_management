@@ -6,6 +6,7 @@ from django.http import HttpResponseRedirect
 from django.shortcuts import render
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
+from django.db.models import Count
 
 from analytics.services import AnalyticsService
 
@@ -877,7 +878,6 @@ class CreditRepaymentSplitInline(admin.TabularInline):
     extra = 1
     fields = ("method", "amount", "reference_code", "created_at")
     readonly_fields = ("created_at",)
-    classes = ("collapse-entry",)
 
 
 @admin.register(CreditRepayment)
@@ -940,21 +940,25 @@ class CreditRepaymentAdmin(admin.ModelAdmin):
         ),
     )
 
+    def get_queryset(self, request):
+        """
+        Annotates split count to avoid N+1 database queries on list display.
+        """
+        qs = super().get_queryset(request)
+        return qs.annotate(split_count_anno=Count("splits"))
+
     @admin.display(description="Branch", ordering="branch__name")
     def get_branch_name(self, obj):
-        if obj.branch:
+        if hasattr(obj, "branch") and obj.branch:
             return obj.branch.name
-        if obj.transaction and obj.transaction.branch:
+        if hasattr(obj, "transaction") and obj.transaction and getattr(obj.transaction, "branch", None):
             return f"{obj.transaction.branch.name} (via Invoice)"
         return "Unassigned Branch"
 
-    @admin.display(description="Split Lines")
+    @admin.display(description="Split Lines", ordering="split_count_anno")
     def get_split_count(self, obj):
-        splits = obj.splits.all()
-        count = len(splits)
-        if count == 0:
-            return "-"
-        return f"{count} line(s)"
+        count = getattr(obj, "split_count_anno", 0)
+        return f"{count} line(s)" if count > 0 else "-"
 
 
 @admin.register(CreditRepaymentSplit)
