@@ -11174,7 +11174,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
         return notes
 
-    @@action(detail=False, methods=['get'], url_path='detailed-report')
+    @action(detail=False, methods=['get'], url_path='detailed-report')
     def detailed_report(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
