@@ -6929,9 +6929,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
                     )
 
-            # Filter each model by its actual business-date field.
-            # DateField: date__range=(start_date, end_date)
-            # DateTimeField: datetime__range=(start_dt, end_dt)
             sales_qs = base_sales_qs
             expenses_qs = base_expenses_qs
             purchases_qs = base_purchases_qs
@@ -6979,7 +6976,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             operating_expenses = quantize_money(expenses_agg['total'] or ZERO)
 
             gross_profit = total_sales - cogs
-            net_profit = gross_profit - operating_expenses
+            operating_profit = gross_profit - operating_expenses
+            net_profit = operating_profit
 
             # -----------------------------------------------------------------
             # 3. CASH MOVEMENT & PAYMENT CHANNEL BREAKDOWN
@@ -7067,17 +7065,18 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 other_total
             )
 
-            # Receivables Calculation (Cumulative Lifetime vs Period Recovered)
+            # -----------------------------------------------------------------
+            # 4. UNIFIED RECEIVABLES LEDGER (PER DEBTOR AGGREGATION)
+            # -----------------------------------------------------------------
             st_credit_filter = (
                 Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) |
                 Q(payment_method='Credit') |
                 Q(split_payments__method='CREDIT') |
                 Q(split_payments__method='Credit')
             )
-            all_credit_sales = base_sales_qs.filter(st_credit_filter).distinct()
+            all_credit_sales = base_sales_qs.filter(st_credit_filter).prefetch_related('split_payments', 'customer').distinct()
             if end_dt:
                 all_credit_sales = all_credit_sales.filter(sale_date__lte=end_dt)
-            gross_credit_issued = ZERO
 
             all_credit_ids = set(
                 base_credit_repay_qs
@@ -7086,39 +7085,52 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 .distinct()
             )
 
-            for c_sale in all_credit_sales.prefetch_related("split_payments"):
-                gross_credit_issued += get_sale_credit_amt(c_sale, all_credit_ids)
-
-            # Lifetime total recovered customer credit repayments
-            repay_agg_lifetime = base_credit_repay_qs.aggregate(total=Sum('amount'))
-            total_recovered_lifetime = quantize_money(repay_agg_lifetime['total'] or ZERO)
-
             repayments_to_date_qs = base_credit_repay_qs
             if end_date:
                 repayments_to_date_qs = repayments_to_date_qs.filter(date__lte=end_date)
-            repay_agg_to_date = repayments_to_date_qs.aggregate(total=Sum('amount'))
-            all_repayments_to_date = quantize_money(repay_agg_to_date['total'] or ZERO)
 
-            total_customer_debtors = max(ZERO, gross_credit_issued - all_repayments_to_date)
+            debtors_map = {}
+            for c_sale in all_credit_sales:
+                cust_key = c_sale.customer_id if c_sale.customer_id else (c_sale.customer_name or "Walk-in Debtor").strip()
+                if cust_key not in debtors_map:
+                    debtors_map[cust_key] = {
+                        "customer_obj": c_sale.customer,
+                        "gross_credit": ZERO,
+                    }
+                debtors_map[cust_key]["gross_credit"] += get_sale_credit_amt(c_sale, all_credit_ids)
 
-            # Safely count unpaid credit transactions without using field lookups on properties
+            total_customer_debtors = ZERO
+            for key, data in debtors_map.items():
+                cust_obj = data["customer_obj"]
+                cust_repayments = ZERO
+                if cust_obj:
+                    cust_repayments = repayments_to_date_qs.filter(customer=cust_obj).aggregate(
+                        total=Coalesce(Sum('amount'), ZERO)
+                    )['total'] or ZERO
+
+                net_bal = max(ZERO, data["gross_credit"] - quantize_money(cust_repayments))
+                total_customer_debtors += net_bal
+
+            repay_agg_lifetime = base_credit_repay_qs.aggregate(total=Sum('amount'))
+            total_recovered_lifetime = quantize_money(repay_agg_lifetime['total'] or ZERO)
+
             unpaid_invoices_count = base_sales_qs.filter(
                 st_credit_filter,
                 is_paid=False
             ).distinct().count()
 
             # -----------------------------------------------------------------
-            # 4. INVENTORY & SKUS
+            # 5. INVENTORY & SKUS
             # -----------------------------------------------------------------
             pricings_qs = BranchItemPricing.objects.select_related('item', 'branch')
             if branch_obj:
                 pricings_qs = pricings_qs.filter(branch=branch_obj)
 
-            stocks_qs = BranchStock.objects.all()
-            if branch_obj:
+            stocks_qs = BranchStock.objects.all() if 'BranchStock' in globals() else []
+            if branch_obj and stocks_qs:
                 stocks_qs = stocks_qs.filter(branch=branch_obj)
 
-            branch_stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in stocks_qs}
+            branch_stock_map = {s.item_id: Decimal(str(s.quantity or ZERO)) for s in stocks_qs} if stocks_qs else {}
 
             total_stock_value = ZERO
             low_stock_count = 0
@@ -7146,7 +7158,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             total_cataloged_skus = pricings_qs.values('item_id').distinct().count()
 
             # -----------------------------------------------------------------
-            # 5. PURCHASES & OUTFLOWS
+            # 6. PURCHASES & OUTFLOWS
             # -----------------------------------------------------------------
             dir_purch_agg = purchases_qs.exclude(
                 payment_method='CREDIT'
@@ -7162,10 +7174,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             available_funds = actual_cash_receipts - operating_expenses - purchases_total
 
             # -----------------------------------------------------------------
-            # 6. SAFE TRAJECTORY COMPUTATION
+            # 7. SAFE TRAJECTORY COMPUTATION
             # -----------------------------------------------------------------
             trajectory_data = []
-
             sales_by_date = {}
             for sale in sales_qs:
                 s_date = getattr(sale, 'sale_date', None)
@@ -7178,7 +7189,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     ratio = (day_s / total_sales) if total_sales > ZERO else ZERO
                     day_cogs = quantize_money(cogs * ratio)
                     day_net = quantize_money(net_profit * ratio)
-                    
+
                     trajectory_data.append({
                         "date": date_str,
                         "total_sales": float(day_s),
