@@ -11012,6 +11012,13 @@ def generate_pdf_pie_chart(payment_breakdown):
     return Image(img_buf, width=320, height=185)
 
 
+def quantize_money(amount):
+    """Safely convert numerical inputs to Decimal rounded to 2 decimal places."""
+    if amount is None:
+        return ZERO
+    return Decimal(str(amount)).quantize(Decimal("0.01"))
+
+
 class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
@@ -11026,12 +11033,26 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             .upper()
             .replace("-", "_")
             .replace(" ", "_")
+            .replace("/", "_")
         )
 
         if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
             return "PAYBILL"
 
-        if any(k in clean for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "BUYGOODS", "P2P", "MPESA", "M_PESA", "MOBILE"]):
+        if any(
+            k in clean
+            for k in [
+                "SEND_MONEY",
+                "SENDMONEY",
+                "TILL",
+                "BUY_GOODS",
+                "BUYGOODS",
+                "P2P",
+                "MPESA",
+                "M_PESA",
+                "MOBILE",
+            ]
+        ):
             return "SEND_MONEY"
 
         if any(k in clean for k in ["BANK", "EFT", "TRANSFER"]):
@@ -11040,7 +11061,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         if "CASH" in clean:
             return "CASH"
 
-        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT"]):
+        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT", "INVOICE"]):
             return "CREDIT"
 
         if "SPLIT" in clean:
@@ -11049,6 +11070,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         return clean
 
     def _extract_sp_method(self, sp):
+        """Safely inspects split payment instances across all potential field names."""
         for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
             val = getattr(sp, attr, None)
             if val:
@@ -11056,14 +11078,21 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         return None
 
     def _get_split_payments(self, sale):
+        """Safely gathers child split records across various relation names."""
         all_found = []
-        for rel_attr in ["split_payments", "payments", "payment_breakdown", "splits", "sale_payments", "legacy_sales"]:
+        for rel_attr in [
+            "split_payments",
+            "payments",
+            "payment_breakdown",
+            "splits",
+            "sale_payments",
+            "legacy_sales",
+        ]:
             relation = getattr(sale, rel_attr, None)
             if relation is not None:
                 try:
                     records = list(relation.all())
                     for r in records:
-                        # If relation is legacy_sales, extract its child split_payments
                         if hasattr(r, "split_payments"):
                             all_found.extend(list(r.split_payments.all()))
                         else:
@@ -11074,7 +11103,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
     def _get_branch_and_dates(self, request):
         return _get_reporting_filters(request, default_period="month")
-
 
     def _generate_executive_insights(self, summary, fast_movers, slow_movers):
         notes = []
@@ -11144,7 +11172,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 returns_qs = returns_qs.filter(branch=branch_obj)
                 repayment_qs = repayment_qs.filter(
-                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
                 )
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
@@ -11165,7 +11193,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             sale_tx_ids = set(sales_qs.values_list('id', flat=True))
             
-            # Query SalePayment across all potential relation links
             split_payments_qs = SalePayment.objects.filter(
                 Q(transaction_id__in=sale_tx_ids) |
                 Q(sale__transaction_id__in=sale_tx_ids) |
@@ -11186,45 +11213,40 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
                 main_method = self._normalize_payment_method(getattr(sale, "payment_method", None))
                 
-                # Fetch mapped split records or fallback to prefetched relation
                 split_records = split_payments_map.get(sale.id, [])
-                if not split_records and hasattr(sale, "split_payments"):
-                    try:
-                        split_records = list(sale.split_payments.all())
-                    except Exception:
-                        split_records = []
+                if not split_records:
+                    split_records = self._get_split_payments(sale)
 
                 if main_method == "SPLIT" or len(split_records) > 0:
                     for sp in split_records:
-                        raw_sp_method = str(getattr(sp, "method", "") or getattr(sp, "payment_method", "") or "").upper().replace(" ", "_")
+                        raw_sp_method = self._extract_sp_method(sp)
                         sp_method = self._normalize_payment_method(raw_sp_method)
                         sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
 
-                        if sp_method == "CASH" or "CASH" in raw_sp_method:
+                        if sp_method == "CASH":
                             cash_total += sp_amount
-                        elif sp_method == "PAYBILL" or "PAYBILL" in raw_sp_method:
+                        elif sp_method == "PAYBILL":
                             paybill_total += sp_amount
-                        elif sp_method == "SEND_MONEY" or "SEND_MONEY" in raw_sp_method or "SENDMONEY" in raw_sp_method or "TILL" in raw_sp_method:
+                        elif sp_method == "SEND_MONEY":
                             send_money_total += sp_amount
-                        elif sp_method == "MPESA" or "MPESA" in raw_sp_method:
+                        elif sp_method == "MPESA":
                             mpesa_std_total += sp_amount
-                        elif sp_method == "BANK_TRANSFER" or "BANK" in raw_sp_method:
+                        elif sp_method == "BANK_TRANSFER":
                             bank_total += sp_amount
-                        elif sp_method == "CREDIT" or "CREDIT" in raw_sp_method:
+                        elif sp_method == "CREDIT":
                             gross_credit_sales += sp_amount
                         else:
                             other_total += sp_amount
                 else:
-                    # Fallback to model property if method is split but no split_records array was created
                     if main_method == "SPLIT" and hasattr(sale, "liquid_payments_breakdown"):
                         breakdown = sale.liquid_payments_breakdown
-                        cash_total += breakdown.get("CASH", ZERO)
-                        paybill_total += breakdown.get("PAYBILL", ZERO)
-                        send_money_total += breakdown.get("SEND_MONEY", ZERO)
-                        mpesa_std_total += breakdown.get("MPESA", ZERO)
-                        bank_total += breakdown.get("BANK_TRANSFER", ZERO)
-                        gross_credit_sales += breakdown.get("CREDIT", ZERO)
-                        other_total += breakdown.get("OTHER", ZERO)
+                        cash_total += quantize_money(breakdown.get("CASH", ZERO))
+                        paybill_total += quantize_money(breakdown.get("PAYBILL", ZERO))
+                        send_money_total += quantize_money(breakdown.get("SEND_MONEY", ZERO))
+                        mpesa_std_total += quantize_money(breakdown.get("MPESA", ZERO))
+                        bank_total += quantize_money(breakdown.get("BANK_TRANSFER", ZERO))
+                        gross_credit_sales += quantize_money(breakdown.get("CREDIT", ZERO))
+                        other_total += quantize_money(breakdown.get("OTHER", ZERO))
                     elif main_method == "CREDIT":
                         gross_credit_sales += sale_amt
                     elif main_method == "CASH":
@@ -11270,7 +11292,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             daily_map = {}
             transaction_items_map = {}
 
-            # Decide the chart bucket once for the entire selected range.
             trend_granularity = period_type
             if trend_granularity == "custom":
                 span_days = (end_date - start_date).days + 1
@@ -11327,7 +11348,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 if not sale_dt:
                     sale_dt = timezone.localtime(timezone.now())
 
-                # Keep the x-axis readable for each selected period.
                 granularity = trend_granularity
 
                 if granularity == "day":
@@ -11384,8 +11404,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         "line_profit": float(line_rev - line_cost)
                     })
 
-            # Include empty periods as zeroes so the axis always shows the
-            # complete selected week/month/year, not only dates with transactions.
             def ensure_trend_bucket(key, label):
                 daily_map.setdefault(key, {
                     "date": label,
@@ -11740,29 +11758,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     elements.append(Spacer(1, 2))
                 elements.append(Spacer(1, 10))
 
-            # 4. GRAPHICAL CHARTS GENERATION & EMBEDDING
-            trend_img = generate_pdf_trend_chart(daily_trends)
-            pie_img = generate_pdf_pie_chart(payment_breakdown)
-
-            if trend_img or pie_img:
-                elements.append(Paragraph("<b>VISUAL ANALYTICS & DISTRIBUTION CHARTS</b>", section_heading))
-                if trend_img and pie_img:
-                    # Place side-by-side or stacked cleanly
-                    chart_table = Table([[trend_img], [pie_img]], colWidths=[552])
-                    chart_table.setStyle(TableStyle([
-                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                        ('TOPPADDING', (0, 0), (-1, -1), 4),
-                        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                    ]))
-                    elements.append(chart_table)
-                elif trend_img:
-                    elements.append(trend_img)
-                elif pie_img:
-                    elements.append(pie_img)
-                elements.append(Spacer(1, 10))
-
-            # 5. Period Trends Table Data
+            # 4. Period Trends Table Data
             if daily_trends:
                 elements.append(Paragraph("<b>PERIOD TRENDS BREAKDOWN</b>", section_heading))
                 trend_data = [[
@@ -11789,7 +11785,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(trend_table)
                 elements.append(Spacer(1, 10))
 
-            # 6. Fast & Slow Movers Tables
+            # 5. Fast & Slow Movers Tables
             if fast_movers:
                 elements.append(Paragraph("<b>FAST-MOVING PRODUCTS (TOP PERFORMERS)</b>", section_heading))
                 fm_data = [[
@@ -11842,7 +11838,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(sm_table)
                 elements.append(Spacer(1, 10))
 
-            # 7. TRANSACTIONS LEDGER
+            # 6. TRANSACTIONS LEDGER
             if transactions:
                 elements.append(Paragraph(f"<b>TRANSACTIONS LEDGER ({report_title_suffix})</b>", section_heading))
                 
@@ -11924,7 +11920,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         elements.append(KeepTogether(tx_elements))
                     elements.append(Spacer(1, 10))
 
-            # 8. Credit Repayments Ledger
+            # 7. Credit Repayments Ledger
             if repayments_list:
                 elements.append(Paragraph("<b>CREDIT REPAYMENTS COLLECTED LEDGER</b>", section_heading))
                 rep_data = [[
@@ -11953,7 +11949,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(rep_table)
                 elements.append(Spacer(1, 10))
 
-            # 9. Payment Channel Distribution
+            # 8. Payment Channel Distribution
             if payment_breakdown:
                 elements.append(Paragraph("<b>RESOLVED PAYMENT CHANNEL DISTRIBUTION</b>", section_heading))
                 pm_data = [[
