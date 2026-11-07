@@ -1421,8 +1421,19 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
+        # 1. Grab raw payment list from context/initial_data in case of key mismatch
+        initial_payments = []
+        if hasattr(self, "initial_data") and isinstance(self.initial_data, dict):
+            initial_payments = (
+                self.initial_data.get("payments")
+                or self.initial_data.get("split_payments")
+                or self.initial_data.get("splits")
+                or self.initial_data.get("split_details")
+                or []
+            )
+
         items_data = validated_data.pop("items", [])
-        payments_data = validated_data.pop("payments", [])
+        payments_data = validated_data.pop("payments", []) or initial_payments
         
         request = self.context.get("request")
         user = _get_request_user(self) if hasattr(self, "context") else None
@@ -1434,7 +1445,7 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
         payment_method = _normalize_payment_method(validated_data.get("payment_method", "CASH"))
         validated_data["payment_method"] = payment_method
 
-        # 1. Resolve Customer & Preserve UI Customer Name Input
+        # Resolve Customer
         customer_input = validated_data.pop("customer", None)
         customer_name_from_ui = validated_data.get("customer_name")
         retailer = getattr(branch, "retailer", None)
@@ -1464,7 +1475,6 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
         if user and "created_by" not in validated_data:
             validated_data["created_by"] = user
 
-        # 2. Preserve UI-supplied Invoice Number / Receipt Number
         custom_invoice_no = validated_data.get("invoice_number") or validated_data.get("receipt_number")
         if custom_invoice_no and str(custom_invoice_no).strip():
             validated_data["invoice_number"] = str(custom_invoice_no).strip()
@@ -1476,12 +1486,10 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
                 validated_data["invoice_number"] = generated_no
 
         try:
-            # 3. Instantiate SaleTransaction Header
             transaction_obj = SaleTransaction.objects.create(**validated_data)
-
             computed_total = ZERO
 
-            # 4. Process Line Items (SaleItem.save() handles StockMovement & WAC automatically)
+            # Save Line Items
             for item_data in items_data:
                 item_id = item_data.get("item")
                 item = Item.objects.filter(pk=item_id).first() if isinstance(item_id, int) else item_id
@@ -1511,7 +1519,6 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
                     pricing.remaining_stock = max(0, pricing.remaining_stock - int(qty_sold))
                     pricing.save(update_fields=["remaining_stock"])
 
-            # 5. Always recalculate total_amount directly from computed items to prevent data inflation
             transaction_obj.total_amount = computed_total
 
             if payment_method == "CREDIT":
@@ -1523,24 +1530,42 @@ class SaleTransactionSerializer(serializers.ModelSerializer):
 
             transaction_obj.save(update_fields=["total_amount", "amount_paid", "is_paid"])
 
-            # 6. Handle Split Payments
-            if payment_method == "SPLIT" and payments_data:
+            # -----------------------------------------------------------------
+            # GUARANTEED SPLIT PAYMENTS CREATION
+            # -----------------------------------------------------------------
+            if (payment_method == "SPLIT" or payments_data) and payments_data:
                 paid_sum = ZERO
+                
+                # If payments_data came as a dict (e.g. {"cash": 500, "paybill": 300})
+                if isinstance(payments_data, dict):
+                    formatted_payments = []
+                    for k, v in payments_data.items():
+                        if _money(v) > ZERO:
+                            formatted_payments.append({
+                                "method": k.upper(),
+                                "amount": _money(v),
+                                "reference_code": ""
+                            })
+                    payments_data = formatted_payments
+
                 for p_data in payments_data:
-                    sp_method = p_data.get("method")
+                    if not isinstance(p_data, dict):
+                        continue
+                    sp_method = _normalize_payment_method(p_data.get("method") or p_data.get("payment_method"))
                     sp_amount = _money(p_data.get("amount", ZERO))
-                    paid_sum += sp_amount
+                    if sp_amount > ZERO:
+                        paid_sum += sp_amount
+                        SalePayment.objects.create(
+                            transaction=transaction_obj,
+                            method=sp_method,
+                            amount=sp_amount,
+                            reference_code=p_data.get("reference_code", "") or p_data.get("reference", ""),
+                        )
 
-                    SalePayment.objects.create(
-                        transaction=transaction_obj,
-                        method=sp_method,
-                        amount=sp_amount,
-                        reference_code=p_data.get("reference_code", ""),
-                    )
-
-                transaction_obj.amount_paid = paid_sum
-                transaction_obj.is_paid = paid_sum >= transaction_obj.total_amount
-                transaction_obj.save(update_fields=["amount_paid", "is_paid"])
+                if payment_method == "SPLIT":
+                    transaction_obj.amount_paid = paid_sum
+                    transaction_obj.is_paid = paid_sum >= transaction_obj.total_amount
+                    transaction_obj.save(update_fields=["amount_paid", "is_paid"])
 
             return transaction_obj
 

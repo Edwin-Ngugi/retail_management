@@ -1874,21 +1874,15 @@ class SaleTransaction(models.Model):
 
     @property
     def liquid_payments_breakdown(self):
-        """
-        Calculates channel totals for this transaction taking into account
-        split payments, actual amount paid, and normalization rules.
-        """
         totals = {
             "CASH": Decimal("0.00"),
             "PAYBILL": Decimal("0.00"),
             "SEND_MONEY": Decimal("0.00"),
-            "MPESA": Decimal("0.00"),
             "BANK_TRANSFER": Decimal("0.00"),
             "CREDIT": Decimal("0.00"),
             "OTHER": Decimal("0.00"),
         }
 
-        # 1. Inspect attached SalePayment records
         split_qs = getattr(self, "split_payments", None) or getattr(self, "payments", None)
         split_list = list(split_qs.all()) if split_qs is not None else []
 
@@ -1901,12 +1895,10 @@ class SaleTransaction(models.Model):
                     or ""
                 ).upper().replace("-", "_").replace(" ", "_")
 
-                if "PAYBILL" in raw_method:
+                if "PAYBILL" in raw_method or "MPESA" in raw_method:
                     totals["PAYBILL"] += amt
                 elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
                     totals["SEND_MONEY"] += amt
-                elif "MPESA" in raw_method:
-                    totals["MPESA"] += amt
                 elif any(k in raw_method for k in ["BANK", "TRANSFER", "EFT"]):
                     totals["BANK_TRANSFER"] += amt
                 elif "CREDIT" in raw_method:
@@ -1923,28 +1915,10 @@ class SaleTransaction(models.Model):
                 total_val = Decimal(str(self.total_amount or 0))
                 credit_due = max(ZERO, total_val - amt)
                 totals["CREDIT"] += credit_due
-
-                repayment_records = list(self.repayments.all()) if hasattr(self, "repayments") else []
-                if repayment_records:
-                    for rep in repayment_records:
-                        rep_amt = Decimal(str(rep.amount or 0))
-                        rep_pm = str(rep.payment_method or "CASH").upper().replace("-", "_").replace(" ", "_")
-                        if "PAYBILL" in rep_pm:
-                            totals["PAYBILL"] += rep_amt
-                        elif any(k in rep_pm for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
-                            totals["SEND_MONEY"] += rep_amt
-                        elif any(k in rep_pm for k in ["BANK", "TRANSFER", "EFT"]):
-                            totals["BANK_TRANSFER"] += rep_amt
-                        else:
-                            totals["CASH"] += rep_amt
-                else:
-                    totals["CASH"] += amt
-            elif "PAYBILL" in raw_method:
+            elif "PAYBILL" in raw_method or "MPESA" in raw_method:
                 totals["PAYBILL"] += amt
             elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
                 totals["SEND_MONEY"] += amt
-            elif "MPESA" in raw_method:
-                totals["MPESA"] += amt
             elif any(k in raw_method for k in ["BANK", "TRANSFER", "EFT"]):
                 totals["BANK_TRANSFER"] += amt
             elif "CASH" in raw_method:
@@ -2343,6 +2317,11 @@ class SalePayment(models.Model):
         # Auto-link transaction from sale if transaction is empty
         if not self.transaction_id and self.sale_id and hasattr(self.sale, 'transaction_id'):
             self.transaction_id = self.sale.transaction_id
+        # Auto-link sale from transaction if sale is empty
+        elif not self.sale_id and self.transaction_id:
+            first_sale = self.transaction.legacy_sales.first() if hasattr(self.transaction, 'legacy_sales') else None
+            if first_sale:
+                self.sale_id = first_sale.id
         super().save(*args, **kwargs)
 
     def __str__(self):
