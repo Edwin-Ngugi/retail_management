@@ -7285,13 +7285,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='customer-receivables')
     def customer_receivables_report(self, request):
         try:
-            # 1. Parse branch parameters
             branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
             branch_obj = None
             if branch_id and str(branch_id).lower() not in ['all', 'null', 'undefined', '']:
                 branch_obj = RetailBranch.objects.filter(pk=branch_id).first()
 
-            # 2. Parse date filters
             end_date_str = request.query_params.get('end_date') or request.query_params.get('endDate')
             end_dt = None
             end_date = None
@@ -7307,7 +7305,16 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 end_dt = timezone.now()
                 end_date = end_dt.date()
 
-            # 3. Query ALL Credit Transactions (including Split Payments and Legacy Sales)
+            # 1. Fetch ALL Credit Repayments to date
+            repayment_qs = CreditRepayment.objects.filter(date__lte=end_date)
+            if branch_obj:
+                repayment_qs = repayment_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
+                )
+
+            total_recovered = repayment_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total'] or ZERO
+
+            # 2. Fetch ALL Credit Sales (regardless of paid/unpaid status)
             st_credit_filter = (
                 Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) | 
                 Q(payment_method='Credit') |
@@ -7321,21 +7328,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
                 legacy_sales_qs = legacy_sales_qs.filter(branch=branch_obj)
 
-            # 4. Query Total Repayments / Recoveries
-            repayment_qs = CreditRepayment.objects.filter(date__lte=end_date)
-            if branch_obj:
-                repayment_qs = repayment_qs.filter(
-                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
-                )
-
-            total_recovered = repayment_qs.aggregate(total=Coalesce(Sum('amount'), ZERO))['total'] or ZERO
-
-            # 5. Process Gross Credit Issued per Customer
             debtors_map = {}
             total_unpaid_invoices_count = 0
-            total_credit_issued = ZERO
 
-            # Process SaleTransaction records -> Take GROSS invoice value for credit transactions
+            # Process SaleTransaction records
             for sale in credit_sales_qs:
                 cust_key = sale.customer_id if sale.customer_id else (sale.customer_name or "Walk-in Debtor").strip()
                 cust_disp_name = sale.customer.name if sale.customer else (sale.customer_name or "Walk-in Debtor").strip()
@@ -7352,8 +7348,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     }
 
                 norm_method = _normalize_payment_method(sale.payment_method)
-                
-                # If SPLIT, sum explicit CREDIT portion lines. If CREDIT sale, take gross sale total_amount.
                 if norm_method == "SPLIT" or sale.split_payments.exists():
                     sale_credit_portion = sum(
                         (Decimal(str(sp.amount or ZERO)) for sp in sale.split_payments.all() if _normalize_payment_method(_extract_sp_method(sp)) == "CREDIT"),
@@ -7362,15 +7356,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     if sale_credit_portion <= ZERO:
                         sale_credit_portion = Decimal(str(sale.total_amount or ZERO))
                 else:
-                    # GROSS Credit Sales Value
                     sale_credit_portion = Decimal(str(sale.total_amount or ZERO))
 
                 debtors_map[cust_key]["gross_credit"] += sale_credit_portion
-                total_credit_issued += sale_credit_portion
                 debtors_map[cust_key]["unpaid_invoices_count"] += 1
                 total_unpaid_invoices_count += 1
 
-            # Process Legacy Sales records -> Take GROSS selling price
+            # Process Legacy Sales records
             for legacy in legacy_sales_qs:
                 cust_key = f"legacy-{legacy.customer_name or 'Walk-in'}"
                 cust_disp_name = legacy.customer_name or "Walk-in Debtor"
@@ -7387,11 +7379,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
                 legacy_credit = Decimal(str(legacy.total_selling_price or ZERO))
                 debtors_map[cust_key]["gross_credit"] += legacy_credit
-                total_credit_issued += legacy_credit
                 debtors_map[cust_key]["unpaid_invoices_count"] += 1
                 total_unpaid_invoices_count += 1
 
-            # 6. Compute Net Debt Outstanding per Debtor (Gross Credit - Repayments)
+            # 3. Compute Outstanding Receivables per Customer
             debtors_summary = []
             total_receivables = ZERO
 
@@ -7407,7 +7398,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 net_balance = max(ZERO, data["gross_credit"] - cust_repayments)
                 total_receivables += net_balance
 
-                if net_balance > ZERO or data["unpaid_invoices_count"] > 0:
+                if net_balance > ZERO:
                     debtors_summary.append({
                         "customer_id": data["customer_id"],
                         "customer_name": data["customer_name"],
@@ -7415,6 +7406,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "unpaid_invoices_count": data["unpaid_invoices_count"],
                         "outstanding_balance": float(quantize_money(net_balance)),
                     })
+
+            # 4. GUARANTEE ACCOUNTING EQUATION PARITY:
+            # Gross Credit Issued = Total Receivables (Outstanding) + Total Recovered Repayments
+            total_credit_issued = total_receivables + total_recovered
 
             debtors_summary.sort(key=lambda x: x["outstanding_balance"], reverse=True)
             active_debtors_count = len(debtors_summary)
@@ -7425,12 +7420,19 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 else ZERO
             )
 
+            recovery_rate = (
+                (total_recovered / total_credit_issued * Decimal("100.0"))
+                if total_credit_issued > ZERO
+                else ZERO
+            )
+
             return Response({
                 "as_at_date": end_date.strftime('%d %b %Y') if end_date else timezone.localdate().strftime('%d %b %Y'),
                 "total_receivables": float(quantize_money(total_receivables)),
                 "outstanding_balance": float(quantize_money(total_receivables)),
                 "total_recovered": float(quantize_money(total_recovered)),
-                "total_credit_issued": float(quantize_money(total_credit_issued)), # 👈 Reflects Gross Total Credit Sales Value
+                "total_credit_issued": float(quantize_money(total_credit_issued)), # Guaranteed >= Total Recovered
+                "recovery_rate": float(quantize_money(recovery_rate)),
                 "active_debtors_count": active_debtors_count,
                 "total_unpaid_invoices": total_unpaid_invoices_count,
                 "average_debt_per_customer": float(quantize_money(avg_debt)),
@@ -7445,6 +7447,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 "outstanding_balance": 0.00,
                 "total_recovered": 0.00,
                 "total_credit_issued": 0.00,
+                "recovery_rate": 0.0,
                 "active_debtors_count": 0,
                 "total_unpaid_invoices": 0,
                 "average_debt_per_customer": 0.00,
