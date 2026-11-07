@@ -11023,7 +11023,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def _normalize_payment_method(self, method_name):
-        """Standardizes raw payment channel strings to clean distinct keys."""
+        """Standardizes raw payment channel strings to clean distinct keys matching FinancialReportViewSet."""
         if not method_name:
             return "UNKNOWN"
 
@@ -11100,6 +11100,17 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 except Exception:
                     pass
         return all_found
+
+    def _extract_qty(self, obj, default=Decimal("1.000")):
+        """Safely extracts quantity from line items."""
+        for attr in ["quantity", "quantity_sold", "qty", "count"]:
+            val = getattr(obj, attr, None)
+            if val is not None:
+                try:
+                    return Decimal(str(val))
+                except Exception:
+                    continue
+        return Decimal(str(default))
 
     def _get_branch_and_dates(self, request):
         return _get_reporting_filters(request, default_period="month")
@@ -11180,6 +11191,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             cash_total = ZERO
             paybill_total = ZERO
             send_money_total = ZERO
+            mpesa_std_total = ZERO
             bank_total = ZERO
             other_total = ZERO
             gross_credit_sales = ZERO
@@ -11188,68 +11200,64 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # ACCURATE CHANNEL ROUTER
+            # 1. UNIFIED CHANNEL ROUTING HELPER
             # -----------------------------------------------------------------
             def route_channel(raw_method, amount, is_repayment=False):
-                nonlocal cash_total, paybill_total, send_money_total, bank_total, gross_credit_sales, other_total
+                nonlocal cash_total, paybill_total, send_money_total, mpesa_std_total, bank_total, gross_credit_sales, other_total
                 
                 amt = quantize_money(amount or ZERO)
                 if amt <= ZERO:
                     return
 
-                ch_upper = str(raw_method or "").upper().replace("-", "_").replace(" ", "_")
+                method = self._normalize_payment_method(raw_method)
 
-                if "CREDIT" in ch_upper and not is_repayment:
+                if method == "CREDIT" and not is_repayment:
                     gross_credit_sales += amt
-                elif "PAYBILL" in ch_upper:
-                    paybill_total += amt
-                elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
-                    send_money_total += amt
-                elif any(k in ch_upper for k in ["MPESA", "M_PESA"]):
-                    # If method is plain M-Pesa without 'Till' or 'Send Money', treat as Paybill default
-                    paybill_total += amt
-                elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
-                    bank_total += amt
-                elif "CASH" in ch_upper:
+                elif method == "CASH":
                     cash_total += amt
+                elif method == "PAYBILL":
+                    paybill_total += amt
+                elif method == "SEND_MONEY":
+                    send_money_total += amt
+                elif method == "MPESA":
+                    mpesa_std_total += amt
+                elif method == "BANK_TRANSFER":
+                    bank_total += amt
                 else:
                     other_total += amt
 
             # -----------------------------------------------------------------
-            # 1. SALES TRANSACTION PROCESSING
+            # 2. SALES & SPLIT PAYMENTS MAPPING
             # -----------------------------------------------------------------
             sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments", "legacy_sales__split_payments")
 
             for sale in sales_with_payments:
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
-                main_method = str(getattr(sale, "payment_method", "") or "").upper().replace("-", "_").replace(" ", "_")
+                main_method = self._normalize_payment_method(getattr(sale, "payment_method", None))
                 
-                # Fetch child split rows from preloaded queryset or helper
-                split_records = list(sale.split_payments.all()) if hasattr(sale, "split_payments") else []
-                if not split_records and hasattr(self, "_get_split_payments"):
-                    split_records = self._get_split_payments(sale)
+                split_records = self._get_split_payments(sale)
 
-                if "SPLIT" in main_method or len(split_records) > 0:
+                if main_method == "SPLIT" or len(split_records) > 0:
                     if split_records:
                         for sp in split_records:
-                            raw_sp_method = getattr(sp, "method", None) or (self._extract_sp_method(sp) if hasattr(self, "_extract_sp_method") else "")
+                            sp_raw_method = self._extract_sp_method(sp)
                             sp_amount = getattr(sp, "amount", ZERO)
-                            route_channel(raw_sp_method, sp_amount, is_repayment=False)
+                            route_channel(sp_raw_method, sp_amount, is_repayment=False)
                     else:
-                        # Fallback to model property if split payment records were not created
                         if hasattr(sale, "liquid_payments_breakdown"):
                             breakdown = sale.liquid_payments_breakdown
                             cash_total += quantize_money(breakdown.get("CASH", ZERO))
                             paybill_total += quantize_money(breakdown.get("PAYBILL", ZERO))
                             send_money_total += quantize_money(breakdown.get("SEND_MONEY", ZERO))
+                            mpesa_std_total += quantize_money(breakdown.get("MPESA", ZERO))
                             bank_total += quantize_money(breakdown.get("BANK_TRANSFER", ZERO))
                             gross_credit_sales += quantize_money(breakdown.get("CREDIT", ZERO))
                             other_total += quantize_money(breakdown.get("OTHER", ZERO))
                 else:
-                    route_channel(main_method, sale_amt, is_repayment=False)
+                    route_channel(sale.payment_method, sale_amt, is_repayment=False)
 
             # -----------------------------------------------------------------
-            # 2. CREDIT REPAYMENTS LEDGER
+            # 3. CREDIT REPAYMENTS LEDGER & SPLIT ROUTING
             # -----------------------------------------------------------------
             repayments_list = []
             repayment_qs = repayment_qs.select_related("customer", "transaction").prefetch_related("splits")
@@ -11260,17 +11268,17 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     continue
 
                 period_credit_repayments_total += rep_amt
-                main_rep_method = str(getattr(rep, "payment_method", "CASH") or "CASH").upper()
+                main_rep_method = self._normalize_payment_method(getattr(rep, "payment_method", "CASH"))
                 
                 child_splits = list(rep.splits.all()) if hasattr(rep, "splits") else []
 
-                if "SPLIT" in main_rep_method or len(child_splits) > 0:
+                if main_rep_method == "SPLIT" or len(child_splits) > 0:
                     for sp in child_splits:
                         sp_amt = getattr(sp, "amount", ZERO)
-                        raw_sp_method = getattr(sp, "method", "")
+                        raw_sp_method = getattr(sp, "method", None) or self._extract_sp_method(sp)
                         route_channel(raw_sp_method, sp_amt, is_repayment=True)
                 else:
-                    route_channel(main_rep_method, rep_amt, is_repayment=True)
+                    route_channel(getattr(rep, "payment_method", "CASH"), rep_amt, is_repayment=True)
 
                 repayments_list.append({
                     "id": rep.id,
@@ -11284,7 +11292,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
             # -----------------------------------------------------------------
-            # 3. SALE ITEMS AGGREGATION & DAILY TRENDS
+            # 4. SALE ITEMS AGGREGATION & DAILY TRENDS
             # -----------------------------------------------------------------
             total_gross_revenue = ZERO
             total_cogs = ZERO
@@ -11309,7 +11317,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 trend_granularity = "all_year"
 
             for line in sale_items_qs:
-                qty = Decimal(str(line.quantity_sold or 0))
+                qty = self._extract_qty(line, default=ZERO)
                 price = Decimal(str(line.unit_selling_price or 0))
                 disc = Decimal(str(line.discount_per_item or 0))
 
@@ -11534,10 +11542,13 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
+            # Consolidate standard MPESA into SEND_MONEY channel to align with FinancialReportViewSet UI distribution
+            effective_send_money = send_money_total + mpesa_std_total
+
             channel_map = {
                 "CASH": cash_total,
                 "PAYBILL": paybill_total,
-                "SEND_MONEY": send_money_total,
+                "SEND_MONEY": effective_send_money,
                 "BANK_TRANSFER": bank_total,
                 "CREDIT": gross_credit_sales,
                 "OTHER": other_total,
