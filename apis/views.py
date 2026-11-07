@@ -11024,8 +11024,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
     def _normalize_payment_method(self, method_name):
         """
-        Standardizes payment method strings matching _cash_period_data.
-        Guarantees strict routing for PAYBILL, SEND_MONEY, CASH, CREDIT, BANK_TRANSFER, and SPLIT.
+        Standardizes payment method strings matching _cash_period_data 1:1.
+        Evaluates PAYBILL prior to generic MPESA/SEND_MONEY terms.
         """
         if not method_name:
             return "CASH"
@@ -11039,9 +11039,11 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             .replace("/", "_")
         )
 
-        if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
+        # 1. PAYBILL takes priority over general MPESA keywords
+        if "PAYBILL" in clean or "PAY_BILL" in clean or "C2B" in clean:
             return "PAYBILL"
 
+        # 2. SEND_MONEY, TILL, BUY_GOODS, and generic MPESA
         if any(
             k in clean
             for k in [
@@ -11058,15 +11060,19 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         ):
             return "SEND_MONEY"
 
-        if "CASH" in clean:
-            return "CASH"
-
-        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT", "INVOICE"]):
-            return "CREDIT"
-
+        # 3. BANK TRANSFER
         if any(k in clean for k in ["BANK", "EFT", "TRANSFER"]):
             return "BANK_TRANSFER"
 
+        # 4. CASH
+        if "CASH" in clean:
+            return "CASH"
+
+        # 5. CREDIT / INVOICE
+        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT", "INVOICE"]):
+            return "CREDIT"
+
+        # 6. SPLIT
         if "SPLIT" in clean:
             return "SPLIT"
 
@@ -11168,7 +11174,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
         return notes
 
-    @action(detail=False, methods=['get'], url_path='detailed-report')
+    @@action(detail=False, methods=['get'], url_path='detailed-report')
     def detailed_report(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
