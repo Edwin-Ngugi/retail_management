@@ -11188,7 +11188,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # UNIFIED CHANNEL ROUTING HELPER
+            # ACCURATE CHANNEL ROUTER
             # -----------------------------------------------------------------
             def route_channel(raw_method, amount, is_repayment=False):
                 nonlocal cash_total, paybill_total, send_money_total, bank_total, gross_credit_sales, other_total
@@ -11199,63 +11199,57 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
                 ch_upper = str(raw_method or "").upper().replace("-", "_").replace(" ", "_")
 
-                # Handle initial credit sales exposure (repayments are actual cash inflows)
                 if "CREDIT" in ch_upper and not is_repayment:
                     gross_credit_sales += amt
-                # 1. Check explicit Paybill first
                 elif "PAYBILL" in ch_upper:
                     paybill_total += amt
-                # 2. Check Send Money / Till / Buy Goods / MPESA
-                elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "MPESA", "M_PESA"]):
+                elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
                     send_money_total += amt
-                # 3. Check Bank Transfer
+                elif any(k in ch_upper for k in ["MPESA", "M_PESA"]):
+                    # If method is plain M-Pesa without 'Till' or 'Send Money', treat as Paybill default
+                    paybill_total += amt
                 elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
                     bank_total += amt
-                # 4. Check Cash
                 elif "CASH" in ch_upper:
                     cash_total += amt
                 else:
                     other_total += amt
 
             # -----------------------------------------------------------------
-            # 1. SPLIT PAYMENTS MAPPING & SALES CHANNEL RESOLUTION
+            # 1. SALES TRANSACTION PROCESSING
             # -----------------------------------------------------------------
-            sale_tx_ids = set(sales_qs.values_list('id', flat=True))
-            
-            split_payments_qs = SalePayment.objects.filter(
-                Q(transaction_id__in=sale_tx_ids) |
-                Q(sale__transaction_id__in=sale_tx_ids) |
-                Q(sale_id__in=sale_tx_ids)
-            ).select_related('transaction', 'sale')
-
-            split_payments_map = {}
-            for sp in split_payments_qs:
-                tx_id = sp.transaction_id or (sp.sale.transaction_id if sp.sale and hasattr(sp.sale, 'transaction_id') else sp.sale_id)
-                if tx_id:
-                    if tx_id not in split_payments_map:
-                        split_payments_map[tx_id] = []
-                    split_payments_map[tx_id].append(sp)
-
             sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments", "legacy_sales__split_payments")
 
             for sale in sales_with_payments:
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
-                main_method = str(getattr(sale, "payment_method", "") or "").upper()
+                main_method = str(getattr(sale, "payment_method", "") or "").upper().replace("-", "_").replace(" ", "_")
                 
-                split_records = split_payments_map.get(sale.id, [])
-                if not split_records:
+                # Fetch child split rows from preloaded queryset or helper
+                split_records = list(sale.split_payments.all()) if hasattr(sale, "split_payments") else []
+                if not split_records and hasattr(self, "_get_split_payments"):
                     split_records = self._get_split_payments(sale)
 
                 if "SPLIT" in main_method or len(split_records) > 0:
-                    for sp in split_records:
-                        raw_sp_method = getattr(sp, "method", None) or self._extract_sp_method(sp)
-                        sp_amount = getattr(sp, "amount", ZERO)
-                        route_channel(raw_sp_method, sp_amount, is_repayment=False)
+                    if split_records:
+                        for sp in split_records:
+                            raw_sp_method = getattr(sp, "method", None) or (self._extract_sp_method(sp) if hasattr(self, "_extract_sp_method") else "")
+                            sp_amount = getattr(sp, "amount", ZERO)
+                            route_channel(raw_sp_method, sp_amount, is_repayment=False)
+                    else:
+                        # Fallback to model property if split payment records were not created
+                        if hasattr(sale, "liquid_payments_breakdown"):
+                            breakdown = sale.liquid_payments_breakdown
+                            cash_total += quantize_money(breakdown.get("CASH", ZERO))
+                            paybill_total += quantize_money(breakdown.get("PAYBILL", ZERO))
+                            send_money_total += quantize_money(breakdown.get("SEND_MONEY", ZERO))
+                            bank_total += quantize_money(breakdown.get("BANK_TRANSFER", ZERO))
+                            gross_credit_sales += quantize_money(breakdown.get("CREDIT", ZERO))
+                            other_total += quantize_money(breakdown.get("OTHER", ZERO))
                 else:
                     route_channel(main_method, sale_amt, is_repayment=False)
 
             # -----------------------------------------------------------------
-            # 2. CREDIT REPAYMENTS LEDGER & SPLIT ROUTING
+            # 2. CREDIT REPAYMENTS LEDGER
             # -----------------------------------------------------------------
             repayments_list = []
             repayment_qs = repayment_qs.select_related("customer", "transaction").prefetch_related("splits")
