@@ -11180,7 +11180,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             cash_total = ZERO
             paybill_total = ZERO
             send_money_total = ZERO
-            mpesa_std_total = ZERO
             bank_total = ZERO
             other_total = ZERO
             gross_credit_sales = ZERO
@@ -11188,8 +11187,31 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             transaction_count = sales_qs.count()
 
+            # Shared channel routing helper mirroring cash_book logic
+            def route_channel(raw_method, amount):
+                nonlocal cash_total, paybill_total, send_money_total, bank_total, gross_credit_sales, other_total
+                
+                amt = quantize_money(amount or ZERO)
+                if amt <= ZERO:
+                    return
+
+                ch_upper = str(raw_method or "").upper().replace("-", "_").replace(" ", "_")
+
+                if "CREDIT" in ch_upper:
+                    gross_credit_sales += amt
+                elif "PAYBILL" in ch_upper:
+                    paybill_total += amt
+                elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "MPESA", "TILL", "BUY_GOODS"]):
+                    send_money_total += amt
+                elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
+                    bank_total += amt
+                elif "CASH" in ch_upper:
+                    cash_total += amt
+                else:
+                    other_total += amt
+
             # -----------------------------------------------------------------
-            # 1. ROBUST SPLIT PAYMENTS MAPPING & CHANNEL RESOLUTION
+            # 1. SPLIT PAYMENTS MAPPING & SALES CHANNEL RESOLUTION
             # -----------------------------------------------------------------
             sale_tx_ids = set(sales_qs.values_list('id', flat=True))
             
@@ -11211,89 +11233,69 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             for sale in sales_with_payments:
                 sale_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
-                main_method = self._normalize_payment_method(getattr(sale, "payment_method", None))
+                main_method = str(getattr(sale, "payment_method", "") or "").upper()
                 
                 split_records = split_payments_map.get(sale.id, [])
                 if not split_records:
                     split_records = self._get_split_payments(sale)
 
-                if main_method == "SPLIT" or len(split_records) > 0:
+                if "SPLIT" in main_method or len(split_records) > 0:
                     for sp in split_records:
-                        raw_sp_method = str(self._extract_sp_method(sp) or "").upper().replace(" ", "_")
-                        sp_method = self._normalize_payment_method(raw_sp_method)
-                        sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
-
-                        if sp_method == "CASH" or "CASH" in raw_sp_method:
-                            cash_total += sp_amount
-                        elif sp_method == "PAYBILL" or "PAYBILL" in raw_sp_method:
-                            paybill_total += sp_amount
-                        elif sp_method == "SEND_MONEY" or "SEND_MONEY" in raw_sp_method or "SENDMONEY" in raw_sp_method or "TILL" in raw_sp_method or "BUY_GOODS" in raw_sp_method:
-                            send_money_total += sp_amount
-                        elif sp_method == "MPESA" or "MPESA" in raw_sp_method:
-                            mpesa_std_total += sp_amount
-                        elif sp_method == "BANK_TRANSFER" or "BANK" in raw_sp_method:
-                            bank_total += sp_amount
-                        elif sp_method == "CREDIT" or "CREDIT" in raw_sp_method:
-                            gross_credit_sales += sp_amount
-                        else:
-                            other_total += sp_amount
+                        raw_sp_method = getattr(sp, "method", None) or self._extract_sp_method(sp)
+                        sp_amount = getattr(sp, "amount", ZERO)
+                        route_channel(raw_sp_method, sp_amount)
                 else:
-                    if main_method == "SPLIT" and hasattr(sale, "liquid_payments_breakdown"):
-                        breakdown = sale.liquid_payments_breakdown
-                        cash_total += quantize_money(breakdown.get("CASH", ZERO))
-                        paybill_total += quantize_money(breakdown.get("PAYBILL", ZERO))
-                        send_money_total += quantize_money(breakdown.get("SEND_MONEY", ZERO))
-                        mpesa_std_total += quantize_money(breakdown.get("MPESA", ZERO))
-                        bank_total += quantize_money(breakdown.get("BANK_TRANSFER", ZERO))
-                        gross_credit_sales += quantize_money(breakdown.get("CREDIT", ZERO))
-                        other_total += quantize_money(breakdown.get("OTHER", ZERO))
-                    elif main_method == "CREDIT":
-                        gross_credit_sales += sale_amt
-                    elif main_method == "CASH":
-                        cash_total += sale_amt
-                    elif main_method == "PAYBILL":
-                        paybill_total += sale_amt
-                    elif main_method == "SEND_MONEY":
-                        send_money_total += sale_amt
-                    elif main_method == "MPESA":
-                        mpesa_std_total += sale_amt
-                    elif main_method == "BANK_TRANSFER":
-                        bank_total += sale_amt
-                    else:
-                        other_total += sale_amt
+                    route_channel(main_method, sale_amt)
 
             # -----------------------------------------------------------------
-            # 2. CREDIT REPAYMENTS LEDGER
+            # 2. CREDIT REPAYMENTS LEDGER & SPLIT ROUTING
             # -----------------------------------------------------------------
             repayments_list = []
-            for rep in repayment_qs.select_related("customer", "transaction"):
+            repayment_qs = repayment_qs.select_related("customer", "transaction").prefetch_related("splits")
+
+            for rep in repayment_qs:
                 rep_amt = quantize_money(rep.amount or ZERO)
-                if rep_amt > ZERO:
-                    period_credit_repayments_total += rep_amt
-                    rep_method = self._normalize_payment_method(getattr(rep, "payment_method", "CASH"))
-                    
-                    # Accumulate repayments in their specific channel counters
-                    if rep_method == "CASH":
-                        cash_total += rep_amt
-                    elif rep_method == "PAYBILL":
+                if rep_amt <= ZERO:
+                    continue
+
+                period_credit_repayments_total += rep_amt
+                main_rep_method = str(getattr(rep, "payment_method", "CASH") or "CASH").upper()
+                
+                child_splits = list(rep.splits.all()) if hasattr(rep, "splits") else []
+
+                if "SPLIT" in main_rep_method or len(child_splits) > 0:
+                    for sp in child_splits:
+                        sp_amt = quantize_money(sp.amount or ZERO)
+                        raw_sp_method = getattr(sp, "method", "")
+                        
+                        ch_upper = str(raw_sp_method or "").upper().replace("-", "_").replace(" ", "_")
+                        if "PAYBILL" in ch_upper:
+                            paybill_total += sp_amt
+                        elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "MPESA", "TILL", "BUY_GOODS"]):
+                            send_money_total += sp_amt
+                        elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
+                            bank_total += sp_amt
+                        else:
+                            cash_total += sp_amt
+                else:
+                    ch_upper = main_rep_method.replace("-", "_").replace(" ", "_")
+                    if "PAYBILL" in ch_upper:
                         paybill_total += rep_amt
-                    elif rep_method == "SEND_MONEY":
+                    elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "MPESA", "TILL", "BUY_GOODS"]):
                         send_money_total += rep_amt
-                    elif rep_method == "MPESA":
-                        mpesa_std_total += rep_amt
-                    elif rep_method == "BANK_TRANSFER":
+                    elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
                         bank_total += rep_amt
                     else:
-                        other_total += rep_amt
+                        cash_total += rep_amt
 
-                    repayments_list.append({
-                        "id": rep.id,
-                        "date": rep.date.strftime("%Y-%m-%d") if hasattr(rep.date, "strftime") else str(rep.date),
-                        "customer_name": rep.customer.name if getattr(rep, "customer", None) else "Credit Customer",
-                        "reference_number": getattr(rep, "reference_number", None) or getattr(rep, "receipt_number", None) or "-",
-                        "payment_method": rep_method,
-                        "amount": float(rep_amt)
-                    })
+                repayments_list.append({
+                    "id": rep.id,
+                    "date": rep.date.strftime("%Y-%m-%d") if hasattr(rep.date, "strftime") else str(rep.date),
+                    "customer_name": rep.customer.name if getattr(rep, "customer", None) else "Credit Customer",
+                    "reference_number": getattr(rep, "reference_number", None) or getattr(rep, "receipt_number", None) or "-",
+                    "payment_method": main_rep_method,
+                    "amount": float(rep_amt)
+                })
 
             net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
 
@@ -11552,13 +11554,11 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "CASH": cash_total,
                 "PAYBILL": paybill_total,
                 "SEND_MONEY": send_money_total,
-                "MPESA": mpesa_std_total,
                 "BANK_TRANSFER": bank_total,
                 "CREDIT": gross_credit_sales,
                 "OTHER": other_total,
             }
 
-            # UNFILTERED: Returns all payment channels regardless of amount (even 0.00)
             payment_breakdown = [
                 {"method": k, "amount": float(quantize_money(v))}
                 for k, v in channel_map.items()
