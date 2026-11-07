@@ -11219,21 +11219,21 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
                 if main_method == "SPLIT" or len(split_records) > 0:
                     for sp in split_records:
-                        raw_sp_method = self._extract_sp_method(sp)
+                        raw_sp_method = str(self._extract_sp_method(sp) or "").upper().replace(" ", "_")
                         sp_method = self._normalize_payment_method(raw_sp_method)
                         sp_amount = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
 
-                        if sp_method == "CASH":
+                        if sp_method == "CASH" or "CASH" in raw_sp_method:
                             cash_total += sp_amount
-                        elif sp_method == "PAYBILL":
+                        elif sp_method == "PAYBILL" or "PAYBILL" in raw_sp_method:
                             paybill_total += sp_amount
-                        elif sp_method == "SEND_MONEY":
+                        elif sp_method == "SEND_MONEY" or "SEND_MONEY" in raw_sp_method or "SENDMONEY" in raw_sp_method or "TILL" in raw_sp_method or "BUY_GOODS" in raw_sp_method:
                             send_money_total += sp_amount
-                        elif sp_method == "MPESA":
+                        elif sp_method == "MPESA" or "MPESA" in raw_sp_method:
                             mpesa_std_total += sp_amount
-                        elif sp_method == "BANK_TRANSFER":
+                        elif sp_method == "BANK_TRANSFER" or "BANK" in raw_sp_method:
                             bank_total += sp_amount
-                        elif sp_method == "CREDIT":
+                        elif sp_method == "CREDIT" or "CREDIT" in raw_sp_method:
                             gross_credit_sales += sp_amount
                         else:
                             other_total += sp_amount
@@ -11270,12 +11270,28 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 rep_amt = quantize_money(rep.amount or ZERO)
                 if rep_amt > ZERO:
                     period_credit_repayments_total += rep_amt
+                    rep_method = self._normalize_payment_method(getattr(rep, "payment_method", "CASH"))
+                    
+                    # Accumulate repayments in their specific channel counters
+                    if rep_method == "CASH":
+                        cash_total += rep_amt
+                    elif rep_method == "PAYBILL":
+                        paybill_total += rep_amt
+                    elif rep_method == "SEND_MONEY":
+                        send_money_total += rep_amt
+                    elif rep_method == "MPESA":
+                        mpesa_std_total += rep_amt
+                    elif rep_method == "BANK_TRANSFER":
+                        bank_total += rep_amt
+                    else:
+                        other_total += rep_amt
+
                     repayments_list.append({
                         "id": rep.id,
                         "date": rep.date.strftime("%Y-%m-%d") if hasattr(rep.date, "strftime") else str(rep.date),
                         "customer_name": rep.customer.name if getattr(rep, "customer", None) else "Credit Customer",
                         "reference_number": getattr(rep, "reference_number", None) or getattr(rep, "receipt_number", None) or "-",
-                        "payment_method": self._normalize_payment_method(getattr(rep, "payment_method", "CASH")),
+                        "payment_method": rep_method,
                         "amount": float(rep_amt)
                     })
 
@@ -11542,9 +11558,10 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "OTHER": other_total,
             }
 
+            # UNFILTERED: Returns all payment channels regardless of amount (even 0.00)
             payment_breakdown = [
                 {"method": k, "amount": float(quantize_money(v))}
-                for k, v in channel_map.items() if v > ZERO
+                for k, v in channel_map.items()
             ]
 
             payment_channel_breakdown = {
