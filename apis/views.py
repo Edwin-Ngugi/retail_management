@@ -11187,8 +11187,10 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             transaction_count = sales_qs.count()
 
-            # Shared channel routing helper mirroring cash_book logic
-            def route_channel(raw_method, amount):
+            # -----------------------------------------------------------------
+            # UNIFIED CHANNEL ROUTING HELPER
+            # -----------------------------------------------------------------
+            def route_channel(raw_method, amount, is_repayment=False):
                 nonlocal cash_total, paybill_total, send_money_total, bank_total, gross_credit_sales, other_total
                 
                 amt = quantize_money(amount or ZERO)
@@ -11197,14 +11199,19 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
                 ch_upper = str(raw_method or "").upper().replace("-", "_").replace(" ", "_")
 
-                if "CREDIT" in ch_upper:
+                # Handle initial credit sales exposure (repayments are actual cash inflows)
+                if "CREDIT" in ch_upper and not is_repayment:
                     gross_credit_sales += amt
+                # 1. Check explicit Paybill first
                 elif "PAYBILL" in ch_upper:
                     paybill_total += amt
-                elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "MPESA", "TILL", "BUY_GOODS"]):
+                # 2. Check Send Money / Till / Buy Goods / MPESA
+                elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "MPESA", "M_PESA"]):
                     send_money_total += amt
+                # 3. Check Bank Transfer
                 elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
                     bank_total += amt
+                # 4. Check Cash
                 elif "CASH" in ch_upper:
                     cash_total += amt
                 else:
@@ -11243,9 +11250,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     for sp in split_records:
                         raw_sp_method = getattr(sp, "method", None) or self._extract_sp_method(sp)
                         sp_amount = getattr(sp, "amount", ZERO)
-                        route_channel(raw_sp_method, sp_amount)
+                        route_channel(raw_sp_method, sp_amount, is_repayment=False)
                 else:
-                    route_channel(main_method, sale_amt)
+                    route_channel(main_method, sale_amt, is_repayment=False)
 
             # -----------------------------------------------------------------
             # 2. CREDIT REPAYMENTS LEDGER & SPLIT ROUTING
@@ -11265,28 +11272,11 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
                 if "SPLIT" in main_rep_method or len(child_splits) > 0:
                     for sp in child_splits:
-                        sp_amt = quantize_money(sp.amount or ZERO)
+                        sp_amt = getattr(sp, "amount", ZERO)
                         raw_sp_method = getattr(sp, "method", "")
-                        
-                        ch_upper = str(raw_sp_method or "").upper().replace("-", "_").replace(" ", "_")
-                        if "PAYBILL" in ch_upper:
-                            paybill_total += sp_amt
-                        elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "MPESA", "TILL", "BUY_GOODS"]):
-                            send_money_total += sp_amt
-                        elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
-                            bank_total += sp_amt
-                        else:
-                            cash_total += sp_amt
+                        route_channel(raw_sp_method, sp_amt, is_repayment=True)
                 else:
-                    ch_upper = main_rep_method.replace("-", "_").replace(" ", "_")
-                    if "PAYBILL" in ch_upper:
-                        paybill_total += rep_amt
-                    elif any(k in ch_upper for k in ["SEND_MONEY", "SENDMONEY", "MPESA", "TILL", "BUY_GOODS"]):
-                        send_money_total += rep_amt
-                    elif any(k in ch_upper for k in ["BANK", "TRANSFER", "EFT"]):
-                        bank_total += rep_amt
-                    else:
-                        cash_total += rep_amt
+                    route_channel(main_rep_method, rep_amt, is_repayment=True)
 
                 repayments_list.append({
                     "id": rep.id,
