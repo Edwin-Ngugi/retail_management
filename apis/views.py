@@ -1654,7 +1654,7 @@ class ItemViewSet(viewsets.ModelViewSet):
             return Response({"opening_stock": "opening_stock cannot be negative."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            unit_cost_raw = data.get("unit_cost_price")
+            unit_cost_raw = data.get("unit_cost_price") or data.get("cost_price")
             unit_cost = Decimal("0.00") if unit_cost_raw in (None, "") else Decimal(str(unit_cost_raw))
         except Exception:
             return Response({"unit_cost_price": "unit_cost_price must be a valid number."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1663,7 +1663,7 @@ class ItemViewSet(viewsets.ModelViewSet):
             return Response({"unit_cost_price": "unit_cost_price cannot be negative."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            unit_retail_raw = data.get("unit_retail_price")
+            unit_retail_raw = data.get("unit_retail_price") or data.get("retail_price") or data.get("selling_price")
             unit_retail = Decimal(str(unit_retail_raw if unit_retail_raw not in (None, "") else "0.00"))
         except Exception:
             return Response({"unit_retail_price": "unit_retail_price must be a valid number."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1677,7 +1677,14 @@ class ItemViewSet(viewsets.ModelViewSet):
             if not branch_obj:
                 return Response({"branch": "Valid branch is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        serializer = self.get_serializer(data=request.data)
+        # ---------------------------------------------------------------------
+        # FIX: Clean non-Item fields out of item_payload before passing to serializer
+        # ---------------------------------------------------------------------
+        item_payload = request.data.copy() if hasattr(request.data, 'copy') else dict(data)
+        for non_model_field in ["branch", "branch_id", "cost_price", "retail_price", "unit_cost_price", "unit_retail_price", "opening_stock"]:
+            item_payload.pop(non_model_field, None)
+
+        serializer = self.get_serializer(data=item_payload)
         try:
             serializer.is_valid(raise_exception=True)
         except DRFValidationError as e:
@@ -1717,6 +1724,9 @@ class ItemViewSet(viewsets.ModelViewSet):
                         )
 
                     _cache_active_pricing(item, pricing)
+
+            headers = self.get_success_headers(serializer.data)
+            return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
         except IntegrityError as e:
             error_text = str(e).lower()
