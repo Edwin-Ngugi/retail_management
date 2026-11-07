@@ -8872,7 +8872,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     def balance_sheet_report(self, request):
         try:
             branch_obj, start_date, end_date, _start_dt, _end_dt = self._get_branch_and_dates(request)
-            as_at = end_date
+            as_at = end_date.date() if isinstance(end_date, datetime) else (end_date or timezone.localdate())
+
+            # 1. Calculate Period-to-Date Cash Operations
             period_to_date = _cash_period_data(branch_obj, date(1900, 1, 1), as_at)
             expenses_qs = period_to_date["expense_queryset"]
 
@@ -8880,47 +8882,76 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             cash_expenses = expenses_qs.exclude(financing_in_filter).aggregate(
                 total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
             )["total"] or ZERO
+            
             capital_received = expenses_qs.filter(financing_in_filter).aggregate(
                 total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
             )["total"] or ZERO
+
             cash_balance = quantize_money(
                 period_to_date["inflows"] - period_to_date["purchases"] - cash_expenses + capital_received
             )
 
-            sales_qs = SaleTransaction.objects.filter(sale_date__date__lte=as_at).prefetch_related("split_payments")
+            # 2. Query Sales & Purchases up to "as_at" date
+            sales_qs = SaleTransaction.objects.filter(sale_date__date__lte=as_at).prefetch_related("split_payments", "customer")
             purchases_qs = Purchase.objects.filter(purchase_date__date__lte=as_at).prefetch_related("supplier_payments")
+            
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 purchases_qs = purchases_qs.filter(branch=branch_obj)
 
-            customer_debts = ZERO
-            for sale in sales_qs:
-                norm_method = normalize_payment_channel(sale.payment_method)
+            # 3. Calculate Customer Debts (Accounts Receivable) with Per-Debtor Net Aggregation
+            repayment_qs = CreditRepayment.objects.filter(date__lte=as_at)
+            if branch_obj:
+                repayment_qs = repayment_qs.filter(
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
+                )
 
-                if norm_method not in ("CREDIT", "SPLIT"):
+            debtors_map = {}
+            for sale in sales_qs:
+                norm_method = _normalize_payment_method(sale.payment_method)
+                if norm_method not in ("CREDIT", "SPLIT") and not sale.split_payments.exists():
                     continue
 
-                if norm_method == "SPLIT":
+                cust_key = sale.customer_id if sale.customer_id else (sale.customer_name or "Walk-in Debtor").strip()
+                if cust_key not in debtors_map:
+                    debtors_map[cust_key] = {
+                        "customer_obj": sale.customer,
+                        "gross_credit": ZERO,
+                    }
+
+                if norm_method == "SPLIT" or sale.split_payments.exists():
                     credit_amount = sum(
                         (
                             Decimal(str(payment.amount or ZERO))
                             for payment in sale.split_payments.all()
-                            if normalize_payment_channel(_extract_sp_method(payment)) == "CREDIT"
+                            if _normalize_payment_method(_extract_sp_method(payment)) == "CREDIT"
                         ),
                         ZERO,
                     )
+                    if credit_amount <= ZERO:
+                        credit_amount = Decimal(str(sale.total_amount or ZERO))
                 else:
-                    credit_amount = Decimal(str(getattr(sale, "credit_payment_amount", ZERO) or ZERO))
+                    credit_amount = Decimal(str(sale.total_amount or ZERO)) - Decimal(str(sale.amount_paid or ZERO))
+                    if credit_amount <= ZERO:
+                        credit_amount = Decimal(str(sale.total_amount or ZERO))
 
-                repayments_to_date = CreditRepayment.objects.filter(transaction=sale, date__lte=as_at).aggregate(
-                    total=Coalesce(Sum("amount"), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
-                )["total"] or ZERO
+                debtors_map[cust_key]["gross_credit"] += credit_amount
 
-                customer_debts += max(ZERO, credit_amount - Decimal(str(repayments_to_date)))
+            customer_debts = ZERO
+            for key, data in debtors_map.items():
+                cust_obj = data["customer_obj"]
+                cust_repayments = ZERO
+                if cust_obj:
+                    cust_repayments = repayment_qs.filter(customer=cust_obj).aggregate(
+                        total=Coalesce(Sum('amount'), ZERO, output_field=DecimalField(max_digits=12, decimal_places=2))
+                    )['total'] or ZERO
 
+                customer_debts += max(ZERO, data["gross_credit"] - quantize_money(cust_repayments))
+
+            # 4. Calculate Supplier Debts (Accounts Payable)
             supplier_debts = ZERO
             for purchase in purchases_qs:
-                if normalize_payment_channel(purchase.payment_method) != "CREDIT":
+                if _normalize_payment_method(purchase.payment_method) != "CREDIT":
                     continue
                 all_supplier_payments = sum(
                     (Decimal(str(payment.amount or ZERO)) for payment in purchase.supplier_payments.all()), ZERO
@@ -8932,6 +8963,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 paid_to_date = initial_paid + Decimal(str(payments_to_date))
                 supplier_debts += max(ZERO, Decimal(str(purchase.total_cost or ZERO)) - paid_to_date)
 
+            # 5. Inventory Valuation
             pricing_qs = BranchItemPricing.objects.select_related("item", "branch")
             if branch_obj:
                 pricing_qs = pricing_qs.filter(branch=branch_obj)
@@ -8939,6 +8971,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                 (Decimal(str(pr.remaining_stock or ZERO)) * Decimal(str(pr.unit_cost_price or ZERO)) for pr in pricing_qs), ZERO
             )
 
+            # 6. Balance Sheet Parity & Statement Generation
             equipment = ZERO
             bank_overdraft = abs(cash_balance) if cash_balance < ZERO else ZERO
             cash_asset = max(cash_balance, ZERO)
@@ -8968,7 +9001,7 @@ class ManagementReportsViewSet(viewsets.ViewSet):
             }, status=status.HTTP_200_OK)
         except Exception as exc:
             logger.exception("Balance Sheet Report Error: %s", exc)
-            return Response({"error": "Balance sheet calculation failed; inspect the server traceback."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"error": f"Balance sheet calculation failed: {str(exc)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # =========================================================================
     # CASHBOOK REPORT
