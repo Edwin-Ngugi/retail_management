@@ -11023,7 +11023,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def _normalize_payment_method(self, method_name):
-        """Standardizes raw payment channel strings to clean distinct keys matching FinancialReportViewSet."""
+        """Standardizes raw payment channel strings to clean distinct keys."""
         if not method_name:
             return "UNKNOWN"
 
@@ -11036,9 +11036,27 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             .replace("/", "_")
         )
 
+        # Explicit Paybill keyword
         if any(k in clean for k in ["PAYBILL", "PAY_BILL", "C2B"]):
             return "PAYBILL"
 
+        # Explicit Bank keywords
+        if any(k in clean for k in ["BANK", "EFT", "TRANSFER"]):
+            return "BANK_TRANSFER"
+
+        # Explicit Cash keyword
+        if "CASH" in clean:
+            return "CASH"
+
+        # Credit / Account keywords
+        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT", "INVOICE"]):
+            return "CREDIT"
+
+        # Split payments
+        if "SPLIT" in clean:
+            return "SPLIT"
+
+        # ALL Mobile / M-Pesa / Till / Buy Goods / P2P route to SEND_MONEY unless explicitly tagged PAYBILL above
         if any(
             k in clean
             for k in [
@@ -11054,18 +11072,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             ]
         ):
             return "SEND_MONEY"
-
-        if any(k in clean for k in ["BANK", "EFT", "TRANSFER"]):
-            return "BANK_TRANSFER"
-
-        if "CASH" in clean:
-            return "CASH"
-
-        if any(k in clean for k in ["CREDIT", "DEBT", "ON_ACCOUNT", "INVOICE"]):
-            return "CREDIT"
-
-        if "SPLIT" in clean:
-            return "SPLIT"
 
         return clean
 
@@ -11203,7 +11209,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             # 1. UNIFIED CHANNEL ROUTING HELPER
             # -----------------------------------------------------------------
             def route_channel(raw_method, amount, is_repayment=False):
-                nonlocal cash_total, paybill_total, send_money_total, mpesa_std_total, bank_total, gross_credit_sales, other_total
+                nonlocal cash_total, paybill_total, send_money_total, bank_total, gross_credit_sales, other_total
                 
                 amt = quantize_money(amount or ZERO)
                 if amt <= ZERO:
@@ -11217,10 +11223,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     cash_total += amt
                 elif method == "PAYBILL":
                     paybill_total += amt
-                elif method == "SEND_MONEY":
+                elif method in ["SEND_MONEY", "MPESA"]:
                     send_money_total += amt
-                elif method == "MPESA":
-                    mpesa_std_total += amt
                 elif method == "BANK_TRANSFER":
                     bank_total += amt
                 else:
