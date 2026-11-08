@@ -11078,8 +11078,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
         return clean
 
-    
-
     def _extract_sp_method(self, sp):
         """Safely inspects split payment instances across all potential field names."""
         for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
@@ -11091,19 +11089,13 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     def _get_split_payments(self, sale):
         """Safely gathers child split records across main transactions and legacy sales."""
         all_found = []
-        
-        # 1. Check direct split_payments on SaleTransaction
         if hasattr(sale, "split_payments") and sale.split_payments.exists():
             all_found.extend(list(sale.split_payments.all()))
-            
-        # 2. Check legacy sales split payments if direct splits are missing
         if not all_found and hasattr(sale, "legacy_sales") and sale.legacy_sales.exists():
             for legacy_sale in sale.legacy_sales.all():
                 if hasattr(legacy_sale, "split_payments"):
                     all_found.extend(list(legacy_sale.split_payments.all()))
-                    
         return all_found
-
 
     def _extract_qty(self, obj, default=Decimal("1.000")):
         """Safely extracts quantity from line items."""
@@ -11177,7 +11169,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             returns_qs = CustomerReturn.objects.all()
             repayment_qs = CreditRepayment.objects.all()
 
-            # Ensure safe date/datetime filtering matching _cash_period_data 1:1
             if start_dt and end_dt:
                 sales_qs = sales_qs.filter(sale_date__gte=start_dt, sale_date__lte=end_dt)
             if start_date and end_date:
@@ -11204,13 +11195,19 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DIRECT SALES INFLOWS (HANDLING LEGACY & NEW DB RECORDS)
+            # 1. DIRECT SALES INFLOWS (PURE LIQUID INFLOWS + CREDIT ISSUED)
             # -----------------------------------------------------------------
             sales_with_payments = sales_qs.distinct().select_related("customer", "branch").prefetch_related("split_payments", "legacy_sales__split_payments")
 
             for sale in sales_with_payments:
                 norm_method = self._normalize_payment_method(sale.payment_method)
                 split_records = self._get_split_payments(sale)
+
+                # Pure Credit Invoices: capture exact credit issued exposure
+                if norm_method == "CREDIT":
+                    sale_amt = Decimal(str(sale.total_amount or ZERO))
+                    gross_credit_sales += quantize_money(sale_amt)
+                    continue
 
                 if norm_method == "SPLIT" or len(split_records) > 0:
                     if split_records:
@@ -11232,7 +11229,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                             else:
                                 other_total += sp_amt
                     elif hasattr(sale, "liquid_payments_breakdown"):
-                        # Fallback for historical split sales created before child SalePayment rows existed
                         bd = sale.liquid_payments_breakdown
                         cash_total += quantize_money(bd.get("CASH", ZERO))
                         paybill_total += quantize_money(bd.get("PAYBILL", ZERO))
@@ -11240,14 +11236,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         bank_total += quantize_money(bd.get("BANK_TRANSFER", ZERO))
                         gross_credit_sales += quantize_money(bd.get("CREDIT", ZERO))
                         other_total += quantize_money(bd.get("OTHER", ZERO))
-
-                elif norm_method == "CREDIT":
-                    sale_amt = Decimal(str(sale.total_amount or ZERO))
-                    gross_credit_sales += quantize_money(sale_amt)
-                    
-                    amt_paid = Decimal(str(sale.amount_paid or ZERO)) if getattr(sale, "amount_paid", None) else ZERO
-                    if amt_paid > ZERO:
-                        cash_total += quantize_money(amt_paid)
 
                 else:
                     sale_paid = Decimal(
@@ -11271,7 +11259,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         other_total += sale_paid
 
             # -----------------------------------------------------------------
-            # 2. CUSTOMER DEBT REPAYMENTS (ALIGNED 1:1 WITH _cash_period_data)
+            # 2. CUSTOMER DEBT REPAYMENTS (COLLECTED INFLOWS FOR THE DAY)
             # -----------------------------------------------------------------
             repayments_list = []
             repayments_qs = repayment_qs.distinct().select_related("customer", "transaction").prefetch_related("splits")

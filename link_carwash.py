@@ -1,50 +1,41 @@
 import os
-import sys
 import django
-from decimal import Decimal
 
-# 1. Setup Django standalone environment
-# Set the DJANGO_SETTINGS_MODULE to your project's settings file (e.g., 'myproject.settings')
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # 👈 Replace 'core.settings' with your settings module path if different
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
 django.setup()
 
-# 2. Import Django models AFTER django.setup() call
-from stocks.models import CreditRepayment, CreditRepaymentSplit  # Adjust app name if needed
+from datetime import date
+from stocks.models import SaleTransaction, CreditRepayment
 
+target_date = date(2026, 10, 10)
 
-def run_backfill():
-    count = 0
-    # Find all repayments marked as SPLIT that have 0 child split records
-    split_repayments = CreditRepayment.objects.filter(
-        payment_method="SPLIT",
-        splits__isnull=True
-    ).distinct()
+print(f"==================================================")
+print(f" 1. DIRECT SALES TRANSACTIONS (SaleTransaction)   ")
+print(f"==================================================")
+sales = SaleTransaction.objects.filter(sale_date__date=target_date)
+for sale in sales:
+    payments = list(sale.split_payments.all())
+    print(f"Tx #{sale.id} | Method: '{sale.payment_method}' | Amount Paid: KSh {sale.amount_paid}")
+    for p in payments:
+        print(f"   └─ Child SalePayment: method='{p.method}', amount={p.amount}")
 
-    for rep in split_repayments:
-        if rep.amount and rep.amount > Decimal("0.00"):
-            # Split the total amount evenly or assign to default channels for backfill
-            half_amount = (rep.amount / Decimal("2.00")).quantize(Decimal("0.01"))
-            remainder = rep.amount - half_amount
+print(f"\n==================================================")
+print(f" 2. PRIOR CREDIT REPAYMENTS COLLECTED ONLY        ")
+print(f"==================================================")
+# Filter repayments on target_date whose credit invoice was created BEFORE target_date
+# Or repayments linked to general customer balances (transaction__isnull=True)
+repayments = CreditRepayment.objects.filter(
+    date=target_date
+).filter(
+    transaction__sale_date__date__lt=target_date
+) | CreditRepayment.objects.filter(
+    date=target_date, 
+    transaction__isnull=True
+)
 
-            # Create Line 1 (Cash)
-            CreditRepaymentSplit.objects.create(
-                repayment=rep,
-                method="CASH",
-                amount=half_amount,
-                reference_code="BACKFILL-CASH"
-            )
-
-            # Create Line 2 (Paybill)
-            CreditRepaymentSplit.objects.create(
-                repayment=rep,
-                method="PAYBILL",
-                amount=remainder,
-                reference_code="BACKFILL-PAYBILL"
-            )
-            count += 1
-
-    print(f"Successfully backfilled split records for {count} existing split repayments!")
-
-
-if __name__ == "__main__":
-    run_backfill()
+for rep in repayments.distinct():
+    splits = list(rep.splits.all())
+    customer_name = rep.customer.name if getattr(rep, 'customer', None) else "N/A"
+    print(f"Repayment #{rep.id} | Customer: {customer_name} | Method: '{rep.payment_method}' | Amount: KSh {rep.amount}")
+    for s in splits:
+        print(f"   └─ Child CreditRepaymentSplit: method='{s.method}', amount={s.amount}")

@@ -1895,9 +1895,11 @@ class SaleTransaction(models.Model):
                     or ""
                 ).upper().replace("-", "_").replace(" ", "_")
 
-                if "PAYBILL" in raw_method or "MPESA" in raw_method:
+                # 1. Match PAYBILL explicitly first
+                if any(k in raw_method for k in ["PAYBILL", "PAY_BILL", "C2B"]):
                     totals["PAYBILL"] += amt
-                elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
+                # 2. Map generic MPESA / Send Money / Till to SEND_MONEY
+                elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "MPESA", "M_PESA", "MOBILE", "P2P"]):
                     totals["SEND_MONEY"] += amt
                 elif any(k in raw_method for k in ["BANK", "TRANSFER", "EFT"]):
                     totals["BANK_TRANSFER"] += amt
@@ -1915,9 +1917,9 @@ class SaleTransaction(models.Model):
                 total_val = Decimal(str(self.total_amount or 0))
                 credit_due = max(ZERO, total_val - amt)
                 totals["CREDIT"] += credit_due
-            elif "PAYBILL" in raw_method or "MPESA" in raw_method:
+            elif any(k in raw_method for k in ["PAYBILL", "PAY_BILL", "C2B"]):
                 totals["PAYBILL"] += amt
-            elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS"]):
+            elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "MPESA", "M_PESA", "MOBILE", "P2P"]):
                 totals["SEND_MONEY"] += amt
             elif any(k in raw_method for k in ["BANK", "TRANSFER", "EFT"]):
                 totals["BANK_TRANSFER"] += amt
