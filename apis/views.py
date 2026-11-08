@@ -11687,17 +11687,16 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 items_data = transaction_items_map.get(sale.id, [])
                 
                 rec_num = str(sale.receipt_number or f"REC-{sale.id}")
-                norm_method = self._normalize_payment_method(sale.payment_method)
 
-                is_inv = (
-                    rec_num.startswith("INV") 
-                    or bool(sale.invoice_number) 
-                    or norm_method == "CREDIT"
-                )
+                # 1. Strictly rely on prefix/invoice marker for display tag
+                # RECs display their saved payment method (PAYBILL, CASH, SEND_MONEY, etc.)
+                # INVs display CREDIT
+                if rec_num.startswith("INV") or bool(sale.invoice_number):
+                    disp_channel = "CREDIT"
+                else:
+                    disp_channel = sale.payment_method or "CASH"
 
-                # Receipts (REC-...) show their cash channel (PAYBILL, CASH, SEND_MONEY); Invoices show as CREDIT
-                disp_channel = "CREDIT" if is_inv else norm_method
-
+                # 2. Customer Name Resolution
                 cust_disp_name = (
                     sale.customer.name if getattr(sale, 'customer', None) 
                     else (sale.customer_name or "Walk-in Customer")
