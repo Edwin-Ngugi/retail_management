@@ -11689,18 +11689,30 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 
                 rec_num = str(sale.receipt_number or f"REC-{sale.id}")
                 norm_method = self._normalize_payment_method(sale.payment_method)
+                split_records = self._get_split_payments(sale)
 
                 if rec_num.startswith("INV"):
                     disp_channel = "CREDIT"
-                elif norm_method == "SPLIT" or len(self._get_split_payments(sale)) > 1:
-                    disp_channel = "SPLIT"
-                else:
-                    breakdown = sale.liquid_payments_breakdown
-                    active_methods = [m for m, val in breakdown.items() if val > ZERO and m != "CREDIT"]
-                    if active_methods:
-                        disp_channel = active_methods[0]
+                elif norm_method == "SPLIT":
+                    # If marked as SPLIT, double check if it actually has multiple distinct channels
+                    distinct_methods = set()
+                    for sp in split_records:
+                        sp_raw = self._extract_sp_method(sp)
+                        distinct_methods.add(self._normalize_payment_method(sp_raw))
+                    
+                    if len(distinct_methods) > 1:
+                        disp_channel = "SPLIT"
+                    elif len(distinct_methods) == 1:
+                        disp_channel = list(distinct_methods)[0]
                     else:
-                        disp_channel = "CASH" if norm_method == "CREDIT" else norm_method
+                        disp_channel = "SPLIT"
+                else:
+                    # Single payment method transactions (e.g. CASH, PAYBILL, SEND_MONEY)
+                    if split_records:
+                        sp_raw = self._extract_sp_method(split_records[0])
+                        disp_channel = self._normalize_payment_method(sp_raw)
+                    else:
+                        disp_channel = norm_method
 
                 cust_disp_name = (
                     sale.customer.name if getattr(sale, 'customer', None) 
