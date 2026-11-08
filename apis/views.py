@@ -3094,14 +3094,38 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 if raw_custom and str(raw_custom).strip():
                     custom_receipt = str(raw_custom).strip()
 
-            # 5. Extract Split Payments Payload (Supports multiple frontend field keys)
+            # 5. Extract Split Payments Payload & Resolve Exact Method
             split_payments_payload = (
                 data.get("split_payments")
-                or data.get("payments")
                 or data.get("splits")
                 or data.get("split_details")
                 or []
             )
+
+            if isinstance(split_payments_payload, dict):
+                formatted_splits = []
+                for k, v in split_payments_payload.items():
+                    amt_dec = quantize_money(v)
+                    if amt_dec > ZERO:
+                        formatted_splits.append({"method": k, "amount": amt_dec})
+                split_payments_payload = formatted_splits
+
+            valid_splits = []
+            if isinstance(split_payments_payload, list):
+                for sp in split_payments_payload:
+                    if isinstance(sp, dict):
+                        amt = quantize_money(sp.get("amount", ZERO))
+                        if amt > ZERO:
+                            valid_splits.append(sp)
+
+            # Truly SPLIT only if explicitly requested or if >= 2 distinct payments are provided
+            if normalized_pm == "SPLIT" or len(valid_splits) > 1:
+                final_pm = "SPLIT"
+            elif len(valid_splits) == 1:
+                sp_raw = valid_splits[0].get("method") or valid_splits[0].get("payment_method") or valid_splits[0].get("channel")
+                final_pm = self._normalize_payment_method(sp_raw)
+            else:
+                final_pm = normalized_pm
 
             # 6. Process Sale via Transaction Atomic Block
             with transaction.atomic():
@@ -3111,14 +3135,13 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                     "branch": branch_obj,
                     "customer": customer_obj,
                     "customer_name": customer_name,
-                    "payment_method": normalized_pm,
+                    "payment_method": final_pm,
                     "sale_date": parsed_date,
                     "total_amount": ZERO,
                     "amount_paid": amount_paid_quantized,
                     "created_by": request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
                 }
 
-                # Explicitly set user-entered invoice code for Credit Sales
                 if custom_receipt:
                     create_kwargs["receipt_number"] = custom_receipt
 
@@ -3159,44 +3182,27 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 calculated_total = quantize_money(calculated_total)
                 sale.total_amount = calculated_total
 
-                # =================================================================
-                # ROUTE AND SAVE SPLIT PAYMENTS TO CHILD SalePayment MODEL
-                # =================================================================
-                if normalized_pm == "SPLIT" or len(split_payments_payload) > 0:
+                # Route child SalePayment entries ONLY for true multi-channel split payments
+                if final_pm == "SPLIT" and valid_splits:
                     split_sum = ZERO
-                    
-                    # Handle dictionary format payloads e.g. {"cash": 500, "paybill": 300}
-                    if isinstance(split_payments_payload, dict):
-                        formatted_splits = []
-                        for k, v in split_payments_payload.items():
-                            amt_dec = quantize_money(v)
-                            if amt_dec > ZERO:
-                                formatted_splits.append({"method": k, "amount": amt_dec})
-                        split_payments_payload = formatted_splits
-
-                    for sp in split_payments_payload:
-                        if not isinstance(sp, dict):
-                            continue
-                        
-                        raw_sp_method = sp.get("method") or sp.get("payment_method") or sp.get("channel")
-                        sp_method = self._normalize_payment_method(raw_sp_method)
+                    for sp in valid_splits:
+                        sp_raw = sp.get("method") or sp.get("payment_method") or sp.get("channel")
+                        sp_method = self._normalize_payment_method(sp_raw)
                         sp_amount = quantize_money(sp.get("amount", ZERO))
 
-                        if sp_amount > ZERO:
-                            split_sum += sp_amount
-                            SalePayment.objects.create(
-                                transaction=sale,
-                                method=sp_method,
-                                amount=sp_amount,
-                                reference_code=sp.get("reference_code") or sp.get("reference") or sale.receipt_number or ""
-                            )
-
+                        split_sum += sp_amount
+                        SalePayment.objects.create(
+                            transaction=sale,
+                            method=sp_method,
+                            amount=sp_amount,
+                            reference_code=sp.get("reference_code") or sp.get("reference") or sale.receipt_number or ""
+                        )
                     sale.amount_paid = split_sum
-                    sale.payment_method = "SPLIT"
-                elif normalized_pm != "CREDIT" and sale.amount_paid == ZERO:
-                    sale.amount_paid = calculated_total
                 else:
-                    sale.amount_paid = quantize_money(sale.amount_paid)
+                    if final_pm != "CREDIT" and (sale.amount_paid == ZERO or sale.amount_paid is None):
+                        sale.amount_paid = calculated_total
+                    else:
+                        sale.amount_paid = quantize_money(sale.amount_paid)
 
                 sale.save()
 
