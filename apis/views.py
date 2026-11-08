@@ -2400,7 +2400,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 },
             )
 
-            # 3. Bulk Fetch Items and Pricing Objects (Performance Boost)
+            # 3. Bulk Fetch Items and Pricing Objects
             raw_item_ids = [
                 d.get("item") or d.get("item_id")
                 for d in items_payload
@@ -2477,12 +2477,12 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     )
                 )
 
-                # Calculate item-level total cost and payment status
-                line_total = quantize_money(quantity * unit_cost)
+                # Calculate item-level amount_paid and payment status
+                line_total = (quantity * unit_cost).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                 is_paid_status = payment_method != "CREDIT"
                 item_amount_paid = line_total if is_paid_status else ZERO
 
-                # Queue Individual Purchase Records with payment fields populated
+                # Queue Individual Purchase Records (total_cost omitted as it is a property)
                 purchases_to_create.append(
                     Purchase(
                         item=item,
@@ -2490,9 +2490,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                         supplier_name=supplier_name,
                         quantity=quantity,
                         unit_cost_price=unit_cost,
-                        total_cost=line_total,
                         amount_paid=item_amount_paid,
-                        is_paid=is_paid_status,
                         payment_method=payment_method,
                         purchase_date=purchase_date,
                         created_by=user,
