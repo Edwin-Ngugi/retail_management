@@ -11272,18 +11272,28 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
 
+            # Liquid totals STRICTLY for sales originated on this target date
             cash_total = ZERO
             paybill_total = ZERO
             send_money_total = ZERO
             bank_total = ZERO
             other_total = ZERO
             gross_credit_sales = ZERO
+            
+            # Repayment totals STRICTLY for repayments collected on this target date
             period_credit_repayments_total = ZERO
+            repayments_by_channel = {
+                "CASH": ZERO,
+                "PAYBILL": ZERO,
+                "SEND_MONEY": ZERO,
+                "BANK_TRANSFER": ZERO,
+                "OTHER": ZERO,
+            }
 
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DIRECT SALES INFLOWS (ROUTING SPLITS & LIQUID CHANNELS)
+            # 1. DIRECT SALES INFLOWS (TARGET DATE SALES ONLY)
             # -----------------------------------------------------------------
             sales_with_payments = sales_qs.distinct().select_related("customer", "branch").prefetch_related(
                 "split_payments", "legacy_sales__split_payments"
@@ -11351,7 +11361,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         other_total += sale_paid
 
             # -----------------------------------------------------------------
-            # 2. CUSTOMER DEBT REPAYMENTS (ATTRIBUTED EXCLUSIVELY TO REPAYMENT DATE)
+            # 2. CUSTOMER DEBT REPAYMENTS (ISOLATED TO COLLECTION DATE)
             # -----------------------------------------------------------------
             repayments_list = []
             repayments_qs = repayment_qs.distinct().select_related("customer", "transaction").prefetch_related("splits")
@@ -11365,7 +11375,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 raw_method = getattr(repayment, "payment_method", "CASH")
                 norm_rep_method = self._normalize_payment_method(raw_method)
 
-                # A. Repayment has split records
+                # Route repayments to repayment channel metrics without polluting target date sales channels
                 split_records = []
                 for rel in ["splits", "split_payments"]:
                     if hasattr(repayment, rel):
@@ -11380,26 +11390,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                             sp_raw = self._extract_sp_method(sp)
                             sp_channel = self._normalize_payment_method(sp_raw)
                             sp_amt = self._extract_sp_amount(sp)
-
-                            if sp_channel == "PAYBILL":
-                                paybill_total += sp_amt
-                            elif sp_channel == "SEND_MONEY":
-                                send_money_total += sp_amt
-                            elif sp_channel == "BANK_TRANSFER":
-                                bank_total += sp_amt
-                            else:
-                                cash_total += sp_amt
+                            
+                            target = sp_channel if sp_channel in repayments_by_channel else "OTHER"
+                            repayments_by_channel[target] += sp_amt
                     else:
-                        cash_total += rep_amt
+                        repayments_by_channel["CASH"] += rep_amt
                 else:
-                    if norm_rep_method == "PAYBILL":
-                        paybill_total += rep_amt
-                    elif norm_rep_method == "SEND_MONEY":
-                        send_money_total += rep_amt
-                    elif norm_rep_method == "BANK_TRANSFER":
-                        bank_total += rep_amt
-                    else:
-                        cash_total += rep_amt
+                    target = norm_rep_method if norm_rep_method in repayments_by_channel else "OTHER"
+                    repayments_by_channel[target] += rep_amt
 
                 repayments_list.append({
                     "id": repayment.id,
