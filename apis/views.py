@@ -2400,13 +2400,36 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 },
             )
 
-            created_purchases = []
+            # 3. Bulk Fetch Items and Pricing Objects (Performance Boost)
+            raw_item_ids = [
+                d.get("item") or d.get("item_id")
+                for d in items_payload
+                if isinstance(d, dict) and (d.get("item") or d.get("item_id"))
+            ]
+            
+            items_dict = {
+                item.id: item 
+                for item in Item.objects.select_for_update().filter(id__in=raw_item_ids)
+            }
+
+            existing_pricings = {
+                p.item_id: p
+                for p in BranchItemPricing.objects.filter(item_id__in=items_dict.keys(), branch=branch_obj)
+            }
+
+            po_items_to_create = []
+            purchases_to_create = []
+            pricings_to_create = []
             processed_items = set()
 
-            # 3. Process items in batch
+            # 4. In-Memory Processing Loop
             for data in items_payload:
+                if not isinstance(data, dict):
+                    continue
+
                 item_id = data.get("item") or data.get("item_id")
-                if not item_id:
+                item = items_dict.get(int(item_id) if str(item_id).isdigit() else item_id)
+                if not item:
                     continue
 
                 quantity = Decimal(str(data.get("quantity", 0) or 0))
@@ -2422,7 +2445,6 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     str(unit_cost_raw if unit_cost_raw not in (None, "") else "0.00")
                 )
 
-                item = Item.objects.select_for_update().get(id=item_id)
                 cur_branch = (
                     _resolve_branch(data.get("branch") or data.get("branch_id"))
                     or branch_obj
@@ -2433,39 +2455,57 @@ class PurchaseViewSet(viewsets.ModelViewSet):
 
                 self._align_retailer(item, cur_branch)
 
-                BranchItemPricing.objects.get_or_create(
-                    item=item,
-                    branch=cur_branch,
-                    defaults={
-                        "opening_stock": ZERO,
-                        "unit_cost_price": unit_cost,
-                        "unit_selling_price": ZERO,
-                    },
+                # Queue missing branch pricing records
+                if item.id not in existing_pricings:
+                    new_pricing = BranchItemPricing(
+                        item=item,
+                        branch=cur_branch,
+                        opening_stock=ZERO,
+                        unit_cost_price=unit_cost,
+                        unit_selling_price=ZERO,
+                    )
+                    pricings_to_create.append(new_pricing)
+                    existing_pricings[item.id] = new_pricing
+
+                # Queue Batch Purchase Line Items
+                po_items_to_create.append(
+                    PurchaseOrderItem(
+                        purchase_order=po_header,
+                        item=item,
+                        quantity=quantity,
+                        unit_cost_price=unit_cost,
+                    )
                 )
 
-                PurchaseOrderItem.objects.create(
-                    purchase_order=po_header,
-                    item=item,
-                    quantity=quantity,
-                    unit_cost_price=unit_cost,
+                # Queue Individual Purchase Records
+                purchases_to_create.append(
+                    Purchase(
+                        item=item,
+                        branch=cur_branch,
+                        supplier_name=supplier_name,
+                        quantity=quantity,
+                        unit_cost_price=unit_cost,
+                        payment_method=payment_method,
+                        purchase_date=purchase_date,
+                        created_by=user,
+                    )
                 )
-
-                purchase = Purchase(
-                    item=item,
-                    branch=cur_branch,
-                    supplier_name=supplier_name,
-                    quantity=quantity,
-                    unit_cost_price=unit_cost,
-                    payment_method=payment_method,
-                    purchase_date=purchase_date,
-                    created_by=user,
-                )
-                purchase.save()
-
-                created_purchases.append(purchase)
                 processed_items.add((cur_branch, item))
 
-            # 4. Total calculation and partial payment assignment
+            if not purchases_to_create:
+                return Response(
+                    {"error": "No valid purchase entries were processed."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 5. Execute Bulk Insertions
+            if pricings_to_create:
+                BranchItemPricing.objects.bulk_create(pricings_to_create, ignore_conflicts=True)
+
+            PurchaseOrderItem.objects.bulk_create(po_items_to_create)
+            created_purchases = Purchase.objects.bulk_create(purchases_to_create)
+
+            # 6. Header Recalculations and WAC Computations
             po_header.recalculate_totals()
 
             if amount_paid_input not in (None, ""):
@@ -2476,18 +2516,17 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             for branch, item in processed_items:
                 recalculate_wac_sales_cost(branch, item)
 
-            if not created_purchases:
-                return Response(
-                    {"error": "No valid purchase entries were processed."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            self._broadcast_websocket_event(
-                branch_id=created_purchases[0].branch_id,
-                event_type="PURCHASE_RECORDED",
-                purchase_id=created_purchases[0].id,
-                item_id=created_purchases[0].item_id,
-            )
+            # 7. Non-blocking WebSocket Event
+            try:
+                if created_purchases:
+                    self._broadcast_websocket_event(
+                        branch_id=created_purchases[0].branch_id,
+                        event_type="PURCHASE_RECORDED",
+                        purchase_id=created_purchases[0].id,
+                        item_id=created_purchases[0].item_id,
+                    )
+            except Exception as ws_err:
+                logger.warning("Purchase WebSocket notification skipped: %s", ws_err)
 
             return Response(
                 {
