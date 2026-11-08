@@ -3094,7 +3094,16 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 if raw_custom and str(raw_custom).strip():
                     custom_receipt = str(raw_custom).strip()
 
-            # 5. Process Sale via Transaction Atomic Block
+            # 5. Extract Split Payments Payload (Supports multiple frontend field keys)
+            split_payments_payload = (
+                data.get("split_payments")
+                or data.get("payments")
+                or data.get("splits")
+                or data.get("split_details")
+                or []
+            )
+
+            # 6. Process Sale via Transaction Atomic Block
             with transaction.atomic():
                 amount_paid_quantized = quantize_money(data.get("amount_paid") or "0.00")
 
@@ -3149,14 +3158,49 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
 
                 calculated_total = quantize_money(calculated_total)
                 sale.total_amount = calculated_total
-                if normalized_pm != "CREDIT" and sale.amount_paid == ZERO:
+
+                # =================================================================
+                # ROUTE AND SAVE SPLIT PAYMENTS TO CHILD SalePayment MODEL
+                # =================================================================
+                if normalized_pm == "SPLIT" or len(split_payments_payload) > 0:
+                    split_sum = ZERO
+                    
+                    # Handle dictionary format payloads e.g. {"cash": 500, "paybill": 300}
+                    if isinstance(split_payments_payload, dict):
+                        formatted_splits = []
+                        for k, v in split_payments_payload.items():
+                            amt_dec = quantize_money(v)
+                            if amt_dec > ZERO:
+                                formatted_splits.append({"method": k, "amount": amt_dec})
+                        split_payments_payload = formatted_splits
+
+                    for sp in split_payments_payload:
+                        if not isinstance(sp, dict):
+                            continue
+                        
+                        raw_sp_method = sp.get("method") or sp.get("payment_method") or sp.get("channel")
+                        sp_method = self._normalize_payment_method(raw_sp_method)
+                        sp_amount = quantize_money(sp.get("amount", ZERO))
+
+                        if sp_amount > ZERO:
+                            split_sum += sp_amount
+                            SalePayment.objects.create(
+                                transaction=sale,
+                                method=sp_method,
+                                amount=sp_amount,
+                                reference_code=sp.get("reference_code") or sp.get("reference") or sale.receipt_number or ""
+                            )
+
+                    sale.amount_paid = split_sum
+                    sale.payment_method = "SPLIT"
+                elif normalized_pm != "CREDIT" and sale.amount_paid == ZERO:
                     sale.amount_paid = calculated_total
                 else:
                     sale.amount_paid = quantize_money(sale.amount_paid)
 
                 sale.save()
 
-            # 6. Broadcast Real-time WebSocket Event
+            # 7. Broadcast Real-time WebSocket Event
             channel_layer = get_channel_layer()
             if channel_layer:
                 try:

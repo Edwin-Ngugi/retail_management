@@ -2316,14 +2316,17 @@ class SalePayment(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
-        # Auto-link transaction from sale if transaction is empty
-        if not self.transaction_id and self.sale_id and hasattr(self.sale, 'transaction_id'):
-            self.transaction_id = self.sale.transaction_id
-        # Auto-link sale from transaction if sale is empty
-        elif not self.sale_id and self.transaction_id:
-            first_sale = self.transaction.legacy_sales.first() if hasattr(self.transaction, 'legacy_sales') else None
-            if first_sale:
-                self.sale_id = first_sale.id
+        # 1. If transaction_id is set, but sale_id is missing, try to auto-fill sale_id
+        if self.transaction_id and not self.sale_id:
+            first_legacy = self.transaction.legacy_sales.first()
+            if first_legacy:
+                self.sale_id = first_legacy.id
+
+        # 2. If sale_id is set, but transaction_id is missing, auto-fill transaction_id
+        elif self.sale_id and not self.transaction_id:
+            if getattr(self.sale, 'transaction_id', None):
+                self.transaction_id = self.sale.transaction_id
+
         super().save(*args, **kwargs)
 
     def __str__(self):

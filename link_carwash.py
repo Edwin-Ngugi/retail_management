@@ -7,7 +7,7 @@ django.setup()
 from datetime import date
 from stocks.models import SaleTransaction, CreditRepayment
 
-target_date = date(2026, 10, 10)
+target_date = date(2026, 10, 16)
 
 print(f"==================================================")
 print(f" 1. DIRECT SALES TRANSACTIONS (SaleTransaction)   ")
