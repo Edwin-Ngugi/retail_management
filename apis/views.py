@@ -11310,69 +11310,30 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             for sale in sales_with_payments:
                 rec_num = str(sale.receipt_number or f"REC-{sale.id}")
-                norm_method = self._normalize_payment_method(sale.payment_method)
 
-                # STRICT RULE: Any transaction starting with INV is a Credit Invoice.
-                # 100% of face value goes to CREDIT exposure for this issue date.
+                # Rule A: Invoices (INV...) route 100% of their total face value to CREDIT exposure
                 if rec_num.startswith("INV"):
                     sale_total = Decimal(str(sale.total_amount or ZERO))
                     gross_credit_sales += quantize_money(sale_total)
                     continue
 
-                # PURE CASH / IMMEDIATE SALES (REC-...) WITH SPLIT PAYMENT SUPPORT
-                split_records = self._get_split_payments(sale)
+                # Rule B: Standard Receipts (REC...) parse exact liquid breakdown via model property
+                breakdown = sale.liquid_payments_breakdown
 
-                if norm_method == "SPLIT" or len(split_records) > 0:
-                    if split_records:
-                        for sp in split_records:
-                            sp_raw = self._extract_sp_method(sp)
-                            sp_channel = self._normalize_payment_method(sp_raw)
-                            sp_amt = self._extract_sp_amount(sp)
+                c_amt = quantize_money(breakdown.get("CASH", ZERO))
+                pb_amt = quantize_money(breakdown.get("PAYBILL", ZERO))
+                sm_amt = quantize_money(breakdown.get("SEND_MONEY", ZERO))
+                bt_amt = quantize_money(breakdown.get("BANK_TRANSFER", ZERO))
+                cr_amt = quantize_money(breakdown.get("CREDIT", ZERO))
+                oth_amt = quantize_money(breakdown.get("OTHER", ZERO))
 
-                            if sp_channel == "PAYBILL":
-                                paybill_total += sp_amt
-                            elif sp_channel == "SEND_MONEY":
-                                send_money_total += sp_amt
-                            elif sp_channel == "BANK_TRANSFER":
-                                bank_total += sp_amt
-                            elif sp_channel == "CASH":
-                                cash_total += sp_amt
-                            elif sp_channel == "CREDIT":
-                                gross_credit_sales += sp_amt
-                            else:
-                                other_total += sp_amt
-                    else:
-                        # Fallback to model's liquid breakdown property if split child records are missing
-                        breakdown = sale.liquid_payments_breakdown
-                        cash_total += quantize_money(breakdown.get("CASH", ZERO))
-                        paybill_total += quantize_money(breakdown.get("PAYBILL", ZERO))
-                        send_money_total += quantize_money(breakdown.get("SEND_MONEY", ZERO))
-                        bank_total += quantize_money(breakdown.get("BANK_TRANSFER", ZERO))
-                        gross_credit_sales += quantize_money(breakdown.get("CREDIT", ZERO))
-                        other_total += quantize_money(breakdown.get("OTHER", ZERO))
-                else:
-                    # Single payment method resolution
-                    sale_paid = Decimal(
-                        str(
-                            sale.amount_paid
-                            if getattr(sale, "amount_paid", None) and sale.amount_paid > ZERO
-                            else (sale.total_amount or ZERO)
-                        )
-                    )
-                    sale_paid = quantize_money(sale_paid)
-
-                    if norm_method == "PAYBILL":
-                        paybill_total += sale_paid
-                    elif norm_method == "SEND_MONEY":
-                        send_money_total += sale_paid
-                    elif norm_method == "BANK_TRANSFER":
-                        bank_total += sale_paid
-                    elif norm_method == "CASH":
-                        cash_total += sale_paid
-                    elif norm_method == "CREDIT":
-                        gross_credit_sales += sale_paid
-                    else:
-                        other_total += sale_paid
+                # Accumulate exact routed values
+                cash_total += c_amt
+                paybill_total += pb_amt
+                send_money_total += sm_amt
+                bank_total += bt_amt
+                gross_credit_sales += cr_amt
+                other_total += oth_amt
 
             # -----------------------------------------------------------------
             # 2. DEBT REPAYMENTS WITH ENFORCED SPLIT REPAYMENT ROUTING
@@ -11700,7 +11661,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 if rec_num.startswith("INV"):
                     disp_channel = "CREDIT"
                 elif norm_method == "SPLIT":
-                    # If marked as SPLIT, double check if it actually has multiple distinct channels
                     distinct_methods = set()
                     for sp in split_records:
                         sp_raw = self._extract_sp_method(sp)
@@ -11713,7 +11673,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     else:
                         disp_channel = "SPLIT"
                 else:
-                    # Single payment method transactions (e.g. CASH, PAYBILL, SEND_MONEY)
                     if split_records:
                         sp_raw = self._extract_sp_method(split_records[0])
                         disp_channel = self._normalize_payment_method(sp_raw)
