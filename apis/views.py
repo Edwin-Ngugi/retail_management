@@ -11295,53 +11295,66 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DIRECT SALES INFLOWS (USING MODEL PROPERTY FALLBACKS)
+            # 1. DIRECT SALES INFLOWS (PURE CASH SALES ONLY)
             # -----------------------------------------------------------------
             sales_with_payments = sales_qs.distinct().select_related("customer", "branch").prefetch_related(
                 "split_payments", "legacy_sales__split_payments"
             )
 
             for sale in sales_with_payments:
-                # Rely on SaleTransaction's model logic for breakdown
-                breakdown = sale.liquid_payments_breakdown
-                
-                c_amt = quantize_money(breakdown.get("CASH", ZERO))
-                pb_amt = quantize_money(breakdown.get("PAYBILL", ZERO))
-                sm_amt = quantize_money(breakdown.get("SEND_MONEY", ZERO))
-                bt_amt = quantize_money(breakdown.get("BANK_TRANSFER", ZERO))
-                cr_amt = quantize_money(breakdown.get("CREDIT", ZERO))
-                oth_amt = quantize_money(breakdown.get("OTHER", ZERO))
+                norm_method = self._normalize_payment_method(sale.payment_method)
 
-                # Check for explicit child split_payments overriding breakdown if missing
+                # A. IF IT IS AN INVOICE / CREDIT SALE: Route 100% of amount to CREDIT exposure
+                # Do NOT pollute PAYBILL/CASH/SEND_MONEY for the day the invoice was issued!
+                if norm_method == "CREDIT" or sale.receipt_number.startswith("INV") or sale.invoice_number:
+                    sale_total = Decimal(str(sale.total_amount or ZERO))
+                    gross_credit_sales += quantize_money(sale_total)
+                    continue
+
+                # B. PURE LIQUID CASH / MOBILE SALES (REC-...)
                 split_records = self._get_split_payments(sale)
-                if split_records and sum([c_amt, pb_amt, sm_amt, bt_amt, cr_amt, oth_amt]) == ZERO:
+
+                if split_records:
                     for sp in split_records:
                         sp_raw = self._extract_sp_method(sp)
                         sp_channel = self._normalize_payment_method(sp_raw)
                         sp_amt = self._extract_sp_amount(sp)
 
                         if sp_channel == "PAYBILL":
-                            pb_amt += sp_amt
+                            paybill_total += sp_amt
                         elif sp_channel == "SEND_MONEY":
-                            sm_amt += sp_amt
+                            send_money_total += sp_amt
                         elif sp_channel == "BANK_TRANSFER":
-                            bt_amt += sp_amt
+                            bank_total += sp_amt
                         elif sp_channel == "CASH":
-                            c_amt += sp_amt
+                            cash_total += sp_amt
                         elif sp_channel == "CREDIT":
-                            cr_amt += sp_amt
+                            gross_credit_sales += sp_amt
                         else:
-                            oth_amt += sp_amt
+                            other_total += sp_amt
+                else:
+                    sale_paid = Decimal(
+                        str(
+                            sale.amount_paid
+                            if getattr(sale, "amount_paid", None) and sale.amount_paid > ZERO
+                            else (sale.total_amount or ZERO)
+                        )
+                    )
+                    sale_paid = quantize_money(sale_paid)
 
-                cash_total += c_amt
-                paybill_total += pb_amt
-                send_money_total += sm_amt
-                bank_total += bt_amt
-                gross_credit_sales += cr_amt
-                other_total += oth_amt
+                    if norm_method == "PAYBILL":
+                        paybill_total += sale_paid
+                    elif norm_method == "SEND_MONEY":
+                        send_money_total += sale_paid
+                    elif norm_method == "BANK_TRANSFER":
+                        bank_total += sale_paid
+                    elif norm_method == "CASH":
+                        cash_total += sale_paid
+                    else:
+                        other_total += sale_paid
 
             # -----------------------------------------------------------------
-            # 2. CUSTOMER DEBT REPAYMENTS (ISOLATED TO COLLECTION DATE)
+            # 2. CUSTOMER DEBT REPAYMENTS (COLLECTED INFLOWS FOR THE DAY)
             # -----------------------------------------------------------------
             repayments_list = []
             repayments_qs = repayment_qs.distinct().select_related("customer", "transaction").prefetch_related("splits")
@@ -11640,13 +11653,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
+            # COMBINE PURE DIRECT CASH SALES + DEBT REPAYMENTS COLLECTED TODAY
             channel_map = {
-                "CASH": cash_total,
-                "PAYBILL": paybill_total,
-                "SEND_MONEY": send_money_total,
-                "BANK_TRANSFER": bank_total,
+                "CASH": cash_total + repayments_by_channel["CASH"],
+                "PAYBILL": paybill_total + repayments_by_channel["PAYBILL"],
+                "SEND_MONEY": send_money_total + repayments_by_channel["SEND_MONEY"],
+                "BANK_TRANSFER": bank_total + repayments_by_channel["BANK_TRANSFER"],
                 "CREDIT": gross_credit_sales,
-                "OTHER": other_total,
+                "OTHER": other_total + repayments_by_channel["OTHER"],
             }
 
             payment_breakdown = [
@@ -11662,13 +11676,16 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transactions_list = []
             for sale in sales_with_payments:
                 items_data = transaction_items_map.get(sale.id, [])
+                
+                # Normalize payment method for ledger display
+                disp_method = "CREDIT" if (sale.receipt_number and sale.receipt_number.startswith("INV")) or sale.invoice_number or sale.payment_method == "CREDIT" else (sale.payment_method or "CASH")
 
                 transactions_list.append({
                     "id": sale.id,
                     "receipt_number": sale.receipt_number or f"REC-{sale.id}",
                     "sale_date": sale.sale_date.strftime("%Y-%m-%d %H:%M") if hasattr(sale.sale_date, "strftime") else str(sale.sale_date),
                     "customer_name": sale.customer.name if getattr(sale, 'customer', None) else "Walk-in Customer",
-                    "payment_method": sale.payment_method or "CASH",
+                    "payment_method": disp_method,
                     "total_amount": float(getattr(sale, "total_amount", 0) or 0),
                     "items": items_data
                 })
