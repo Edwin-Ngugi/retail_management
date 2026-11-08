@@ -2192,7 +2192,7 @@ def _parse_business_date(date_val):
         except ValueError:
             return timezone.now()
     return date_val
-
+from decimal import Decimal, ROUND_HALF_UP
 
 class PurchaseViewSet(viewsets.ModelViewSet):
     """
@@ -2308,7 +2308,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
 
         return queryset
 
-    @transaction.atomic
+    @@transaction.atomic
     def create(self, request, *args, **kwargs):
         raw_data = request.data
 
@@ -2477,12 +2477,12 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     )
                 )
 
-                # Calculate item-level amount_paid and payment status
-                line_total = (quantity * unit_cost).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                # Calculate line amount safely rounded to 2 decimal places
+                line_total = (quantity * unit_cost).quantize(Decimal("0.01"))
                 is_paid_status = payment_method != "CREDIT"
                 item_amount_paid = line_total if is_paid_status else ZERO
 
-                # Queue Individual Purchase Records (total_cost omitted as it is a property)
+                # Queue Individual Purchase Records
                 purchases_to_create.append(
                     Purchase(
                         item=item,
