@@ -11275,7 +11275,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
 
-            # Channel Inflow Aggregators
+            # Channel Inflow Aggregators (Direct Sales)
             cash_total = ZERO
             paybill_total = ZERO
             send_money_total = ZERO
@@ -11283,6 +11283,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             other_total = ZERO
             gross_credit_sales = ZERO
 
+            # Channel Inflow Aggregators (Debt Repayments Collected)
             period_credit_repayments_total = ZERO
             repayments_by_channel = {
                 "CASH": ZERO,
@@ -11295,24 +11296,31 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DIRECT SALES INFLOWS (PURE CASH/LIQUID SALES ONLY)
+            # 1. DIRECT SALES INFLOWS (PURE CASH vs CREDIT INVOICES)
             # -----------------------------------------------------------------
             sales_with_payments = sales_qs.distinct().select_related("customer", "branch").prefetch_related(
                 "split_payments", "legacy_sales__split_payments"
             )
 
             for sale in sales_with_payments:
+                rec_num = str(sale.receipt_number or f"REC-{sale.id}")
                 norm_method = self._normalize_payment_method(sale.payment_method)
 
-                # A. IF IT IS AN INVOICE / CREDIT SALE: Route 100% of amount to CREDIT exposure
-                # Do NOT pollute PAYBILL/CASH/SEND_MONEY for the day the invoice was issued!
-                rec_no = str(sale.receipt_number or "")
-                if norm_method == "CREDIT" or rec_no.startswith("INV") or sale.invoice_number:
+                # STRICT RULE: Any transaction that is an Invoice / Credit Sale
+                # MUST route 100% of its amount to CREDIT exposure for this issue date.
+                # Do NOT route to PAYBILL/SEND_MONEY on the date of issuance!
+                is_credit_invoice = (
+                    rec_num.startswith("INV")
+                    or bool(sale.invoice_number)
+                    or norm_method == "CREDIT"
+                )
+
+                if is_credit_invoice:
                     sale_total = Decimal(str(sale.total_amount or ZERO))
                     gross_credit_sales += quantize_money(sale_total)
                     continue
 
-                # B. PURE LIQUID CASH / MOBILE SALES (REC-...)
+                # PURE CASH / IMMEDIATE SALES (REC-...)
                 split_records = self._get_split_payments(sale)
 
                 if split_records:
@@ -11355,7 +11363,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         other_total += sale_paid
 
             # -----------------------------------------------------------------
-            # 2. CUSTOMER DEBT REPAYMENTS (COLLECTED INFLOWS FOR THE DAY)
+            # 2. CUSTOMER DEBT REPAYMENTS (COLLECTED INFLOWS FOR THIS PERIOD ONLY)
             # -----------------------------------------------------------------
             repayments_list = []
             repayments_qs = repayment_qs.distinct().select_related("customer", "transaction").prefetch_related("splits")
@@ -11652,10 +11660,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "returned_orders_count": returns_qs.count()
             }
 
-            # FIXED TYPO HERE (_generate_executive_insights)
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
-            # COMBINE PURE DIRECT CASH SALES + DEBT REPAYMENTS COLLECTED TODAY
+            # RESOLVED DISTRIBUTION = PURE CASH SALES MADE TODAY + REPAYMENTS COLLECTED TODAY
             channel_map = {
                 "CASH": cash_total + repayments_by_channel["CASH"],
                 "PAYBILL": paybill_total + repayments_by_channel["PAYBILL"],
@@ -11682,17 +11689,15 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 rec_num = str(sale.receipt_number or f"REC-{sale.id}")
                 norm_method = self._normalize_payment_method(sale.payment_method)
 
-                # Identify if transaction is an Invoice / Credit sale
                 is_inv = (
                     rec_num.startswith("INV") 
                     or bool(sale.invoice_number) 
                     or norm_method == "CREDIT"
                 )
 
-                # Receipts (REC-...) retain their liquid channel; Invoices show as CREDIT
+                # Receipts (REC-...) show their cash channel (PAYBILL, CASH, SEND_MONEY); Invoices show as CREDIT
                 disp_channel = "CREDIT" if is_inv else norm_method
 
-                # Determine customer name safely
                 cust_disp_name = (
                     sale.customer.name if getattr(sale, 'customer', None) 
                     else (sale.customer_name or "Walk-in Customer")
