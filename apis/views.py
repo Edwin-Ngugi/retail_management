@@ -11652,7 +11652,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "returned_orders_count": returns_qs.count()
             }
 
-            insights = self._generateexecutive_insights(summary_payload, fast_movers, slow_movers)
+            # FIXED TYPO HERE (_generate_executive_insights)
+            insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
             # COMBINE PURE DIRECT CASH SALES + DEBT REPAYMENTS COLLECTED TODAY
             channel_map = {
@@ -11688,7 +11689,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     or norm_method == "CREDIT"
                 )
 
-                # Receipts (REC-...) retain their liquid channel (PAYBILL, CASH, SEND_MONEY); Invoices show as CREDIT
+                # Receipts (REC-...) retain their liquid channel; Invoices show as CREDIT
                 disp_channel = "CREDIT" if is_inv else norm_method
 
                 # Determine customer name safely
