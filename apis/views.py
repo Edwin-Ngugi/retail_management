@@ -2308,7 +2308,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
 
         return queryset
 
-    @@transaction.atomic
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
         raw_data = request.data
 
