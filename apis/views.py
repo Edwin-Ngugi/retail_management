@@ -11257,6 +11257,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             if start_dt and end_dt:
                 sales_qs = sales_qs.filter(sale_date__gte=start_dt, sale_date__lte=end_dt)
+            
+            # Repayments are strictly filtered by their actual payment collection date
             if start_date and end_date:
                 returns_qs = returns_qs.filter(date__gte=start_date, date__lte=end_date)
                 repayment_qs = repayment_qs.filter(date__gte=start_date, date__lte=end_date)
@@ -11349,7 +11351,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         other_total += sale_paid
 
             # -----------------------------------------------------------------
-            # 2. CUSTOMER DEBT REPAYMENTS (ROUTING SPLITS & REPAYMENT CHANNELS)
+            # 2. CUSTOMER DEBT REPAYMENTS (ATTRIBUTED EXCLUSIVELY TO REPAYMENT DATE)
             # -----------------------------------------------------------------
             repayments_list = []
             repayments_qs = repayment_qs.distinct().select_related("customer", "transaction").prefetch_related("splits")
