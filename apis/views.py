@@ -2477,7 +2477,12 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                     )
                 )
 
-                # Queue Individual Purchase Records
+                # Calculate item-level total cost and payment status
+                line_total = quantize_money(quantity * unit_cost)
+                is_paid_status = payment_method != "CREDIT"
+                item_amount_paid = line_total if is_paid_status else ZERO
+
+                # Queue Individual Purchase Records with payment fields populated
                 purchases_to_create.append(
                     Purchase(
                         item=item,
@@ -2485,6 +2490,9 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                         supplier_name=supplier_name,
                         quantity=quantity,
                         unit_cost_price=unit_cost,
+                        total_cost=line_total,
+                        amount_paid=item_amount_paid,
+                        is_paid=is_paid_status,
                         payment_method=payment_method,
                         purchase_date=purchase_date,
                         created_by=user,
