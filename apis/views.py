@@ -11252,12 +11252,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
 
-            # Ensure start_dt and end_dt cover the full day range in local time
-            if start_date and end_date and period_type == "day":
-                tz = timezone.get_current_timezone()
-                start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
-                end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
-
             sales_qs = SaleTransaction.objects.all()
             returns_qs = CustomerReturn.objects.all()
             repayment_qs = CreditRepayment.objects.all()
@@ -11281,15 +11275,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
 
-            # Liquid totals STRICTLY for sales originated on this target date
+            # Channel Inflow Aggregators
             cash_total = ZERO
             paybill_total = ZERO
             send_money_total = ZERO
             bank_total = ZERO
             other_total = ZERO
             gross_credit_sales = ZERO
-            
-            # Repayment totals STRICTLY for repayments collected on this target date
+
             period_credit_repayments_total = ZERO
             repayments_by_channel = {
                 "CASH": ZERO,
@@ -11302,72 +11295,50 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DIRECT SALES INFLOWS (TARGET DATE SALES ONLY)
+            # 1. DIRECT SALES INFLOWS (USING MODEL PROPERTY FALLBACKS)
             # -----------------------------------------------------------------
             sales_with_payments = sales_qs.distinct().select_related("customer", "branch").prefetch_related(
                 "split_payments", "legacy_sales__split_payments"
             )
 
             for sale in sales_with_payments:
-                norm_method = self._normalize_payment_method(sale.payment_method)
-                split_records = self._get_split_payments(sale)
+                # Rely on SaleTransaction's model logic for breakdown
+                breakdown = sale.liquid_payments_breakdown
+                
+                c_amt = quantize_money(breakdown.get("CASH", ZERO))
+                pb_amt = quantize_money(breakdown.get("PAYBILL", ZERO))
+                sm_amt = quantize_money(breakdown.get("SEND_MONEY", ZERO))
+                bt_amt = quantize_money(breakdown.get("BANK_TRANSFER", ZERO))
+                cr_amt = quantize_money(breakdown.get("CREDIT", ZERO))
+                oth_amt = quantize_money(breakdown.get("OTHER", ZERO))
 
-                # A. Invoice has child split payments: Route each split to its target channel
-                if split_records:
+                # Check for explicit child split_payments overriding breakdown if missing
+                split_records = self._get_split_payments(sale)
+                if split_records and sum([c_amt, pb_amt, sm_amt, bt_amt, cr_amt, oth_amt]) == ZERO:
                     for sp in split_records:
                         sp_raw = self._extract_sp_method(sp)
                         sp_channel = self._normalize_payment_method(sp_raw)
                         sp_amt = self._extract_sp_amount(sp)
 
                         if sp_channel == "PAYBILL":
-                            paybill_total += sp_amt
+                            pb_amt += sp_amt
                         elif sp_channel == "SEND_MONEY":
-                            send_money_total += sp_amt
+                            sm_amt += sp_amt
                         elif sp_channel == "BANK_TRANSFER":
-                            bank_total += sp_amt
+                            bt_amt += sp_amt
                         elif sp_channel == "CASH":
-                            cash_total += sp_amt
+                            c_amt += sp_amt
                         elif sp_channel == "CREDIT":
-                            gross_credit_sales += sp_amt
+                            cr_amt += sp_amt
                         else:
-                            other_total += sp_amt
+                            oth_amt += sp_amt
 
-                # B. Historical liquid_payments_breakdown dict fallback
-                elif hasattr(sale, "liquid_payments_breakdown") and sale.liquid_payments_breakdown:
-                    bd = sale.liquid_payments_breakdown
-                    cash_total += quantize_money(bd.get("CASH", ZERO))
-                    paybill_total += quantize_money(bd.get("PAYBILL", ZERO))
-                    send_money_total += quantize_money(bd.get("SEND_MONEY", ZERO) + bd.get("MPESA", ZERO))
-                    bank_total += quantize_money(bd.get("BANK_TRANSFER", ZERO))
-                    gross_credit_sales += quantize_money(bd.get("CREDIT", ZERO))
-                    other_total += quantize_money(bd.get("OTHER", ZERO))
-
-                # C. Pure Credit Invoice without child splits
-                elif norm_method == "CREDIT":
-                    sale_amt = Decimal(str(sale.total_amount or ZERO))
-                    gross_credit_sales += quantize_money(sale_amt)
-
-                # D. Single Payment Method Liquid Transaction
-                else:
-                    sale_paid = Decimal(
-                        str(
-                            sale.amount_paid
-                            if getattr(sale, "amount_paid", None) and sale.amount_paid > ZERO
-                            else (sale.total_amount or ZERO)
-                        )
-                    )
-                    sale_paid = quantize_money(sale_paid)
-
-                    if norm_method == "PAYBILL":
-                        paybill_total += sale_paid
-                    elif norm_method == "SEND_MONEY":
-                        send_money_total += sale_paid
-                    elif norm_method == "BANK_TRANSFER":
-                        bank_total += sale_paid
-                    elif norm_method == "CASH":
-                        cash_total += sale_paid
-                    else:
-                        other_total += sale_paid
+                cash_total += c_amt
+                paybill_total += pb_amt
+                send_money_total += sm_amt
+                bank_total += bt_amt
+                gross_credit_sales += cr_amt
+                other_total += oth_amt
 
             # -----------------------------------------------------------------
             # 2. CUSTOMER DEBT REPAYMENTS (ISOLATED TO COLLECTION DATE)
