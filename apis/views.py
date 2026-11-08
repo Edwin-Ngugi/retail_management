@@ -11295,7 +11295,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DIRECT SALES INFLOWS (PURE CASH SALES ONLY)
+            # 1. DIRECT SALES INFLOWS (PURE CASH/LIQUID SALES ONLY)
             # -----------------------------------------------------------------
             sales_with_payments = sales_qs.distinct().select_related("customer", "branch").prefetch_related(
                 "split_payments", "legacy_sales__split_payments"
@@ -11306,7 +11306,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
                 # A. IF IT IS AN INVOICE / CREDIT SALE: Route 100% of amount to CREDIT exposure
                 # Do NOT pollute PAYBILL/CASH/SEND_MONEY for the day the invoice was issued!
-                if norm_method == "CREDIT" or sale.receipt_number.startswith("INV") or sale.invoice_number:
+                rec_no = str(sale.receipt_number or "")
+                if norm_method == "CREDIT" or rec_no.startswith("INV") or sale.invoice_number:
                     sale_total = Decimal(str(sale.total_amount or ZERO))
                     gross_credit_sales += quantize_money(sale_total)
                     continue
@@ -11651,7 +11652,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "returned_orders_count": returns_qs.count()
             }
 
-            insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
+            insights = self._generateexecutive_insights(summary_payload, fast_movers, slow_movers)
 
             # COMBINE PURE DIRECT CASH SALES + DEBT REPAYMENTS COLLECTED TODAY
             channel_map = {
@@ -11677,15 +11678,31 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             for sale in sales_with_payments:
                 items_data = transaction_items_map.get(sale.id, [])
                 
-                # Normalize payment method for ledger display
-                disp_method = "CREDIT" if (sale.receipt_number and sale.receipt_number.startswith("INV")) or sale.invoice_number or sale.payment_method == "CREDIT" else (sale.payment_method or "CASH")
+                rec_num = str(sale.receipt_number or f"REC-{sale.id}")
+                norm_method = self._normalize_payment_method(sale.payment_method)
+
+                # Identify if transaction is an Invoice / Credit sale
+                is_inv = (
+                    rec_num.startswith("INV") 
+                    or bool(sale.invoice_number) 
+                    or norm_method == "CREDIT"
+                )
+
+                # Receipts (REC-...) retain their liquid channel (PAYBILL, CASH, SEND_MONEY); Invoices show as CREDIT
+                disp_channel = "CREDIT" if is_inv else norm_method
+
+                # Determine customer name safely
+                cust_disp_name = (
+                    sale.customer.name if getattr(sale, 'customer', None) 
+                    else (sale.customer_name or "Walk-in Customer")
+                )
 
                 transactions_list.append({
                     "id": sale.id,
-                    "receipt_number": sale.receipt_number or f"REC-{sale.id}",
+                    "receipt_number": rec_num,
                     "sale_date": sale.sale_date.strftime("%Y-%m-%d %H:%M") if hasattr(sale.sale_date, "strftime") else str(sale.sale_date),
-                    "customer_name": sale.customer.name if getattr(sale, 'customer', None) else "Walk-in Customer",
-                    "payment_method": disp_method,
+                    "customer_name": cust_disp_name,
+                    "payment_method": disp_channel,
                     "total_amount": float(getattr(sale, "total_amount", 0) or 0),
                     "items": items_data
                 })
