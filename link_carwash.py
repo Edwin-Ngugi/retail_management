@@ -1,35 +1,41 @@
 import os
-import sys
 import django
 
-# Set up Django environment settings
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # Replace 'your_project_name' with your actual Django project directory name
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
 django.setup()
 
-from stocks.models import SaleTransaction
-from decimal import Decimal
+from datetime import date
+from stocks.models import SaleTransaction, CreditRepayment
 
-def fix_unpaid_credit_sales():
-    # Find all credit invoices
-    credit_sales = SaleTransaction.objects.filter(
-        payment_method="CREDIT"
-    ) | SaleTransaction.objects.filter(
-        receipt_number__startswith="INV"
-    )
+target_date = date(2026, 10, 19)
 
-    updated_count = 0
-    for sale in credit_sales.distinct():
-        # Enforce CREDIT method and reset paid fields
-        sale.payment_method = "CREDIT"
-        sale.amount_paid = Decimal("0.00")
-        sale.is_paid = False
-        sale.save(update_fields=["payment_method", "amount_paid", "is_paid"])
-        
-        # Remove any spurious auto-generated default payment splits for unpaid credit invoices
-        sale.split_payments.filter(method="CREDIT").delete()
-        updated_count += 1
+print(f"==================================================")
+print(f" 1. DIRECT SALES TRANSACTIONS (SaleTransaction)   ")
+print(f"==================================================")
+sales = SaleTransaction.objects.filter(sale_date__date=target_date)
+for sale in sales:
+    payments = list(sale.split_payments.all())
+    print(f"Tx #{sale.id} | Method: '{sale.payment_method}' | Amount Paid: KSh {sale.amount_paid}")
+    for p in payments:
+        print(f"   └─ Child SalePayment: method='{p.method}', amount={p.amount}")
 
-    print(f"Successfully updated {updated_count} credit invoices to UNPAID (is_paid=False, amount_paid=0.00).")
+print(f"\n==================================================")
+print(f" 2. PRIOR CREDIT REPAYMENTS COLLECTED ONLY        ")
+print(f"==================================================")
+# Filter repayments on target_date whose credit invoice was created BEFORE target_date
+# Or repayments linked to general customer balances (transaction__isnull=True)
+repayments = CreditRepayment.objects.filter(
+    date=target_date
+).filter(
+    transaction__sale_date__date__lt=target_date
+) | CreditRepayment.objects.filter(
+    date=target_date, 
+    transaction__isnull=True
+)
 
-if __name__ == "__main__":
-    fix_unpaid_credit_sales()
+for rep in repayments.distinct():
+    splits = list(rep.splits.all())
+    customer_name = rep.customer.name if getattr(rep, 'customer', None) else "N/A"
+    print(f"Repayment #{rep.id} | Customer: {customer_name} | Method: '{rep.payment_method}' | Amount: KSh {rep.amount}")
+    for s in splits:
+        print(f"   └─ Child CreditRepaymentSplit: method='{s.method}', amount={s.amount}")

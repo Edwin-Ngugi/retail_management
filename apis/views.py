@@ -1274,19 +1274,48 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Normalize payment method
+            # Extract Split Payments Payload
+            split_payload = (
+                raw_data.get("split_payments")
+                or raw_data.get("splits")
+                or raw_data.get("split_details")
+                or []
+            )
+
+            valid_splits = []
+            if isinstance(split_payload, list):
+                for sp in split_payload:
+                    if isinstance(sp, dict):
+                        sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
+                        if sp_amt > Decimal("0.00"):
+                            valid_splits.append(sp)
+
+            # Robust Payment Method Normalization Helper
             raw_method = (
                 raw_data.get("payment_method") 
                 or raw_data.get("method") 
+                or raw_data.get("channel")
+                or raw_data.get("payment_channel")
                 or "CASH"
             )
-            payment_method = (
-                str(raw_method)
-                .strip()
-                .upper()
-                .replace(" ", "_")
-                .replace("-", "_")
-            )
+            
+            def normalize_pm(pm_str):
+                clean = str(pm_str or "").strip().upper().replace(" ", "_").replace("-", "_")
+                if clean in ("MPESA", "PAY_BILL", "TILL", "M_PESA"):
+                    return "PAYBILL"
+                if clean in ("SENDMONEY", "DIRECT_TRANSFER", "P2P"):
+                    return "SEND_MONEY"
+                if clean in ("BANK", "TRANSFER", "EFT", "RTGS"):
+                    return "BANK_TRANSFER"
+                return clean or "CASH"
+
+            if len(valid_splits) > 1:
+                payment_method = "SPLIT"
+            elif len(valid_splits) == 1:
+                sp_raw = valid_splits[0].get("method") or valid_splits[0].get("channel") or valid_splits[0].get("payment_method")
+                payment_method = normalize_pm(sp_raw)
+            else:
+                payment_method = normalize_pm(raw_method)
 
             # Resolve Customer Instance
             customer_obj = Customer.objects.filter(pk=customer_id).first()
@@ -1338,7 +1367,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             if ref_no:
                 formatted_notes = f"Ref: {ref_no} | {notes_input}".strip(" |")
 
-            # 2. Save strictly using model schema fields
+            # 2. Save header CreditRepayment
             repayment = CreditRepayment.objects.create(
                 customer=customer_obj,
                 transaction=transaction_obj,
@@ -1349,6 +1378,20 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 notes=formatted_notes,
                 date=repayment_date,
             )
+
+            # 3. Create Child CreditRepaymentSplit entries if multi-channel
+            if payment_method == "SPLIT" and valid_splits:
+                for sp in valid_splits:
+                    sp_raw = sp.get("method") or sp.get("channel") or sp.get("payment_method")
+                    sp_pm = normalize_pm(sp_raw)
+                    sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
+                    
+                    CreditRepaymentSplit.objects.create(
+                        repayment=repayment,
+                        payment_method=sp_pm,
+                        amount=sp_amt,
+                        reference_number=sp.get("reference_number") or ref_no
+                    )
 
             # WebSocket Broadcast
             if repayment.branch_id:
