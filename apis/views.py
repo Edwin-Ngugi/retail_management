@@ -11019,6 +11019,15 @@ def quantize_money(amount):
     return Decimal(str(amount)).quantize(Decimal("0.01"))
 
 
+logger = logging.getLogger(__name__)
+ZERO = Decimal("0.00")
+
+def quantize_money(val):
+    if val is None:
+        return ZERO
+    return Decimal(str(val)).quantize(Decimal("0.01"))
+
+
 class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
@@ -11083,18 +11092,51 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         for attr in ["method", "payment_method", "payment_mode", "channel", "mode", "type"]:
             val = getattr(sp, attr, None)
             if val:
-                return val
-        return None
+                return str(val)
+        return "CASH"
+
+    def _extract_sp_amount(self, sp):
+        """Safely extracts amount from split records across potential field names."""
+        for attr in ["amount", "amount_paid", "paid_amount", "val", "value", "total"]:
+            val = getattr(sp, attr, None)
+            if val is not None:
+                try:
+                    return quantize_money(val)
+                except Exception:
+                    continue
+        return ZERO
 
     def _get_split_payments(self, sale):
-        """Safely gathers child split records across main transactions and legacy sales."""
+        """Safely gathers child split records across main transactions, legacy sales, and custom splits."""
         all_found = []
-        if hasattr(sale, "split_payments") and sale.split_payments.exists():
-            all_found.extend(list(sale.split_payments.all()))
+        
+        # 1. Direct split_payments relation on SaleTransaction
+        if hasattr(sale, "split_payments"):
+            splits = list(sale.split_payments.all())
+            if splits:
+                all_found.extend(splits)
+
+        # 2. Alternative child relation names (e.g., payments, sale_payments)
+        if not all_found:
+            for rel in ["payments", "sale_payments", "splits"]:
+                if hasattr(sale, rel):
+                    rel_manager = getattr(sale, rel)
+                    if hasattr(rel_manager, "all"):
+                        splits = list(rel_manager.all())
+                        if splits:
+                            all_found.extend(splits)
+                            break
+
+        # 3. Check legacy sales split payments if direct splits are missing
         if not all_found and hasattr(sale, "legacy_sales") and sale.legacy_sales.exists():
             for legacy_sale in sale.legacy_sales.all():
-                if hasattr(legacy_sale, "split_payments"):
-                    all_found.extend(list(legacy_sale.split_payments.all()))
+                for rel in ["split_payments", "payments"]:
+                    if hasattr(legacy_sale, rel):
+                        splits = list(getattr(legacy_sale, rel).all())
+                        if splits:
+                            all_found.extend(splits)
+                            break
+
         return all_found
 
     def _extract_qty(self, obj, default=Decimal("1.000")):
@@ -11195,48 +11237,52 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transaction_count = sales_qs.count()
 
             # -----------------------------------------------------------------
-            # 1. DIRECT SALES INFLOWS (PURE LIQUID INFLOWS + CREDIT ISSUED)
+            # 1. DIRECT SALES INFLOWS (ROUTING SPLITS & LIQUID CHANNELS)
             # -----------------------------------------------------------------
-            sales_with_payments = sales_qs.distinct().select_related("customer", "branch").prefetch_related("split_payments", "legacy_sales__split_payments")
+            sales_with_payments = sales_qs.distinct().select_related("customer", "branch").prefetch_related(
+                "split_payments", "legacy_sales__split_payments"
+            )
 
             for sale in sales_with_payments:
                 norm_method = self._normalize_payment_method(sale.payment_method)
                 split_records = self._get_split_payments(sale)
 
-                # Pure Credit Invoices: capture exact credit issued exposure
-                if norm_method == "CREDIT":
+                # A. Invoice has child split payments: Route each split to its target channel
+                if split_records:
+                    for sp in split_records:
+                        sp_raw = self._extract_sp_method(sp)
+                        sp_channel = self._normalize_payment_method(sp_raw)
+                        sp_amt = self._extract_sp_amount(sp)
+
+                        if sp_channel == "PAYBILL":
+                            paybill_total += sp_amt
+                        elif sp_channel == "SEND_MONEY":
+                            send_money_total += sp_amt
+                        elif sp_channel == "BANK_TRANSFER":
+                            bank_total += sp_amt
+                        elif sp_channel == "CASH":
+                            cash_total += sp_amt
+                        elif sp_channel == "CREDIT":
+                            gross_credit_sales += sp_amt
+                        else:
+                            other_total += sp_amt
+
+                # B. Historical liquid_payments_breakdown dict fallback
+                elif hasattr(sale, "liquid_payments_breakdown") and sale.liquid_payments_breakdown:
+                    bd = sale.liquid_payments_breakdown
+                    cash_total += quantize_money(bd.get("CASH", ZERO))
+                    paybill_total += quantize_money(bd.get("PAYBILL", ZERO))
+                    send_money_total += quantize_money(bd.get("SEND_MONEY", ZERO) + bd.get("MPESA", ZERO))
+                    bank_total += quantize_money(bd.get("BANK_TRANSFER", ZERO))
+                    gross_credit_sales += quantize_money(bd.get("CREDIT", ZERO))
+                    other_total += quantize_money(bd.get("OTHER", ZERO))
+
+                # C. Pure Credit Invoice without child splits
+                elif norm_method == "CREDIT":
                     sale_amt = Decimal(str(sale.total_amount or ZERO))
                     gross_credit_sales += quantize_money(sale_amt)
-                    continue
 
-                if norm_method == "SPLIT" or len(split_records) > 0:
-                    if split_records:
-                        for sp in split_records:
-                            sp_raw = self._extract_sp_method(sp)
-                            sp_channel = self._normalize_payment_method(sp_raw)
-                            sp_amt = quantize_money(getattr(sp, "amount", ZERO) or ZERO)
-
-                            if sp_channel == "PAYBILL":
-                                paybill_total += sp_amt
-                            elif sp_channel == "SEND_MONEY":
-                                send_money_total += sp_amt
-                            elif sp_channel == "BANK_TRANSFER":
-                                bank_total += sp_amt
-                            elif sp_channel == "CASH":
-                                cash_total += sp_amt
-                            elif sp_channel == "CREDIT":
-                                gross_credit_sales += sp_amt
-                            else:
-                                other_total += sp_amt
-                    elif hasattr(sale, "liquid_payments_breakdown"):
-                        bd = sale.liquid_payments_breakdown
-                        cash_total += quantize_money(bd.get("CASH", ZERO))
-                        paybill_total += quantize_money(bd.get("PAYBILL", ZERO))
-                        send_money_total += quantize_money(bd.get("SEND_MONEY", ZERO) + bd.get("MPESA", ZERO))
-                        bank_total += quantize_money(bd.get("BANK_TRANSFER", ZERO))
-                        gross_credit_sales += quantize_money(bd.get("CREDIT", ZERO))
-                        other_total += quantize_money(bd.get("OTHER", ZERO))
-
+                # D. Single Payment Method Liquid Transaction
                 else:
                     sale_paid = Decimal(
                         str(
@@ -11259,7 +11305,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         other_total += sale_paid
 
             # -----------------------------------------------------------------
-            # 2. CUSTOMER DEBT REPAYMENTS (COLLECTED INFLOWS FOR THE DAY)
+            # 2. CUSTOMER DEBT REPAYMENTS (ROUTING SPLITS & REPAYMENT CHANNELS)
             # -----------------------------------------------------------------
             repayments_list = []
             repayments_qs = repayment_qs.distinct().select_related("customer", "transaction").prefetch_related("splits")
@@ -11273,14 +11319,21 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 raw_method = getattr(repayment, "payment_method", "CASH")
                 norm_rep_method = self._normalize_payment_method(raw_method)
 
-                if norm_rep_method == "SPLIT":
-                    split_records = list(repayment.splits.all()) if hasattr(repayment, "splits") else []
+                # A. Repayment has split records
+                split_records = []
+                for rel in ["splits", "split_payments"]:
+                    if hasattr(repayment, rel):
+                        splits = list(getattr(repayment, rel).all())
+                        if splits:
+                            split_records = splits
+                            break
 
+                if norm_rep_method == "SPLIT" or split_records:
                     if split_records:
                         for sp in split_records:
-                            sp_raw = self._extract_sp_method(sp) or getattr(sp, "method", "CASH")
+                            sp_raw = self._extract_sp_method(sp)
                             sp_channel = self._normalize_payment_method(sp_raw)
-                            sp_amt = quantize_money(sp.amount or ZERO)
+                            sp_amt = self._extract_sp_amount(sp)
 
                             if sp_channel == "PAYBILL":
                                 paybill_total += sp_amt
