@@ -2511,6 +2511,20 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             PurchaseOrderItem.objects.bulk_create(po_items_to_create)
             created_purchases = Purchase.objects.bulk_create(purchases_to_create)
 
+            # 5b. Update Inventory Stock Levels (Restock Fix)
+            for branch, item in processed_items:
+                batch_added_qty = sum(
+                    p.quantity for p in purchases_to_create 
+                    if p.item_id == item.id and p.branch_id == branch.id
+                )
+                if batch_added_qty > ZERO:
+                    BranchItemPricing.objects.filter(
+                        item=item, 
+                        branch=branch
+                    ).update(
+                        current_stock=F("current_stock") + batch_added_qty
+                    )
+
             # 6. Header Recalculations and WAC Computations
             po_header.recalculate_totals()
 
