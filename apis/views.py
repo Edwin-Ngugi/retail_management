@@ -11251,14 +11251,23 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
     def detailed_report(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
+
+            # Ensure start_dt and end_dt cover the full day range in local time
+            if start_date and end_date and period_type == "day":
+                tz = timezone.get_current_timezone()
+                start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
+                end_dt = timezone.make_aware(datetime.combine(end_date, time.max), tz)
+
             sales_qs = SaleTransaction.objects.all()
             returns_qs = CustomerReturn.objects.all()
             repayment_qs = CreditRepayment.objects.all()
 
             if start_dt and end_dt:
                 sales_qs = sales_qs.filter(sale_date__gte=start_dt, sale_date__lte=end_dt)
+            elif start_date and end_date:
+                sales_qs = sales_qs.filter(sale_date__date__gte=start_date, sale_date__date__lte=end_date)
             
-            # Repayments are strictly filtered by their actual payment collection date
+            # Repayments strictly filtered by collection date
             if start_date and end_date:
                 returns_qs = returns_qs.filter(date__gte=start_date, date__lte=end_date)
                 repayment_qs = repayment_qs.filter(date__gte=start_date, date__lte=end_date)
@@ -11375,7 +11384,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 raw_method = getattr(repayment, "payment_method", "CASH")
                 norm_rep_method = self._normalize_payment_method(raw_method)
 
-                # Route repayments to repayment channel metrics without polluting target date sales channels
                 split_records = []
                 for rel in ["splits", "split_payments"]:
                     if hasattr(repayment, rel):
