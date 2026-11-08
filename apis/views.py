@@ -11275,7 +11275,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
 
-            # Channel Inflow Aggregators (Direct Sales)
+            # Aggregators for Direct Sales Issued
             cash_total = ZERO
             paybill_total = ZERO
             send_money_total = ZERO
@@ -11283,7 +11283,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             other_total = ZERO
             gross_credit_sales = ZERO
 
-            # Channel Inflow Aggregators (Debt Repayments Collected)
+            # Aggregators for Repayments Collected
             period_credit_repayments_total = ZERO
             repayments_by_channel = {
                 "CASH": ZERO,
@@ -11306,14 +11306,10 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 rec_num = str(sale.receipt_number or f"REC-{sale.id}")
                 norm_method = self._normalize_payment_method(sale.payment_method)
 
-                # STRICT RULE: Any transaction that is an Invoice / Credit Sale
-                # MUST route 100% of its amount to CREDIT exposure for this issue date.
-                # Do NOT route to PAYBILL/SEND_MONEY on the date of issuance!
-                is_credit_invoice = (
-                    rec_num.startswith("INV")
-                    or bool(sale.invoice_number)
-                    or norm_method == "CREDIT"
-                )
+                # STRICT INVOICE CHECK:
+                # Based on models.py, invoice_number and receipt_number copy each other.
+                # So we ONLY check if payment_method is CREDIT or if rec_num starts with INV.
+                is_credit_invoice = (norm_method == "CREDIT" or rec_num.startswith("INV"))
 
                 if is_credit_invoice:
                     sale_total = Decimal(str(sale.total_amount or ZERO))
@@ -11363,7 +11359,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         other_total += sale_paid
 
             # -----------------------------------------------------------------
-            # 2. CUSTOMER DEBT REPAYMENTS (COLLECTED INFLOWS FOR THIS PERIOD ONLY)
+            # 2. DEBT REPAYMENTS (COLLECTED INFLOWS FOR THIS PERIOD ONLY)
             # -----------------------------------------------------------------
             repayments_list = []
             repayments_qs = repayment_qs.distinct().select_related("customer", "transaction").prefetch_related("splits")
@@ -11687,16 +11683,16 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 items_data = transaction_items_map.get(sale.id, [])
                 
                 rec_num = str(sale.receipt_number or f"REC-{sale.id}")
+                norm_method = self._normalize_payment_method(sale.payment_method)
 
-                # 1. Strictly rely on prefix/invoice marker for display tag
-                # RECs display their saved payment method (PAYBILL, CASH, SEND_MONEY, etc.)
-                # INVs display CREDIT
-                if rec_num.startswith("INV") or bool(sale.invoice_number):
+                # STRICT LEDGER CHANNEL DISPLAY:
+                # REC... records display their actual payment method (PAYBILL, SEND_MONEY, CASH)
+                # INV... or CREDIT sales display CREDIT
+                if norm_method == "CREDIT" or rec_num.startswith("INV"):
                     disp_channel = "CREDIT"
                 else:
-                    disp_channel = sale.payment_method or "CASH"
+                    disp_channel = norm_method
 
-                # 2. Customer Name Resolution
                 cust_disp_name = (
                     sale.customer.name if getattr(sale, 'customer', None) 
                     else (sale.customer_name or "Walk-in Customer")
