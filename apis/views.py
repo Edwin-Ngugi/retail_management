@@ -1205,6 +1205,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         queryset = (
             CreditRepayment.objects
             .select_related("customer", "branch", "transaction")
+            .prefetch_related("splits")
             .all()
             .order_by("-date", "-created_at")
         )
@@ -1274,13 +1275,22 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Extract Split Payments Payload
+            # Extract Split Payments Payload (Handles lists and dictionaries)
             split_payload = (
                 raw_data.get("split_payments")
                 or raw_data.get("splits")
                 or raw_data.get("split_details")
+                or raw_data.get("repayment_splits")
                 or []
             )
+
+            if isinstance(split_payload, dict):
+                formatted_splits = []
+                for k, v in split_payload.items():
+                    amt_dec = quantize_money(v)
+                    if amt_dec > Decimal("0.00"):
+                        formatted_splits.append({"method": k, "amount": amt_dec})
+                split_payload = formatted_splits
 
             valid_splits = []
             if isinstance(split_payload, list):
@@ -1301,15 +1311,15 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             
             def normalize_pm(pm_str):
                 clean = str(pm_str or "").strip().upper().replace(" ", "_").replace("-", "_")
-                if clean in ("MPESA", "PAY_BILL", "TILL", "M_PESA"):
+                if clean in ("MPESA", "PAY_BILL", "TILL", "M_PESA", "C2B"):
                     return "PAYBILL"
-                if clean in ("SENDMONEY", "DIRECT_TRANSFER", "P2P"):
+                if clean in ("SENDMONEY", "DIRECT_TRANSFER", "P2P", "SEND_MONEY_MPESA"):
                     return "SEND_MONEY"
                 if clean in ("BANK", "TRANSFER", "EFT", "RTGS"):
                     return "BANK_TRANSFER"
                 return clean or "CASH"
 
-            if len(valid_splits) > 1:
+            if len(valid_splits) > 1 or str(raw_method).strip().upper() in ("SPLIT", "SPLIT_PAYMENT"):
                 payment_method = "SPLIT"
             elif len(valid_splits) == 1:
                 sp_raw = valid_splits[0].get("method") or valid_splits[0].get("channel") or valid_splits[0].get("payment_method")
@@ -1379,19 +1389,25 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 date=repayment_date,
             )
 
-            # 3. Create Child CreditRepaymentSplit entries if multi-channel
+            # 3. Create Child CreditRepaymentSplit entries if multi-channel (Fixed field names)
             if payment_method == "SPLIT" and valid_splits:
+                split_total = Decimal("0.00")
                 for sp in valid_splits:
                     sp_raw = sp.get("method") or sp.get("channel") or sp.get("payment_method")
                     sp_pm = normalize_pm(sp_raw)
                     sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
-                    
+                    split_total += sp_amt
+
                     CreditRepaymentSplit.objects.create(
                         repayment=repayment,
-                        payment_method=sp_pm,
+                        method=sp_pm,  # Correct field name in CreditRepaymentSplit model
                         amount=sp_amt,
-                        reference_number=sp.get("reference_number") or ref_no
+                        reference_code=sp.get("reference_code") or sp.get("reference_number") or ref_no or (transaction_obj.invoice_number if transaction_obj else "")
                     )
+
+                if split_total > Decimal("0.00"):
+                    repayment.amount = split_total
+                    repayment.save(update_fields=["amount"])
 
             # WebSocket Broadcast
             if repayment.branch_id:
