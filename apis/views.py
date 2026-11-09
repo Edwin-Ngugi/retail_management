@@ -3196,14 +3196,19 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 if raw_custom and str(raw_custom).strip():
                     custom_receipt = str(raw_custom).strip()
 
-            # 5. Extract Split Payments Payload & Resolve Exact Method
+            # 5. Extract Split Payments Payload (Comprehensive Key Checks & Format Resolution)
             split_payments_payload = (
                 data.get("split_payments")
+                or data.get("payments")
                 or data.get("splits")
                 or data.get("split_details")
+                or data.get("sale_payments")
+                or data.get("split_payment_list")
+                or data.get("split_methods")
                 or []
             )
 
+            # If payload comes as a dictionary (e.g., {"CASH": 1000, "PAYBILL": 700})
             if isinstance(split_payments_payload, dict):
                 formatted_splits = []
                 for k, v in split_payments_payload.items():
@@ -3220,7 +3225,7 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                         if amt > ZERO:
                             valid_splits.append(sp)
 
-            # Truly SPLIT only if explicitly requested or if >= 2 distinct payments are provided
+            # Truly SPLIT only if explicitly requested or if >= 2 distinct payment entries are provided
             if normalized_pm == "SPLIT" or len(valid_splits) > 1:
                 final_pm = "SPLIT"
             elif len(valid_splits) == 1:
