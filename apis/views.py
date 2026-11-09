@@ -7357,35 +7357,46 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             available_funds = actual_cash_receipts - operating_expenses - purchases_total
 
             # -----------------------------------------------------------------
-            # 7. SAFE TRAJECTORY COMPUTATION
+            # 7. GRANULAR DAILY TRAJECTORY COMPUTATION
             # -----------------------------------------------------------------
             trajectory_data = []
-            sales_by_date = {}
-            for sale in sales_qs:
+
+            # Calculate daily sales and exact COGS by transaction date
+            daily_sales_map = {}
+            for sale in sales_qs.prefetch_related('items'):
                 s_date = getattr(sale, 'sale_date', None)
-                if s_date:
-                    d_key = s_date.strftime('%b %d') if hasattr(s_date, 'strftime') else str(s_date)[:10]
-                    sales_by_date[d_key] = sales_by_date.get(d_key, ZERO) + quantize_money(sale.total_amount or ZERO)
+                if not s_date:
+                    continue
 
-            if sales_by_date:
-                for date_str, day_s in sales_by_date.items():
-                    ratio = (day_s / total_sales) if total_sales > ZERO else ZERO
-                    day_cogs = quantize_money(cogs * ratio)
-                    day_net = quantize_money(net_profit * ratio)
+                d_key = s_date.strftime('%Y-%m-%d') if hasattr(s_date, 'strftime') else str(s_date)[:10]
 
-                    trajectory_data.append({
-                        "date": date_str,
-                        "total_sales": float(day_s),
-                        "cogs": float(day_cogs),
-                        "net_profit": float(day_net)
-                    })
-            else:
-                formatted_label = start_date.strftime('%b %d') if hasattr(start_date, 'strftime') else str(start_date)
+                if d_key not in daily_sales_map:
+                    daily_sales_map[d_key] = {"total_sales": ZERO, "cogs": ZERO}
+
+                sale_amt = quantize_money(sale.total_amount or ZERO)
+                daily_sales_map[d_key]["total_sales"] += sale_amt
+
+                # Sum line item COGS for this transaction
+                sale_cogs = ZERO
+                for item in getattr(sale, 'items', []).all():
+                    q_sold = Decimal(str(getattr(item, 'quantity_sold', ZERO) or ZERO))
+                    u_cost = Decimal(str(getattr(item, 'unit_cost_price', ZERO) or ZERO))
+                    sale_cogs += quantize_money(q_sold * u_cost)
+
+                daily_sales_map[d_key]["cogs"] += sale_cogs
+
+            # Build sorted trajectory list with exact date strings (YYYY-MM-DD)
+            sorted_dates = sorted(daily_sales_map.keys())
+            for date_str in sorted_dates:
+                d_sales = daily_sales_map[date_str]["total_sales"]
+                d_cogs = daily_sales_map[date_str]["cogs"]
+                d_net = d_sales - d_cogs  # Direct gross/net calculation per day
+
                 trajectory_data.append({
-                    "date": formatted_label,
-                    "total_sales": float(total_sales),
-                    "cogs": float(cogs),
-                    "net_profit": float(net_profit)
+                    "date": date_str,
+                    "total_sales": float(d_sales),
+                    "cogs": float(d_cogs),
+                    "net_profit": float(d_net)
                 })
 
             # Construct Payload Response
