@@ -3299,14 +3299,22 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                             amount=sp_amount,
                             reference_code=sp.get("reference_code") or sp.get("reference") or sale.receipt_number or ""
                         )
+                    
+                    # Update amount_paid and is_paid status directly for SPLIT transactions
                     sale.amount_paid = split_sum
+                    sale.is_paid = split_sum >= calculated_total
                 else:
                     if final_pm != "CREDIT" and (sale.amount_paid == ZERO or sale.amount_paid is None):
                         sale.amount_paid = calculated_total
+                        sale.is_paid = True
+                    elif final_pm == "CREDIT":
+                        sale.amount_paid = quantize_money(sale.amount_paid or ZERO)
+                        sale.is_paid = (sale.amount_paid >= calculated_total) and (calculated_total > ZERO)
                     else:
                         sale.amount_paid = quantize_money(sale.amount_paid)
 
-                sale.save()
+                # ALWAYS persist final total_amount, amount_paid, and is_paid to database
+                sale.save(update_fields=["total_amount", "amount_paid", "is_paid"])
 
             # 7. Broadcast Real-time WebSocket Event
             channel_layer = get_channel_layer()
