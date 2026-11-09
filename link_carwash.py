@@ -1,41 +1,41 @@
 import os
+import sys
 import django
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+# Initialize Django environment
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # <-- Change to your settings module name
 django.setup()
 
-from datetime import date
-from stocks.models import SaleTransaction, CreditRepayment
+from decimal import Decimal
+from stocks.models import SaleTransaction, SalePayment
 
-target_date = date(2026, 10, 19)
+print("--- Fixing Typo IN 1_82 (Tx #1382) to CREDIT ---")
 
-print(f"==================================================")
-print(f" 1. DIRECT SALES TRANSACTIONS (SaleTransaction)   ")
-print(f"==================================================")
-sales = SaleTransaction.objects.filter(sale_date__date=target_date)
-for sale in sales:
-    payments = list(sale.split_payments.all())
-    print(f"Tx #{sale.id} | Method: '{sale.payment_method}' | Amount Paid: KSh {sale.amount_paid}")
-    for p in payments:
-        print(f"   └─ Child SalePayment: method='{p.method}', amount={p.amount}")
-
-print(f"\n==================================================")
-print(f" 2. PRIOR CREDIT REPAYMENTS COLLECTED ONLY        ")
-print(f"==================================================")
-# Filter repayments on target_date whose credit invoice was created BEFORE target_date
-# Or repayments linked to general customer balances (transaction__isnull=True)
-repayments = CreditRepayment.objects.filter(
-    date=target_date
-).filter(
-    transaction__sale_date__date__lt=target_date
-) | CreditRepayment.objects.filter(
-    date=target_date, 
-    transaction__isnull=True
+# 1. Fetch by primary key 1382 and string variants 'IN 1_82' / 'INV 1_82'
+tx_1382 = (
+    SaleTransaction.objects.filter(pk=1382).first() 
+    or SaleTransaction.objects.filter(invoice_number__icontains="1_82").first()
 )
 
-for rep in repayments.distinct():
-    splits = list(rep.splits.all())
-    customer_name = rep.customer.name if getattr(rep, 'customer', None) else "N/A"
-    print(f"Repayment #{rep.id} | Customer: {customer_name} | Method: '{rep.payment_method}' | Amount: KSh {rep.amount}")
-    for s in splits:
-        print(f"   └─ Child CreditRepaymentSplit: method='{s.method}', amount={s.amount}")
+if tx_1382:
+    # Force payment_method to CREDIT and set amount_paid to 0.00
+    tx_1382.payment_method = "CREDIT"
+    tx_1382.amount_paid = Decimal("0.00")
+    tx_1382.is_paid = False
+    tx_1382.total_amount = Decimal("2500.00")
+    tx_1382.save(update_fields=["payment_method", "amount_paid", "is_paid", "total_amount"])
+    print(f"✔ Successfully updated Tx #{tx_1382.pk} ({tx_1382.invoice_number}) to CREDIT!")
+
+    # Delete all child SalePayment entries associated with Tx #1382
+    deleted_count, _ = SalePayment.objects.filter(transaction=tx_1382).delete()
+    print(f"✔ Purged {deleted_count} child payment records.")
+
+# 2. Safety sweep for any remaining credit transactions on 2026-10-12
+ghost_deleted, _ = SalePayment.objects.filter(
+    transaction__sale_date__date="2026-10-12",
+    transaction__payment_method="CREDIT"
+).delete()
+print(f"✔ Swept {ghost_deleted} residual ghost child payments.")
+
+print("--- Update Complete! Refresh your browser page now. ---")

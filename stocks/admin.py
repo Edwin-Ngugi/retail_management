@@ -1,12 +1,13 @@
 from django import forms
 from django.contrib import admin, messages
 from django.db import transaction
-from django.db.models import Avg, Q
+from django.db.models import Avg, Q, Count
+from django.forms.models import BaseInlineFormSet
+from django.core.exceptions import ValidationError
 from django.http import HttpResponseRedirect
 from django.shortcuts import render
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-from django.db.models import Count
 
 from analytics.services import AnalyticsService
 
@@ -400,8 +401,43 @@ class SaleItemInline(admin.TabularInline):
     readonly_fields = ("unit_cost_price",)
 
 
+class SalePaymentInlineFormSet(BaseInlineFormSet):
+    """
+    Formset validator enforcing that split transactions contain at least TWO 
+    child payment methods whose total sum equals the sale total.
+    """
+    def clean(self):
+        super().clean()
+        if any(self.errors):
+            return
+
+        valid_forms_count = 0
+        total_inline_amount = 0
+
+        for form in self.forms:
+            if form.cleaned_data and not form.cleaned_data.get("DELETE", False):
+                valid_forms_count += 1
+                total_inline_amount += form.cleaned_data.get("amount", 0)
+
+        # Ensure split transactions require at least 2 child payment records
+        if self.instance and self.instance.payment_method in [
+            SaleTransaction.PaymentMethod.SPLIT,
+            "SPLIT",
+            "SPLIT PAYMENT",
+        ]:
+            if valid_forms_count < 2:
+                raise ValidationError(
+                    "Split Payment transactions require at least TWO child entries in the SALE PAYMENTS section below."
+                )
+            if self.instance.total_amount and total_inline_amount != self.instance.total_amount:
+                raise ValidationError(
+                    f"Sum of split payments (KSh {total_inline_amount:,.2f}) must equal transaction total (KSh {self.instance.total_amount:,.2f})."
+                )
+
+
 class SalePaymentInline(admin.TabularInline):
     model = SalePayment
+    formset = SalePaymentInlineFormSet
     extra = 1
     fields = ("method", "amount", "reference_code", "created_at")
     readonly_fields = ("created_at",)
@@ -750,6 +786,7 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
         """
         Automatically recalculate amount_paid and is_paid status 
         when split payment inline records are saved in Django Admin.
+        Uses update() to avoid triggering recursive signal loops.
         """
         instances = formset.save(commit=False)
         for instance in instances:
@@ -761,10 +798,11 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
             split_payments = obj.split_payments.all()
             if split_payments.exists():
                 total_split_paid = sum(sp.amount for sp in split_payments)
-                obj.amount_paid = total_split_paid
-                if total_split_paid >= (obj.total_amount or 0):
-                    obj.is_paid = True
-                obj.save(update_fields=["amount_paid", "is_paid"])
+                is_paid = total_split_paid >= (obj.total_amount or 0)
+                SaleTransaction.objects.filter(pk=obj.pk).update(
+                    amount_paid=total_split_paid,
+                    is_paid=is_paid
+                )
 
     @admin.display(description="Amount Paid", ordering="amount_paid")
     def display_amount_paid(self, obj):
