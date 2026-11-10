@@ -2371,13 +2371,13 @@ class CreditRepayment(models.Model):
         SPLIT = "SPLIT", "Split Payment"
 
     customer = models.ForeignKey(
-        Customer,
+        "Customer",
         on_delete=models.CASCADE,
         related_name="repayments",
     )
 
     transaction = models.ForeignKey(
-        SaleTransaction,
+        "SaleTransaction",
         on_delete=models.CASCADE,
         related_name="repayments",
         null=True,
@@ -2386,7 +2386,7 @@ class CreditRepayment(models.Model):
     )
 
     branch = models.ForeignKey(
-        RetailBranch,
+        "RetailBranch",
         on_delete=models.CASCADE,
         related_name="repayments",
     )
@@ -2396,6 +2396,14 @@ class CreditRepayment(models.Model):
         choices=PaymentMethod.choices,
         default=PaymentMethod.CASH,
         help_text="Payment method used for the repayment.",
+    )
+
+    # Added explicit reference code for M-Pesa / Paybill / Bank Txn codes
+    reference_code = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="M-Pesa Txn code, Paybill ref, or bank reference.",
     )
 
     amount = models.DecimalField(
@@ -2419,6 +2427,12 @@ class CreditRepayment(models.Model):
 
     class Meta:
         ordering = ["-date", "-created_at"]
+        indexes = [
+            models.Index(fields=["branch", "date"]),
+            models.Index(fields=["customer", "date"]),
+            models.Index(fields=["transaction"]),
+            models.Index(fields=["reference_code"]),
+        ]
 
     def clean(self):
         super().clean()
@@ -2435,13 +2449,14 @@ class CreditRepayment(models.Model):
         self.full_clean()
         super().save(*args, **kwargs)
 
-        if self.transaction and self.transaction.balance_due <= ZERO:
+        if self.transaction and getattr(self.transaction, "balance_due", ZERO) <= ZERO:
             self.transaction.is_paid = True
             self.transaction.save(update_fields=["is_paid"])
 
     def __str__(self):
         doc_str = f" for {self.transaction.receipt_number}" if self.transaction else ""
-        return f"Repayment - {self.customer.name}: KSh {self.amount} via {self.get_payment_method_display()}{doc_str}"
+        ref_str = f" (Ref: {self.reference_code})" if self.reference_code else ""
+        return f"Repayment - {self.customer.name}: KSh {self.amount} via {self.get_payment_method_display()}{ref_str}{doc_str}"
 
 
 # -----------------------------------------------------------------------------

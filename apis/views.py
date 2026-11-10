@@ -1221,7 +1221,6 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         queryset = (
             CreditRepayment.objects
             .select_related("customer", "branch", "transaction")
-            .prefetch_related("splits")
             .all()
             .order_by("-date", "-created_at")
         )
@@ -1244,6 +1243,10 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="lookup")
     def lookup_invoice(self, request):
+        """
+        Fast lookup endpoint for invoice search in Customer Receipts view.
+        Directly queries SaleTransaction invoices and aggregates related CreditRepayments.
+        """
         query = str(request.query_params.get("q", "")).strip()
         branch_id = request.query_params.get("branch") or request.query_params.get("branch_id")
 
@@ -1281,7 +1284,8 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             total_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
             
             repaid_amt = ZERO
-            repayment_rel = getattr(sale, "credit_repayments", None)
+            # Correctly accesses the 'repayments' related_name defined on CreditRepayment.transaction
+            repayment_rel = getattr(sale, "repayments", None)
             if repayment_rel is not None:
                 try:
                     repaid_amt = sum(
@@ -1351,64 +1355,12 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            amount = Decimal(str(amount_raw))
-            if amount <= Decimal("0.00"):
+            total_amount = Decimal(str(amount_raw))
+            if total_amount <= Decimal("0.00"):
                 return Response(
                     {"error": "Repayment amount must be greater than zero."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-
-            # Extract Split Payments Payload
-            split_payload = (
-                raw_data.get("split_payments")
-                or raw_data.get("splits")
-                or raw_data.get("split_details")
-                or raw_data.get("repayment_splits")
-                or []
-            )
-
-            if isinstance(split_payload, dict):
-                formatted_splits = []
-                for k, v in split_payload.items():
-                    amt_dec = quantize_money(v)
-                    if amt_dec > Decimal("0.00"):
-                        formatted_splits.append({"method": k, "amount": amt_dec})
-                split_payload = formatted_splits
-
-            valid_splits = []
-            if isinstance(split_payload, list):
-                for sp in split_payload:
-                    if isinstance(sp, dict):
-                        sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
-                        if sp_amt > Decimal("0.00"):
-                            valid_splits.append(sp)
-
-            # Payment Method Normalization Helper
-            raw_method = (
-                raw_data.get("payment_method") 
-                or raw_data.get("method") 
-                or raw_data.get("channel")
-                or raw_data.get("payment_channel")
-                or "CASH"
-            )
-            
-            def normalize_pm(pm_str):
-                clean = str(pm_str or "").strip().upper().replace(" ", "_").replace("-", "_")
-                if clean in ("MPESA", "PAY_BILL", "TILL", "M_PESA", "C2B"):
-                    return "PAYBILL"
-                if clean in ("SENDMONEY", "DIRECT_TRANSFER", "P2P", "SEND_MONEY_MPESA"):
-                    return "SEND_MONEY"
-                if clean in ("BANK", "TRANSFER", "EFT", "RTGS"):
-                    return "BANK_TRANSFER"
-                return clean or "CASH"
-
-            if len(valid_splits) > 1 or str(raw_method).strip().upper() in ("SPLIT", "SPLIT_PAYMENT"):
-                payment_method = "SPLIT"
-            elif len(valid_splits) == 1:
-                sp_raw = valid_splits[0].get("method") or valid_splits[0].get("channel") or valid_splits[0].get("payment_method")
-                payment_method = normalize_pm(sp_raw)
-            else:
-                payment_method = normalize_pm(raw_method)
 
             # Resolve Customer Instance
             customer_obj = Customer.objects.filter(pk=customer_id).first()
@@ -1443,6 +1395,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
 
             user = _authenticated_user(request)
 
+            # Date handling
             date_input = raw_data.get("date") or raw_data.get("repayment_date")
             repayment_date = timezone.localdate()
             if date_input:
@@ -1454,61 +1407,120 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             ref_no = str(raw_data.get("reference_number") or raw_data.get("tx_code") or "").strip()
             notes_input = str(raw_data.get("notes") or "").strip()
 
-            formatted_notes = notes_input
-            if ref_no:
-                formatted_notes = f"Ref: {ref_no} | {notes_input}".strip(" |")
+            def normalize_pm(pm_str):
+                clean = str(pm_str or "").strip().upper().replace(" ", "_").replace("-", "_")
+                if clean in ("MPESA", "PAY_BILL", "TILL", "M_PESA", "C2B"):
+                    return "PAYBILL"
+                if clean in ("SENDMONEY", "DIRECT_TRANSFER", "P2P", "SEND_MONEY_MPESA"):
+                    return "SEND_MONEY"
+                if clean in ("BANK", "TRANSFER", "EFT", "RTGS"):
+                    return "BANK_TRANSFER"
+                return clean or "CASH"
 
-            # Save header CreditRepayment
-            repayment = CreditRepayment.objects.create(
-                customer=customer_obj,
-                transaction=transaction_obj,
-                branch=branch_obj,
-                created_by=user,
-                amount=amount,
-                payment_method=payment_method,
-                notes=formatted_notes,
-                date=repayment_date,
+            # Parse split payments list / details
+            split_payload = (
+                raw_data.get("split_payments")
+                or raw_data.get("splits")
+                or raw_data.get("split_details")
+                or raw_data.get("repayment_splits")
+                or []
             )
 
-            # Create Child CreditRepaymentSplit entries
-            if payment_method == "SPLIT" and valid_splits:
-                split_total = Decimal("0.00")
+            valid_splits = []
+            if isinstance(split_payload, list):
+                for sp in split_payload:
+                    if isinstance(sp, dict):
+                        sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
+                        if sp_amt > Decimal("0.00"):
+                            valid_splits.append(sp)
+            elif isinstance(split_payload, dict):
+                for k, v in split_payload.items():
+                    amt_dec = quantize_money(v)
+                    if amt_dec > Decimal("0.00"):
+                        valid_splits.append({"method": k, "amount": amt_dec})
+
+            created_repayments = []
+
+            # 2. Case A: Split Payment Payload -> Create distinct CreditRepayment per channel
+            if valid_splits:
                 for sp in valid_splits:
-                    sp_raw = sp.get("method") or sp.get("channel") or sp.get("payment_method")
-                    sp_pm = normalize_pm(sp_raw)
+                    sp_pm = normalize_pm(sp.get("method") or sp.get("payment_method") or sp.get("channel"))
                     sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
-                    split_total += sp_amt
+                    sp_ref = str(sp.get("reference_code") or sp.get("reference_number") or ref_no).strip()
 
-                    CreditRepaymentSplit.objects.create(
-                        repayment=repayment,
-                        method=sp_pm,
-                        amount=sp_amt,
-                        reference_code=sp.get("reference_code") or sp.get("reference_number") or ref_no or (transaction_obj.invoice_number if transaction_obj else "")
-                    )
+                    sp_notes = notes_input
+                    if sp_ref and not hasattr(CreditRepayment, "reference_code"):
+                        sp_notes = f"Ref: {sp_ref} | {notes_input}".strip(" |")
 
-                if split_total > Decimal("0.00"):
-                    repayment.amount = split_total
-                    repayment.save(update_fields=["amount"])
+                    kwargs_create = {
+                        "customer": customer_obj,
+                        "transaction": transaction_obj,
+                        "branch": branch_obj,
+                        "created_by": user,
+                        "amount": sp_amt,
+                        "payment_method": sp_pm,
+                        "notes": sp_notes,
+                        "date": repayment_date,
+                    }
+                    
+                    if hasattr(CreditRepayment, "reference_code"):
+                        kwargs_create["reference_code"] = sp_ref
+
+                    rep = CreditRepayment.objects.create(**kwargs_create)
+                    created_repayments.append(rep)
+
+            # 3. Case B: Single Payment Channel -> Create single CreditRepayment entry
+            else:
+                raw_method = (
+                    raw_data.get("payment_method") 
+                    or raw_data.get("method") 
+                    or raw_data.get("channel")
+                    or raw_data.get("payment_channel")
+                    or "CASH"
+                )
+                payment_method = normalize_pm(raw_method)
+
+                formatted_notes = notes_input
+                if ref_no and not hasattr(CreditRepayment, "reference_code"):
+                    formatted_notes = f"Ref: {ref_no} | {notes_input}".strip(" |")
+
+                kwargs_create = {
+                    "customer": customer_obj,
+                    "transaction": transaction_obj,
+                    "branch": branch_obj,
+                    "created_by": user,
+                    "amount": total_amount,
+                    "payment_method": payment_method,
+                    "notes": formatted_notes,
+                    "date": repayment_date,
+                }
+
+                if hasattr(CreditRepayment, "reference_code"):
+                    kwargs_create["reference_code"] = ref_no
+
+                rep = CreditRepayment.objects.create(**kwargs_create)
+                created_repayments.append(rep)
 
             # WebSocket Broadcast
-            if repayment.branch_id:
+            main_repayment = created_repayments[0]
+            if main_repayment.branch_id:
                 channel_layer = get_channel_layer()
                 if channel_layer:
                     try:
                         async_to_sync(channel_layer.group_send)(
-                            f"analytics_branch_{repayment.branch_id}",
+                            f"analytics_branch_{main_repayment.branch_id}",
                             {
                                 "type": "analytics_update",
                                 "event": "REPAYMENT_RECORDED",
-                                "customer_id": repayment.customer_id,
-                                "payment_method": repayment.payment_method,
-                                "amount": float(repayment.amount),
+                                "customer_id": main_repayment.customer_id,
+                                "payment_method": main_repayment.payment_method,
+                                "amount": float(total_amount),
                             },
                         )
                     except Exception:
                         pass
 
-            serializer = self.get_serializer(repayment)
+            serializer = self.get_serializer(main_repayment)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
