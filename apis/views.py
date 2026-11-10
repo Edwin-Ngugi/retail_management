@@ -1683,11 +1683,8 @@ class ItemViewSet(viewsets.ModelViewSet):
         if not branch:
             return
 
-        target_retailer = branch.retailer or item.retailer
-        user = _authenticated_user(self.request)
-
-        if not target_retailer and user:
-            target_retailer = user
+        # ✅ FIXED: Retailer MUST be a Retailer instance (not auth.User)
+        target_retailer = branch.retailer or item.retailer or Retailer.objects.first()
 
         if not target_retailer:
             return
@@ -1737,7 +1734,7 @@ class ItemViewSet(viewsets.ModelViewSet):
                 return Response({"branch": "Valid branch is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         # ---------------------------------------------------------------------
-        # FIX: Clean non-Item fields out of item_payload before passing to serializer
+        # Clean non-Item fields out of item_payload before passing to serializer
         # ---------------------------------------------------------------------
         item_payload = request.data.copy() if hasattr(request.data, 'copy') else dict(data)
         for non_model_field in ["branch", "branch_id", "cost_price", "retail_price", "unit_cost_price", "unit_retail_price", "opening_stock"]:
@@ -1753,8 +1750,10 @@ class ItemViewSet(viewsets.ModelViewSet):
 
         try:
             with transaction.atomic():
-                user = _authenticated_user(request)
-                save_kwargs = {"retailer": user} if user else {}
+                # ✅ FIXED: Pass a valid Retailer model instance instead of User
+                retailer_obj = branch_obj.retailer if (branch_obj and branch_obj.retailer) else Retailer.objects.first()
+                save_kwargs = {"retailer": retailer_obj} if retailer_obj else {}
+                
                 item = serializer.save(**save_kwargs)
 
                 if branch_obj:
@@ -1784,8 +1783,19 @@ class ItemViewSet(viewsets.ModelViewSet):
 
                     _cache_active_pricing(item, pricing)
 
-            headers = self.get_success_headers(serializer.data)
-            return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+            refetched_item = self._fetch_item_with_pricing(item.id, branch_id) or item
+            response_data = self._serialize_item(refetched_item, branch_id=branch_id)
+
+            if branch_obj:
+                self._broadcast_websocket_event(
+                    branch_id=branch_obj.id,
+                    event_type="ITEM_CREATED",
+                    item_id=item.id,
+                    updated_item=response_data,
+                )
+
+            headers = self.get_success_headers(response_data)
+            return Response(response_data, status=status.HTTP_201_CREATED, headers=headers)
 
         except IntegrityError as e:
             error_text = str(e).lower()
@@ -1796,20 +1806,6 @@ class ItemViewSet(viewsets.ModelViewSet):
             return Response({"error": "The item could not be created because of a database constraint.", "details": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({"error": "Unable to create item.", "details": str(e), "exception_type": type(e).__name__}, status=status.HTTP_400_BAD_REQUEST)
-
-        refetched_item = self._fetch_item_with_pricing(item.id, branch_id) or item
-        response_data = self._serialize_item(refetched_item, branch_id=branch_id)
-
-        if branch_obj:
-            self._broadcast_websocket_event(
-                branch_id=branch_obj.id,
-                event_type="ITEM_CREATED",
-                item_id=item.id,
-                updated_item=response_data,
-            )
-
-        headers = self.get_success_headers(response_data)
-        return Response(response_data, status=status.HTTP_201_CREATED, headers=headers)
 
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)

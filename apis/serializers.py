@@ -652,6 +652,7 @@ class ItemSerializer(serializers.ModelSerializer):
     remaining_stock_value = serializers.SerializerMethodField()
     is_low_stock = serializers.SerializerMethodField()
 
+    retailer = serializers.PrimaryKeyRelatedField(read_only=True)
     branch = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
@@ -681,6 +682,45 @@ class ItemSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def create(self, validated_data):
+        branch_id = validated_data.pop("branch", None)
+        cost_price = validated_data.pop("unit_cost_price_input", Decimal("0.00"))
+        retail_price = validated_data.pop("unit_retail_price_input", Decimal("0.00"))
+        opening_stock = validated_data.pop("opening_stock_input", 0)
+
+        # Resolve branch instance
+        branch_obj = None
+        if branch_id:
+            branch_obj = RetailBranch.objects.filter(pk=branch_id).first()
+
+        # Resolve valid Retailer instance (avoiding User type mismatch)
+        retailer_obj = validated_data.get("retailer")
+        if not retailer_obj:
+            if branch_obj and branch_obj.retailer:
+                retailer_obj = branch_obj.retailer
+            else:
+                retailer_obj = Retailer.objects.first()
+
+        validated_data["retailer"] = retailer_obj
+
+        # Create Item
+        item = super().create(validated_data)
+
+        # Provision Branch Item Pricing if branch provided
+        if branch_obj:
+            BranchItemPricing.objects.get_or_create(
+                item=item,
+                branch=branch_obj,
+                defaults={
+                    "opening_stock": opening_stock,
+                    "opening_stock_unit_cost_price": cost_price,
+                    "unit_cost_price": cost_price,
+                    "unit_retail_price": retail_price,
+                },
+            )
+
+        return item
 
     def _get_branch_id(self):
         context = self.context or {}
