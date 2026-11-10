@@ -532,8 +532,23 @@ class CreditRepaymentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CreditRepayment
-        fields = "__all__"
-        read_only_fields = ["created_by"]
+        # Exclude 'reference_code' from ORM persistence fields until database migration is run
+        fields = [
+            "id",
+            "customer",
+            "transaction",
+            "branch",
+            "payment_method",
+            "amount",
+            "date",
+            "notes",
+            "created_by",
+            "created_at",
+            "customer_detail",
+            "branch_detail",
+            "payment_method_display",
+        ]
+        read_only_fields = ["created_by", "created_at"]
 
     def validate_date(self, value):
         return _coerce_to_date(value)
