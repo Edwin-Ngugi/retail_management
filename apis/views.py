@@ -1244,56 +1244,44 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="lookup")
     def lookup_invoice(self, request):
-        """
-        Fast lookup endpoint for invoice search in Customer Receipts view.
-        Handles query variation formats (2_34, 2 34, 2-34, INV 2 34).
-        """
         query = str(request.query_params.get("q", "")).strip()
         branch_id = request.query_params.get("branch") or request.query_params.get("branch_id")
 
-        if not query:
+        if not query or (len(query) < 3 and "_" not in query and "-" not in query and " " not in query):
             return Response([], status=status.HTTP_200_OK)
 
-        # 1. Normalize search terms to match spaces, underscores, and hyphens
+        # 1. Normalize query
         raw_clean = query.upper().replace("INV", "").replace("REC", "").replace("#", "").strip()
         with_spaces = raw_clean.replace("_", " ").replace("-", " ")
         with_underscores = raw_clean.replace(" ", "_").replace("-", "_")
-        with_hyphens = raw_clean.replace(" ", "-").replace("_", "-")
 
-        # 2. Flexible search filter
+        # 2. Filter for Invoices only (INV...) or matching customer names
         search_filter = (
+            Q(receipt_number__icontains=f"INV {with_spaces}") |
+            Q(receipt_number__icontains=f"INV_{with_underscores}") |
             Q(receipt_number__icontains=query) |
             Q(receipt_number__icontains=raw_clean) |
             Q(receipt_number__icontains=with_spaces) |
             Q(receipt_number__icontains=with_underscores) |
-            Q(receipt_number__icontains=with_hyphens) |
             Q(customer_name__icontains=query) |
             Q(customer__name__icontains=query)
         )
 
-        sales_qs = (
-            SaleTransaction.objects
-            .select_related("customer", "branch")
-            .prefetch_related("creditrepayment_set") # or prefetch related repayments safely
-            if hasattr(SaleTransaction, "creditrepayment_set") else
-            SaleTransaction.objects.select_related("customer", "branch")
-        )
+        sales_qs = SaleTransaction.objects.select_related("customer", "branch").filter(search_filter)
 
-        sales_qs = sales_qs.filter(search_filter)
+        # Exclude pure Cash receipts starting with 'REC-' unless explicitly queried
+        if not query.upper().startswith("REC"):
+            sales_qs = sales_qs.exclude(receipt_number__startswith="REC-")
 
-        # Strict branch isolation
         if branch_id and str(branch_id).isdigit():
             sales_qs = sales_qs.filter(branch_id=int(branch_id))
 
         results = []
-        # Limit to top 20 matches ordered by sale date
-        for sale in sales_qs.order_by("-sale_date")[:20]:
+        for sale in sales_qs.order_by("-sale_date")[:15]:
             total_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
             
-            # Safely compute total repayments collected for this transaction
             repaid_amt = ZERO
-            repayment_rel = getattr(sale, "credit_repayments", None) or getattr(sale, "repayments", None)
-            
+            repayment_rel = getattr(sale, "credit_repayments", None)
             if repayment_rel is not None:
                 try:
                     repaid_amt = sum(
@@ -1304,6 +1292,10 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     repaid_amt = ZERO
 
             balance_due = max(ZERO, total_amt - repaid_amt)
+
+            # Only show transactions that have an outstanding balance due
+            if balance_due <= ZERO and not query.upper().startswith("INV"):
+                continue
 
             results.append({
                 "id": sale.id,
