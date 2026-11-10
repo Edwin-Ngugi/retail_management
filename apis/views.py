@@ -7025,7 +7025,32 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         return clean
 
     def _get_branch_and_dates(self, request):
-        return _get_reporting_filters(request, default_period="month")
+        """
+        Uses _get_reporting_filters to parse dates/period, but explicitly handles 
+        strict branch lookup to avoid leaking data across branches.
+        """
+        # Parse standard reporting filters (dates and period)
+        branch_obj, start_date, end_date, start_dt, end_dt, period_type = _get_reporting_filters(
+            request, default_period="month"
+        )
+
+        # Extract raw branch parameter directly from request
+        branch_param = (
+            request.query_params.get("branch")
+            or request.query_params.get("branch_id")
+            or (request.data.get("branch") if isinstance(request.data, dict) else None)
+            or (request.data.get("branch_id") if isinstance(request.data, dict) else None)
+        )
+
+        # If a branch parameter was passed explicitly, enforce strict resolution
+        if branch_param:
+            branch_str = str(branch_param).strip()
+            if branch_str.isdigit():
+                branch_obj = RetailBranch.objects.filter(id=int(branch_str)).first()
+            else:
+                branch_obj = RetailBranch.objects.filter(name__iexact=branch_str).first()
+
+        return branch_obj, start_date, end_date, start_dt, end_dt, period_type
 
 
     def _get_filter_params(self, request):
@@ -7041,6 +7066,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     def dashboard_cards(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
+
+            # Check if a branch parameter was passed but could not be resolved
+            raw_branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
+            if raw_branch_param and not branch_obj:
+                return Response(
+                    {"detail": f"Branch '{raw_branch_param}' not found."},
+                    status=status.HTTP_404_NOT_FOUND
+                )
 
             # --- Internal Inline Helpers ---
             def extract_split_payments(sale_obj):
@@ -7106,7 +7139,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 return ZERO
 
             # -----------------------------------------------------------------
-            # 1. UNFILTERED BASE QUERYSETS BY BRANCH
+            # 1. STRICT UNFILTERED BASE QUERYSETS BY BRANCH
             # -----------------------------------------------------------------
             base_sales_qs = SaleTransaction.objects.all()
             base_expenses_qs = Expense.objects.exclude(description__icontains='Supplier Repayment')
@@ -7120,8 +7153,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 base_purchases_qs = base_purchases_qs.filter(branch=branch_obj)
                 base_supplier_pmts_qs = base_supplier_pmts_qs.filter(purchase__branch=branch_obj)
                 if hasattr(CreditRepayment, 'branch'):
+                    # STRICT FILTERING (Removed Q(branch__isnull=True) leak)
                     base_credit_repay_qs = base_credit_repay_qs.filter(
-                        Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
+                        Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
                     )
 
             sales_qs = base_sales_qs
@@ -7373,7 +7407,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             trajectory_data = []
 
-            # Calculate daily sales and exact COGS by transaction date
             daily_sales_map = {}
             for sale in sales_qs.prefetch_related('items'):
                 s_date = getattr(sale, 'sale_date', None)
@@ -7388,7 +7421,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 sale_amt = quantize_money(sale.total_amount or ZERO)
                 daily_sales_map[d_key]["total_sales"] += sale_amt
 
-                # Sum line item COGS for this transaction
                 sale_cogs = ZERO
                 for item in getattr(sale, 'items', []).all():
                     q_sold = Decimal(str(getattr(item, 'quantity_sold', ZERO) or ZERO))
@@ -7397,12 +7429,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
                 daily_sales_map[d_key]["cogs"] += sale_cogs
 
-            # Build sorted trajectory list with exact date strings (YYYY-MM-DD)
             sorted_dates = sorted(daily_sales_map.keys())
             for date_str in sorted_dates:
                 d_sales = daily_sales_map[date_str]["total_sales"]
                 d_cogs = daily_sales_map[date_str]["cogs"]
-                d_net = d_sales - d_cogs  # Direct gross/net calculation per day
+                d_net = d_sales - d_cogs
 
                 trajectory_data.append({
                     "date": date_str,
@@ -7411,7 +7442,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "net_profit": float(d_net)
                 })
 
-            # Construct Payload Response
             response_payload = {
                 "profitability": {
                     "total_sales": float(total_sales),
