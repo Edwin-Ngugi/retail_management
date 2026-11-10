@@ -1246,7 +1246,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
     def lookup_invoice(self, request):
         """
         Fast lookup endpoint for invoice search in Customer Receipts view.
-        Normalizes spaces/underscores/hyphens and computes balances via DB aggregation.
+        Handles query variation formats (2_34, 2 34, 2-34, INV 2 34).
         """
         query = str(request.query_params.get("q", "")).strip()
         branch_id = request.query_params.get("branch") or request.query_params.get("branch_id")
@@ -1254,14 +1254,13 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         if not query:
             return Response([], status=status.HTTP_200_OK)
 
-        # 1. Normalize query terms (handles '2_34', '2 34', '2-34', 'INV 2 34', 'INV 2_34')
+        # 1. Normalize search terms to match spaces, underscores, and hyphens
         raw_clean = query.upper().replace("INV", "").replace("REC", "").replace("#", "").strip()
-        
         with_spaces = raw_clean.replace("_", " ").replace("-", " ")
         with_underscores = raw_clean.replace(" ", "_").replace("-", "_")
         with_hyphens = raw_clean.replace(" ", "-").replace("_", "-")
 
-        # 2. Build flexible Q filter
+        # 2. Flexible search filter
         search_filter = (
             Q(receipt_number__icontains=query) |
             Q(receipt_number__icontains=raw_clean) |
@@ -1272,40 +1271,49 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             Q(customer__name__icontains=query)
         )
 
-        sales_qs = SaleTransaction.objects.select_related("customer", "branch").filter(search_filter)
+        sales_qs = (
+            SaleTransaction.objects
+            .select_related("customer", "branch")
+            .prefetch_related("creditrepayment_set") # or prefetch related repayments safely
+            if hasattr(SaleTransaction, "creditrepayment_set") else
+            SaleTransaction.objects.select_related("customer", "branch")
+        )
 
-        # Strict branch filtering
+        sales_qs = sales_qs.filter(search_filter)
+
+        # Strict branch isolation
         if branch_id and str(branch_id).isdigit():
             sales_qs = sales_qs.filter(branch_id=int(branch_id))
 
-        # 3. Direct DB aggregation to prevent N+1 loop slowness
-        sales_qs = (
-            sales_qs
-            .annotate(
-                total_repaid=Coalesce(
-                    Sum("credit_repayments__amount"),
-                    ZERO,
-                    output_field=models.DecimalField(max_digits=12, decimal_places=2)
-                )
-            )
-            .order_by("-sale_date")[:20]
-        )
-
         results = []
-        for sale in sales_qs:
-            total_amt = quantize_money(sale.total_amount or ZERO)
-            repaid_amt = quantize_money(sale.total_repaid or ZERO)
+        # Limit to top 20 matches ordered by sale date
+        for sale in sales_qs.order_by("-sale_date")[:20]:
+            total_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
+            
+            # Safely compute total repayments collected for this transaction
+            repaid_amt = ZERO
+            repayment_rel = getattr(sale, "credit_repayments", None) or getattr(sale, "repayments", None)
+            
+            if repayment_rel is not None:
+                try:
+                    repaid_amt = sum(
+                        (quantize_money(getattr(rep, "amount", ZERO) or ZERO) for rep in repayment_rel.all()),
+                        ZERO
+                    )
+                except Exception:
+                    repaid_amt = ZERO
+
             balance_due = max(ZERO, total_amt - repaid_amt)
 
             results.append({
                 "id": sale.id,
                 "invoice_number": str(sale.receipt_number or f"INV-{sale.id}"),
                 "customer_id": sale.customer_id,
-                "customer_name": sale.customer.name if sale.customer else (sale.customer_name or "Walk-in Debtor"),
+                "customer_name": sale.customer.name if getattr(sale, "customer", None) else (sale.customer_name or "Walk-in Debtor"),
                 "total_amount": float(total_amt),
                 "repaid_amount": float(repaid_amt),
                 "balance_due": float(balance_due),
-                "sale_date": sale.sale_date.strftime("%Y-%m-%d") if hasattr(sale.sale_date, "strftime") else str(sale.sale_date),
+                "sale_date": sale.sale_date.strftime("%Y-%m-%d") if hasattr(sale, "sale_date") and hasattr(sale.sale_date, "strftime") else str(getattr(sale, "sale_date", "")),
             })
 
         return Response(results, status=status.HTTP_200_OK)
