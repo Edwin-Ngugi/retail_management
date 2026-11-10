@@ -183,6 +183,8 @@ class Customer(models.Model):
         Retailer,
         on_delete=models.CASCADE,
         related_name="customers",
+        null=True,
+        blank=True,
         help_text="The retailer/client who owns this customer entry",
     )
     customer_id = models.CharField(
@@ -2020,31 +2022,24 @@ class SaleTransaction(models.Model):
 
         # 1. Resolve Default Debtor/Customer if missing
         if is_credit and not self.customer:
-            retailer_user = self.created_by
-
-            if not retailer_user and hasattr(self, "branch") and self.branch:
-                if hasattr(self.branch, "retailer"):
-                    retailer_user = self.branch.retailer
-                elif hasattr(self.branch, "user"):
-                    retailer_user = self.branch.user
+            retailer_obj = None
+            if hasattr(self, "branch") and self.branch and self.branch.retailer:
+                retailer_obj = self.branch.retailer
 
             branch_name = self.branch.name if hasattr(self, "branch") and self.branch else "Branch"
             cust_name = self.customer_name or f"Walk-in Debtor ({branch_name})"
 
             customer_kwargs = {"name": cust_name}
-            if retailer_user:
-                customer_kwargs["retailer"] = retailer_user
+            if retailer_obj:
+                customer_kwargs["retailer"] = retailer_obj
             if self.customer_phone:
                 customer_kwargs["phone_number"] = self.customer_phone
 
             default_customer = Customer.objects.filter(**customer_kwargs).first()
-            if not default_customer:
+            if not default_customer and retailer_obj:
                 default_customer = Customer.objects.create(**customer_kwargs)
 
             self.customer = default_customer
-
-        if not is_credit and not self.customer_name:
-            self.customer_name = "Walk-in Customer"
 
         # 2. Preserve Custom Invoice / Receipt Number Input
         inv_no = (self.invoice_number or "").strip()
