@@ -60,6 +60,8 @@ class RetailBranch(models.Model):
         User,
         on_delete=models.CASCADE,
         related_name="branches",
+        null=True,  # Allow temporary null during creation before auto-assignment
+        blank=True,
         help_text="The retailer/client who owns this branch",
     )
     name = models.CharField(
@@ -78,8 +80,33 @@ class RetailBranch(models.Model):
         ]
         ordering = ["name"]
 
+    def save(self, *args, **kwargs):
+        # AUTOMATIC RETAILER ASSIGNMENT FOR NEW BRANCHES
+        if not self.retailer_id:
+            with db_transaction.atomic():
+                default_retailer, created = User.objects.get_or_create(
+                    username="system_retailer",
+                    defaults={
+                        "first_name": "System", 
+                        "last_name": "Retailer",
+                        "is_active": True,
+                    }
+                )
+                
+                # Ensure default retailer has role permissions initialized
+                if created and hasattr(settings, 'AUTH_USER_MODEL'):
+                    UserRolePermission.objects.get_or_create(
+                        user=default_retailer,
+                        defaults={"role": UserRolePermission.Role.ADMIN}
+                    )
+
+                self.retailer = default_retailer
+
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f"{self.name} ({self.retailer.username})"
+        retailer_name = self.retailer.username if self.retailer else "Unassigned"
+        return f"{self.name} ({retailer_name})"
 
 
 # -----------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 from django import forms
 from django.contrib import admin, messages
 from django.db import transaction
-from django.db.models import Avg, Q, Count
+from django.db.models import Avg, Count, Q
 from django.forms.models import BaseInlineFormSet
 from django.core.exceptions import ValidationError
 from django.http import HttpResponseRedirect
@@ -14,6 +14,7 @@ from analytics.services import AnalyticsService
 from .models import (
     BranchItemPricing,
     CreditRepayment,
+    CreditRepaymentSplit,
     Customer,
     CustomerReturn,
     DailyFinancialReport,
@@ -22,12 +23,12 @@ from .models import (
     Item,
     MonthlyInventorySnapshot,
     MonthlyStockMovementArchive,
+    MonthlyTransactionArchive,
     PendingApproval,
     Purchase,
-    PurchaseReturn,
     PurchaseOrder,
     PurchaseOrderItem,
-    CreditRepaymentSplit,
+    PurchaseReturn,
     RetailBranch,
     Sale,
     SaleItem,
@@ -36,7 +37,6 @@ from .models import (
     StockBatch,
     StockMovement,
     StockTransfer,
-    MonthlyTransactionArchive,
     Supplier,
     SupplierPayment,
     SupplierReturn,
@@ -419,7 +419,6 @@ class SalePaymentInlineFormSet(BaseInlineFormSet):
                 valid_forms_count += 1
                 total_inline_amount += form.cleaned_data.get("amount", 0)
 
-        # Ensure split transactions require at least 2 child payment records
         if self.instance and self.instance.payment_method in [
             SaleTransaction.PaymentMethod.SPLIT,
             "SPLIT",
@@ -725,7 +724,7 @@ class MonthlyTransactionArchiveAdmin(TenantAwareModelAdmin):
 
 
 # =============================================================================
-# SALES & TRANSACTION MANAGEMENT (FIXED FOR DELETION, LIST VIEW & SPLIT INLINES)
+# SALES & TRANSACTION MANAGEMENT
 # =============================================================================
 
 
@@ -783,11 +782,6 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
         )
 
     def save_formset(self, request, form, formset, change):
-        """
-        Automatically recalculate amount_paid and is_paid status 
-        when split payment inline records are saved in Django Admin.
-        Uses update() to avoid triggering recursive signal loops.
-        """
         instances = formset.save(commit=False)
         for instance in instances:
             instance.save()
@@ -801,7 +795,7 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
                 is_paid = total_split_paid >= (obj.total_amount or 0)
                 SaleTransaction.objects.filter(pk=obj.pk).update(
                     amount_paid=total_split_paid,
-                    is_paid=is_paid
+                    is_paid=is_paid,
                 )
 
     @admin.display(description="Amount Paid", ordering="amount_paid")
@@ -908,10 +902,6 @@ class SalePaymentAdmin(TenantAwareModelAdmin):
 
 
 class CreditRepaymentSplitInline(admin.TabularInline):
-    """
-    Renders split payment channels directly inside the CreditRepayment change form.
-    Allows cashiers/admins to break down split repayments by method and amount.
-    """
     model = CreditRepaymentSplit
     extra = 1
     fields = ("method", "amount", "reference_code", "created_at")
@@ -920,11 +910,7 @@ class CreditRepaymentSplitInline(admin.TabularInline):
 
 @admin.register(CreditRepayment)
 class CreditRepaymentAdmin(admin.ModelAdmin):
-    """
-    Admin configuration for primary CreditRepayment records.
-    Includes inline split rows, branch/customer filters, and quick calculations.
-    """
-    ordering = ("-id",)  # 👈 REQUIRED for autocomplete_fields in CreditRepaymentSplitAdmin
+    ordering = ("-id",)
     
     list_display = (
         "id",
@@ -981,9 +967,6 @@ class CreditRepaymentAdmin(admin.ModelAdmin):
     )
 
     def get_queryset(self, request):
-        """
-        Annotates split count to avoid N+1 database queries on list display.
-        """
         qs = super().get_queryset(request)
         return qs.annotate(split_count_anno=Count("splits"))
 
@@ -1003,10 +986,6 @@ class CreditRepaymentAdmin(admin.ModelAdmin):
 
 @admin.register(CreditRepaymentSplit)
 class CreditRepaymentSplitAdmin(admin.ModelAdmin):
-    """
-    Standalone Admin UI for inspecting individual repayment split records across all branches.
-    Safely scopes queryset by tenant retailer through repayment.branch relation.
-    """
     list_display = (
         "id",
         "get_repayment_id",
