@@ -1238,10 +1238,62 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         if customer_id:
             queryset = queryset.filter(customer_id=customer_id)
         if start_date and end_date:
-            # CreditRepayment.date is authoritative; created_at is audit metadata.
             queryset = queryset.filter(date__range=(start_date, end_date))
 
         return queryset
+
+    @action(detail=False, methods=["get"], url_path="lookup")
+    def lookup_invoice(self, request):
+        """
+        Fast lookup endpoint for invoice search in Customer Receipts view.
+        Searches SaleTransaction invoices directly instead of full repayment lists.
+        """
+        query = str(request.query_params.get("q", "")).strip()
+        branch_id = request.query_params.get("branch") or request.query_params.get("branch_id")
+
+        if not query:
+            return Response([], status=status.HTTP_200_OK)
+
+        # Base query optimized with select_related / prefetch_related
+        sales_qs = (
+            SaleTransaction.objects
+            .select_related("customer", "branch")
+            .prefetch_related("credit_repayments", "split_payments")
+            .all()
+            .order_by("-sale_date")
+        )
+
+        if branch_id and str(branch_id).isdigit():
+            sales_qs = sales_qs.filter(branch_id=int(branch_id))
+
+        # Instant DB search across receipt numbers and customer names (limited to 20)
+        sales_qs = sales_qs.filter(
+            Q(receipt_number__icontains=query) |
+            Q(customer_name__icontains=query) |
+            Q(customer__name__icontains=query)
+        )[:20]
+
+        results = []
+        for sale in sales_qs:
+            total_amt = quantize_money(sale.total_amount or ZERO)
+            repaid_amt = sum(
+                (quantize_money(rep.amount or ZERO) for rep in sale.credit_repayments.all()),
+                ZERO
+            )
+            balance_due = max(ZERO, total_amt - repaid_amt)
+
+            results.append({
+                "id": sale.id,
+                "invoice_number": str(sale.receipt_number or f"INV-{sale.id}"),
+                "customer_id": sale.customer_id,
+                "customer_name": sale.customer.name if sale.customer else (sale.customer_name or "Walk-in Debtor"),
+                "total_amount": float(total_amt),
+                "repaid_amount": float(repaid_amt),
+                "balance_due": float(balance_due),
+                "sale_date": sale.sale_date.strftime("%Y-%m-%d") if hasattr(sale.sale_date, "strftime") else str(sale.sale_date),
+            })
+
+        return Response(results, status=status.HTTP_200_OK)
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -1291,7 +1343,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Extract Split Payments Payload (Handles lists and dictionaries)
+            # Extract Split Payments Payload
             split_payload = (
                 raw_data.get("split_payments")
                 or raw_data.get("splits")
@@ -1316,7 +1368,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                         if sp_amt > Decimal("0.00"):
                             valid_splits.append(sp)
 
-            # Robust Payment Method Normalization Helper
+            # Payment Method Normalization Helper
             raw_method = (
                 raw_data.get("payment_method") 
                 or raw_data.get("method") 
@@ -1374,10 +1426,8 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             if not branch_obj:
                 branch_obj = getattr(customer_obj, "branch", None)
 
-            # Creator reference
             user = _authenticated_user(request)
 
-            # Date handling
             date_input = raw_data.get("date") or raw_data.get("repayment_date")
             repayment_date = timezone.localdate()
             if date_input:
@@ -1393,7 +1443,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             if ref_no:
                 formatted_notes = f"Ref: {ref_no} | {notes_input}".strip(" |")
 
-            # 2. Save header CreditRepayment
+            # Save header CreditRepayment
             repayment = CreditRepayment.objects.create(
                 customer=customer_obj,
                 transaction=transaction_obj,
@@ -1405,7 +1455,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 date=repayment_date,
             )
 
-            # 3. Create Child CreditRepaymentSplit entries if multi-channel (Fixed field names)
+            # Create Child CreditRepaymentSplit entries
             if payment_method == "SPLIT" and valid_splits:
                 split_total = Decimal("0.00")
                 for sp in valid_splits:
@@ -1416,7 +1466,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
 
                     CreditRepaymentSplit.objects.create(
                         repayment=repayment,
-                        method=sp_pm,  # Correct field name in CreditRepaymentSplit model
+                        method=sp_pm,
                         amount=sp_amt,
                         reference_code=sp.get("reference_code") or sp.get("reference_number") or ref_no or (transaction_obj.invoice_number if transaction_obj else "")
                     )
