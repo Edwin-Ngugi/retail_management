@@ -2,9 +2,10 @@ import logging
 import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from django.conf import settings
 import random
 import string
+
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
@@ -15,6 +16,7 @@ from django.db.models.functions import Coalesce
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils import timezone
+from django.utils.text import slugify
 
 
 logger = logging.getLogger(__name__)
@@ -52,21 +54,47 @@ def generate_receipt_number():
     return generate_document_number(is_credit=False)
 
 
+class Retailer(models.Model):
+    """
+    Represents a client business/tenant owning store branches, catalog items, and financial records.
+    Staff users are not tied 1:1 to retailers and can manage any retailer upon authentication.
+    """
+    name = models.CharField(
+        max_length=255,
+        unique=True,
+        help_text="e.g., Melvex Enterprises, Car Wash Ltd",
+    )
+    code = models.CharField(
+        max_length=50,
+        unique=True,
+        blank=True,
+        null=True,
+        help_text="Optional unique retailer identification code",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
 # -----------------------------------------------------------------------------
-# Base & Setup Models
+# Branch Model Linked to Business Retailer Entity
 # -----------------------------------------------------------------------------
 class RetailBranch(models.Model):
     retailer = models.ForeignKey(
-        User,
+        Retailer,
         on_delete=models.CASCADE,
         related_name="branches",
-        null=True,  # Allow temporary null during creation before auto-assignment
+        null=True,
         blank=True,
-        help_text="The retailer/client who owns this branch",
+        help_text="The retailer/business entity that owns this branch",
     )
     name = models.CharField(
         max_length=200,
-        help_text="e.g. Nairobi Branch, Meru Branch",
+        help_text="e.g., Nairobi Branch, Meru Branch",
     )
     location = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -81,32 +109,19 @@ class RetailBranch(models.Model):
         ordering = ["name"]
 
     def save(self, *args, **kwargs):
-        # AUTOMATIC RETAILER ASSIGNMENT FOR NEW BRANCHES
+        # Auto-create or link a dedicated Retailer business entity by branch name if unassigned
         if not self.retailer_id:
-            with db_transaction.atomic():
-                default_retailer, created = User.objects.get_or_create(
-                    username="system_retailer",
-                    defaults={
-                        "first_name": "System", 
-                        "last_name": "Retailer",
-                        "is_active": True,
-                    }
-                )
-                
-                # Ensure default retailer has role permissions initialized
-                if created and hasattr(settings, 'AUTH_USER_MODEL'):
-                    UserRolePermission.objects.get_or_create(
-                        user=default_retailer,
-                        defaults={"role": UserRolePermission.Role.ADMIN}
-                    )
-
-                self.retailer = default_retailer
+            clean_name = self.name.strip()
+            retailer_obj, _ = Retailer.objects.get_or_create(name=clean_name)
+            self.retailer = retailer_obj
 
         super().save(*args, **kwargs)
 
     def __str__(self):
-        retailer_name = self.retailer.username if self.retailer else "Unassigned"
+        retailer_name = self.retailer.name if self.retailer else "Unassigned"
         return f"{self.name} ({retailer_name})"
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -117,20 +132,20 @@ class BranchStock(models.Model):
         RetailBranch,
         on_delete=models.CASCADE,
         related_name="branch_stocks",
-        help_text="The branch holding this inventory record"
+        help_text="The branch holding this inventory record",
     )
     item = models.ForeignKey(
-        'Item',
+        "Item",
         on_delete=models.CASCADE,
         related_name="branch_stocks",
-        help_text="The item tied to this branch stock"
+        help_text="The item tied to this branch stock",
     )
     quantity = models.DecimalField(
         max_digits=12,
         decimal_places=3,
         default=ZERO,
         validators=[MinValueValidator(ZERO)],
-        help_text="Current real-time stock level at this branch"
+        help_text="Current real-time stock level at this branch",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -165,7 +180,7 @@ class BranchStock(models.Model):
 
 class Customer(models.Model):
     retailer = models.ForeignKey(
-        User,
+        Retailer,
         on_delete=models.CASCADE,
         related_name="customers",
         help_text="The retailer/client who owns this customer entry",
@@ -216,7 +231,7 @@ class Customer(models.Model):
 
 class Supplier(models.Model):
     retailer = models.ForeignKey(
-        User,
+        Retailer,
         on_delete=models.CASCADE,
         related_name="suppliers",
         null=True,
@@ -230,7 +245,7 @@ class Supplier(models.Model):
 
 class Item(models.Model):
     retailer = models.ForeignKey(
-        User,
+        Retailer,
         on_delete=models.CASCADE,
         related_name="items",
         null=True,
@@ -275,7 +290,7 @@ class Item(models.Model):
 
     def __str__(self):
         retailer_name = (
-            self.retailer.username
+            self.retailer.name      
             if self.retailer
             else "No retailer"
         )
@@ -1399,6 +1414,7 @@ class Purchase(models.Model):
             f"Purchase ({self.quantity}) [{self.payment_method}]"
         )
 
+
 class PurchaseOrder(models.Model):
     """Parent model representing the overall Purchase Order (Header)."""
     class PaymentMethod(models.TextChoices):
@@ -1495,6 +1511,7 @@ class PurchaseOrderItem(models.Model):
             }
         )
 
+
 class SupplierPayment(models.Model):
     class PaymentMethod(models.TextChoices):
         CASH = "CASH", "Cash"
@@ -1530,7 +1547,6 @@ class SupplierPayment(models.Model):
     def clean(self):
         super().clean()
         if self.purchase_id and not self.pk:
-            # Only validate outstanding balance on BRAND NEW payment entries
             balance = self.purchase.balance_due
             if self.amount and self.amount > balance:
                 raise ValidationError(
@@ -1545,21 +1561,18 @@ class SupplierPayment(models.Model):
         old_amount = Decimal("0.00")
         
         if not is_new:
-            # Fetch original payment amount to calculate delta
             orig = SupplierPayment.objects.filter(pk=self.pk).values('amount').first()
             if orig:
                 old_amount = Decimal(str(orig['amount'] or '0.00'))
 
         super().save(*args, **kwargs)
 
-        # 1. Update purchase model amount_paid field by the delta difference
         p = self.purchase
         amount_delta = Decimal(str(self.amount or '0.00')) - old_amount
         if amount_delta != Decimal("0.00"):
             p.amount_paid = Decimal(str(p.amount_paid or '0.00')) + amount_delta
             p.save(update_fields=["amount_paid"])
 
-        # 2. Synchronize expense entry date and amount for cashbook accounting
         expense_date = self.created_at.date() if self.created_at else timezone.localdate()
         expense_desc = f"Supplier Repayment ({p.item.name}): {self.notes}".strip()
 
@@ -1576,6 +1589,7 @@ class SupplierPayment(models.Model):
 
     def __str__(self):
         return f"Supplier Payment: KSh {self.amount} for PO #{self.purchase_id}"
+
 
 # -----------------------------------------------------------------------------
 # Purchase Return
@@ -1653,7 +1667,6 @@ class PurchaseReturn(models.Model):
                 self.item.retailer = self.branch.retailer
                 self.item.save(update_fields=["retailer"])
 
-        # Validate return quantity against original purchase if linked
         if self.purchase and self.quantity:
             if self.quantity > self.purchase.quantity:
                 raise ValidationError(
@@ -1668,17 +1681,14 @@ class PurchaseReturn(models.Model):
         self.full_clean()
         is_new = self.pk is None
 
-        # Auto-fill unit cost from purchase if omitted
         if (not self.unit_cost_price or self.unit_cost_price == ZERO) and self.purchase:
             self.unit_cost_price = self.purchase.unit_cost_price
 
-        # Auto-fill supplier name if linked
         if self.purchase and not self.supplier_name:
             self.supplier_name = self.purchase.supplier_name or (self.purchase.supplier.name if self.purchase.supplier else "")
 
         super().save(*args, **kwargs)
 
-        # 1. Post to Stock Movement Ledger (Outbound movement)
         ref_code = f"PURCHASE-RETURN-{self.pk}"
         StockMovement.objects.update_or_create(
             branch=self.branch,
@@ -1695,7 +1705,6 @@ class PurchaseReturn(models.Model):
             },
         )
 
-        # 2. Recalculate WAC & update stock
         recalculate_wac_sales_cost(self.branch, self.item)
 
     def delete(self, *args, **kwargs):
@@ -1922,10 +1931,8 @@ class SaleTransaction(models.Model):
                     or ""
                 ).upper().replace("-", "_").replace(" ", "_")
 
-                # 1. Match PAYBILL explicitly first
                 if any(k in raw_method for k in ["PAYBILL", "PAY_BILL", "C2B"]):
                     totals["PAYBILL"] += amt
-                # 2. Map generic MPESA / Send Money / Till to SEND_MONEY
                 elif any(k in raw_method for k in ["SEND_MONEY", "SENDMONEY", "TILL", "BUY_GOODS", "MPESA", "M_PESA", "MOBILE", "P2P"]):
                     totals["SEND_MONEY"] += amt
                 elif any(k in raw_method for k in ["BANK", "TRANSFER", "EFT"]):
@@ -2080,7 +2087,6 @@ def ensure_default_sale_payment(sender, instance, created, **kwargs):
     if instance.payment_method in [SaleTransaction.PaymentMethod.SPLIT, SaleTransaction.PaymentMethod.CREDIT]:
         return
 
-    # Check if any SalePayment already exists for this transaction
     if not instance.split_payments.exists():
         paid_amt = instance.amount_paid if (instance.amount_paid and instance.amount_paid > ZERO) else instance.total_amount
         if paid_amt > ZERO:
@@ -2343,13 +2349,11 @@ class SalePayment(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
-        # 1. If transaction_id is set, but sale_id is missing, try to auto-fill sale_id
         if self.transaction_id and not self.sale_id:
             first_legacy = self.transaction.legacy_sales.first()
             if first_legacy:
                 self.sale_id = first_legacy.id
 
-        # 2. If sale_id is set, but transaction_id is missing, auto-fill transaction_id
         elif self.sale_id and not self.transaction_id:
             if getattr(self.sale, 'transaction_id', None):
                 self.transaction_id = self.sale.transaction_id
@@ -2809,7 +2813,7 @@ class DamageRecord(models.Model):
 # -----------------------------------------------------------------------------
 class Expense(models.Model):
     retailer = models.ForeignKey(
-        User,
+        Retailer,
         on_delete=models.CASCADE,
         related_name="expenses",
         null=True,
@@ -2897,7 +2901,7 @@ class PendingApproval(models.Model):
 # -----------------------------------------------------------------------------
 class DailyFinancialReport(models.Model):
     retailer = models.ForeignKey(
-        User,
+        Retailer,
         on_delete=models.CASCADE,
         related_name="financial_reports",
         null=True,
@@ -3035,6 +3039,8 @@ class DailyFinancialReport(models.Model):
     def __str__(self):
         branch_name = self.branch.name if self.branch else "All Branches"
         return f"Report {self.date} ({branch_name})"
+
+
 class CreditRepaymentSplit(models.Model):
     METHOD_CHOICES = [
         ("CASH", "Cash"),
@@ -3059,13 +3065,13 @@ class CreditRepaymentSplit(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
-        # Automatically sync date from parent CreditRepayment
         if not self.date and self.repayment and self.repayment.date:
             self.date = self.repayment.date
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"Repayment Split ({self.method}): KSh {self.amount}"
+
 
 # =============================================================================
 # WAC RECALCULATION
@@ -3087,15 +3093,12 @@ def recalculate_wac_sales_cost(branch, item):
 
     opening_qty = Decimal(str(pricing.opening_stock or ZERO))
 
-    # 1. Determine baseline opening cost price
     opening_cost = pricing.opening_stock_unit_cost_price or ZERO
     opening_cost = Decimal(str(opening_cost))
 
-    # Fallback to current unit_cost_price if opening cost is zero
     if opening_cost <= ZERO:
         opening_cost = Decimal(str(pricing.unit_cost_price or ZERO))
 
-    # Cross-branch catalog fallback: if this branch has 0.00, check other branch pricings for this item
     if opening_cost <= ZERO:
         other_pricing = BranchItemPricing.objects.filter(
             item=item, 
@@ -3148,7 +3151,6 @@ def recalculate_wac_sales_cost(branch, item):
         if movement.movement_type in inbound_types:
             movement_cost = Decimal(str(movement.unit_cost_price or ZERO))
             
-            # If movement cost is zero, fallback to last known cost or baseline cost
             if movement_cost <= ZERO:
                 movement_cost = last_known_cost if last_known_cost > ZERO else opening_cost
 
@@ -3194,7 +3196,6 @@ def recalculate_wac_sales_cost(branch, item):
 
     final_wac = quantize_money(final_wac)
 
-    # Save calculated WAC back to BranchItemPricing
     BranchItemPricing.objects.filter(pk=pricing.pk).update(unit_cost_price=final_wac)
 
     for sale_id, new_unit_cost in sales_to_update.items():
@@ -3220,21 +3221,17 @@ class PasswordResetOTP(models.Model):
 
     @classmethod
     def generate_otp(cls, username):
-        # 1. Invalidate old unverified codes for this user
         cls.objects.filter(username=username, is_verified=False).delete()
-
-        # 2. Generate random 6-digit numeric OTP
-        code = ''.join(random.choices(string.digits, k=6))
-
-        # 3. Set expiration time (10 minutes)
+        code = "".join(random.choices(string.digits, k=6))
         expiry = timezone.now() + timedelta(minutes=10)
 
         otp_obj = cls.objects.create(
             username=username,
             otp_code=code,
-            expires_at=expiry
+            expires_at=expiry,
         )
         return otp_obj
+
 
 def default_module_permissions():
     """
@@ -3338,5 +3335,3 @@ class UserRolePermission(models.Model):
 
     def __str__(self):
         return f"{self.user.username} — {self.get_role_display()}"
-
-    

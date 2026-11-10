@@ -267,45 +267,24 @@ def consolidate_into_batch_order(modeladmin, request, queryset):
 class TenantAwareModelAdmin(admin.ModelAdmin):
     def get_queryset(self, request):
         qs = super().get_queryset(request)
-
-        if request.user.is_superuser:
+        # Any authenticated user has global management access across retailers
+        if request.user.is_authenticated:
             return qs
-
-        field_names = [field.name for field in self.model._meta.get_fields()]
-
-        if self.model == Item or "retailer" in field_names:
-            return qs.filter(Q(retailer=request.user) | Q(retailer__isnull=True))
-
-        if "branch" in field_names:
-            return qs.filter(branch__retailer=request.user)
-
-        if "from_branch" in field_names:
-            return qs.filter(from_branch__retailer=request.user)
-
-        return qs
+        return qs.none()
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if not request.user.is_superuser:
+        # Allow drop-down selection of all branches, items, customers, and suppliers
+        if request.user.is_authenticated:
             if db_field.name in ("branch", "from_branch", "to_branch"):
-                kwargs["queryset"] = RetailBranch.objects.filter(retailer=request.user)
-
+                kwargs["queryset"] = RetailBranch.objects.all()
             elif db_field.name == "item":
-                kwargs["queryset"] = Item.objects.filter(
-                    Q(retailer=request.user) | Q(retailer__isnull=True)
-                )
-
+                kwargs["queryset"] = Item.objects.all()
             elif db_field.name == "customer":
-                kwargs["queryset"] = Customer.objects.filter(retailer=request.user)
-
+                kwargs["queryset"] = Customer.objects.all()
             elif db_field.name == "supplier":
-                kwargs["queryset"] = Supplier.objects.filter(
-                    Q(retailer=request.user) | Q(retailer__isnull=True)
-                )
-
+                kwargs["queryset"] = Supplier.objects.all()
             elif db_field.name == "retailer":
-                kwargs["queryset"] = request.user.__class__.objects.filter(
-                    pk=request.user.pk
-                )
+                kwargs["queryset"] = Retailer.objects.all()
 
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
@@ -314,6 +293,15 @@ class TenantAwareModelAdmin(admin.ModelAdmin):
 # INLINES
 # =============================================================================
 
+from django.contrib import admin
+from .models import Retailer  
+
+
+@admin.register(Retailer)
+class RetailerAdmin(admin.ModelAdmin):
+    list_display = ("name", "code", "created_at")
+    search_fields = ("name", "code")  
+    ordering = ("name",)
 
 class BranchItemPricingInline(admin.TabularInline):
     model = BranchItemPricing
