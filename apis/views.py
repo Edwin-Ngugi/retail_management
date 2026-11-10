@@ -1449,24 +1449,19 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     sp_ref = str(sp.get("reference_code") or sp.get("reference_number") or ref_no).strip()
 
                     sp_notes = notes_input
-                    if sp_ref and not hasattr(CreditRepayment, "reference_code"):
+                    if sp_ref:
                         sp_notes = f"Ref: {sp_ref} | {notes_input}".strip(" |")
 
-                    kwargs_create = {
-                        "customer": customer_obj,
-                        "transaction": transaction_obj,
-                        "branch": branch_obj,
-                        "created_by": user,
-                        "amount": sp_amt,
-                        "payment_method": sp_pm,
-                        "notes": sp_notes,
-                        "date": repayment_date,
-                    }
-                    
-                    if hasattr(CreditRepayment, "reference_code"):
-                        kwargs_create["reference_code"] = sp_ref
-
-                    rep = CreditRepayment.objects.create(**kwargs_create)
+                    rep = CreditRepayment.objects.create(
+                        customer=customer_obj,
+                        transaction=transaction_obj,
+                        branch=branch_obj,
+                        created_by=user,
+                        amount=sp_amt,
+                        payment_method=sp_pm,
+                        notes=sp_notes,
+                        date=repayment_date,
+                    )
                     created_repayments.append(rep)
 
             # 3. Case B: Single Payment Channel -> Create single CreditRepayment entry
@@ -1481,27 +1476,22 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 payment_method = normalize_pm(raw_method)
 
                 formatted_notes = notes_input
-                if ref_no and not hasattr(CreditRepayment, "reference_code"):
+                if ref_no:
                     formatted_notes = f"Ref: {ref_no} | {notes_input}".strip(" |")
 
-                kwargs_create = {
-                    "customer": customer_obj,
-                    "transaction": transaction_obj,
-                    "branch": branch_obj,
-                    "created_by": user,
-                    "amount": total_amount,
-                    "payment_method": payment_method,
-                    "notes": formatted_notes,
-                    "date": repayment_date,
-                }
-
-                if hasattr(CreditRepayment, "reference_code"):
-                    kwargs_create["reference_code"] = ref_no
-
-                rep = CreditRepayment.objects.create(**kwargs_create)
+                rep = CreditRepayment.objects.create(
+                    customer=customer_obj,
+                    transaction=transaction_obj,
+                    branch=branch_obj,
+                    created_by=user,
+                    amount=total_amount,
+                    payment_method=payment_method,
+                    notes=formatted_notes,
+                    date=repayment_date,
+                )
                 created_repayments.append(rep)
 
-            # WebSocket Broadcast
+            # Real-time WebSocket Event Broadcast
             main_repayment = created_repayments[0]
             if main_repayment.branch_id:
                 channel_layer = get_channel_layer()
