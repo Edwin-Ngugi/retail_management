@@ -11377,7 +11377,29 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         return Decimal(str(default))
 
     def _get_branch_and_dates(self, request):
-        return _get_reporting_filters(request, default_period="month")
+        """
+        Extracts branch & reporting period filters with strict RetailBranch lookup 
+        to prevent leaking data across branches.
+        """
+        branch_obj, start_date, end_date, start_dt, end_dt, period_type = _get_reporting_filters(
+            request, default_period="month"
+        )
+
+        branch_param = (
+            request.query_params.get("branch")
+            or request.query_params.get("branch_id")
+            or (request.data.get("branch") if isinstance(request.data, dict) else None)
+            or (request.data.get("branch_id") if isinstance(request.data, dict) else None)
+        )
+
+        if branch_param:
+            branch_str = str(branch_param).strip()
+            if branch_str.isdigit():
+                branch_obj = RetailBranch.objects.filter(id=int(branch_str)).first()
+            else:
+                branch_obj = RetailBranch.objects.filter(name__iexact=branch_str).first()
+
+        return branch_obj, start_date, end_date, start_dt, end_dt, period_type
 
     def _generate_executive_insights(self, summary, fast_movers, slow_movers):
         notes = []
@@ -11443,7 +11465,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             elif start_date and end_date:
                 sales_qs = sales_qs.filter(sale_date__date__gte=start_date, sale_date__date__lte=end_date)
             
-            # Repayments strictly filtered by collection date
             if start_date and end_date:
                 returns_qs = returns_qs.filter(date__gte=start_date, date__lte=end_date)
                 repayment_qs = repayment_qs.filter(date__gte=start_date, date__lte=end_date)
@@ -11451,8 +11472,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 returns_qs = returns_qs.filter(branch=branch_obj)
+                # ✅ STRICT BRANCH FILTERING (Removed Q(branch__isnull=True) leak)
                 repayment_qs = repayment_qs.filter(
-                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj) | Q(branch__isnull=True)
+                    Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
                 )
 
             sale_items_qs = SaleItem.objects.filter(transaction__in=sales_qs).select_related('item', 'transaction')
@@ -11487,13 +11509,11 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             for sale in sales_with_payments:
                 rec_num = str(sale.receipt_number or f"REC-{sale.id}")
 
-                # Rule A: Invoices (INV...) route 100% of their total face value to CREDIT exposure
                 if rec_num.startswith("INV"):
                     sale_total = Decimal(str(sale.total_amount or ZERO))
                     gross_credit_sales += quantize_money(sale_total)
                     continue
 
-                # Rule B: Standard Receipts (REC...) parse exact liquid breakdown via model property
                 breakdown = sale.liquid_payments_breakdown
 
                 c_amt = quantize_money(breakdown.get("CASH", ZERO))
@@ -11503,7 +11523,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 cr_amt = quantize_money(breakdown.get("CREDIT", ZERO))
                 oth_amt = quantize_money(breakdown.get("OTHER", ZERO))
 
-                # Accumulate exact routed values
                 cash_total += c_amt
                 paybill_total += pb_amt
                 send_money_total += sm_amt
@@ -11526,7 +11545,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 raw_method = getattr(repayment, "payment_method", "CASH")
                 norm_rep_method = self._normalize_payment_method(raw_method)
 
-                # Fetch child CreditRepaymentSplit entries using helper
                 split_records = self._get_split_payments(repayment)
 
                 if norm_rep_method == "SPLIT" or len(split_records) > 0:
@@ -11806,7 +11824,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
-            # COMBINED RESOLVED PAYMENT CHANNEL DISTRIBUTION (PURE CASH SALES + COLLECTED REPAYMENTS)
             channel_map = {
                 "CASH": cash_total + repayments_by_channel["CASH"],
                 "PAYBILL": paybill_total + repayments_by_channel["PAYBILL"],
