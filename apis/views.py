@@ -3406,6 +3406,11 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     serializer_class = ExpenseSerializer
     permission_classes = [permissions.AllowAny]
 
+    def _resolve_target_retailer(self, request, branch_obj=None):
+        if branch_obj and branch_obj.retailer:
+            return branch_obj.retailer
+        return Retailer.objects.first()
+
     def get_queryset(self):
         selected_date_str = self.request.query_params.get("date") or self.request.query_params.get("selectedDate")
         target_date = timezone.localdate()
@@ -3424,10 +3429,11 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             .order_by("-date", "-id")
         )
 
-        user = _authenticated_user(self.request)
-        if user:
+        # ✅ FIX: Filter by Retailer entity instead of auth.User
+        target_retailer = self._resolve_target_retailer(self.request)
+        if target_retailer:
             queryset = queryset.filter(
-                Q(retailer=user) | Q(branch__retailer=user)
+                Q(retailer=target_retailer) | Q(branch__retailer=target_retailer)
             )
 
         branch_param = (
@@ -3489,14 +3495,13 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 if not branch_obj:
                     branch_obj = RetailBranch.objects.filter(name__iexact=clean_param).first()
 
-            # 3. Resolve Retailer Owner
-            user = _authenticated_user(request)
-            retailer_user = user or (branch_obj.retailer if branch_obj else None)
+            # 3. ✅ FIX: Resolve Retailer model instance instead of request.user
+            retailer_obj = self._resolve_target_retailer(request, branch_obj)
 
             # 4. Save directly
             expense = Expense.objects.create(
                 branch=branch_obj,
-                retailer=retailer_user,
+                retailer=retailer_obj,
                 description=description,
                 amount=amount,
                 date=expense_date,
