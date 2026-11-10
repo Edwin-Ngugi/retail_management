@@ -1164,27 +1164,43 @@ class CustomerViewSet(viewsets.ModelViewSet):
     serializer_class = CustomerSerializer
     permission_classes = [permissions.AllowAny]
 
-    def get_queryset(self):
-        queryset = (
-            Customer.objects
-            .all()
-            .order_by("name")
+    def _resolve_target_retailer(self, request):
+        """Helper to resolve the Retailer instance from branch params or fallback."""
+        branch_id = (
+            request.query_params.get("branch")
+            or request.query_params.get("branch_id")
+            or (request.data.get("branch") if isinstance(request.data, dict) else None)
+            or (request.data.get("branch_id") if isinstance(request.data, dict) else None)
         )
 
-        user = _authenticated_user(self.request)
+        if branch_id:
+            branch = _resolve_branch(branch_id)
+            if branch and branch.retailer:
+                return branch.retailer
 
-        if user:
+        # Fallback to first branch or first retailer in the system
+        first_branch = RetailBranch.objects.filter(retailer__isnull=False).first()
+        if first_branch and first_branch.retailer:
+            return first_branch.retailer
+
+        return Retailer.objects.first()
+
+    def get_queryset(self):
+        queryset = Customer.objects.select_related("retailer").all().order_by("name")
+
+        target_retailer = self._resolve_target_retailer(self.request)
+        if target_retailer:
             queryset = queryset.filter(
-                retailer=user
+                Q(retailer=target_retailer) | Q(retailer__isnull=True)
             )
 
         return queryset
 
     def perform_create(self, serializer):
-        user = _authenticated_user(self.request)
+        target_retailer = self._resolve_target_retailer(self.request)
 
-        if user:
-            serializer.save(retailer=user)
+        if target_retailer:
+            serializer.save(retailer=target_retailer)
         else:
             serializer.save()
 
