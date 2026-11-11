@@ -67,6 +67,7 @@ from analytics.services import AnalyticsService, InventoryService
 from stocks.models import (
     BranchItemPricing,
     CreditRepayment,
+    CreditRepaymentSplit,
     Customer,
     CustomerReturn,
     DamageRecord,
@@ -1284,7 +1285,6 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             total_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
             
             repaid_amt = ZERO
-            # Correctly accesses the 'repayments' related_name defined on CreditRepayment.transaction
             repayment_rel = getattr(sale, "repayments", None)
             if repayment_rel is not None:
                 try:
@@ -1439,10 +1439,63 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     if amt_dec > Decimal("0.00"):
                         valid_splits.append({"method": k, "amount": amt_dec})
 
+            raw_method = (
+                raw_data.get("payment_method") 
+                or raw_data.get("method") 
+                or raw_data.get("channel")
+                or raw_data.get("payment_channel")
+                or "CASH"
+            )
+
+            # Check for CreditRepaymentSplit availability
+            has_split_model = False
+            try:
+                from stocks.models import CreditRepaymentSplit
+                has_split_model = True
+            except ImportError:
+                has_split_model = False
+
             created_repayments = []
 
-            # 2. Case A: Split Payment Payload -> Create distinct CreditRepayment per channel
-            if valid_splits:
+            # 2. Case A: Split Payment with CreditRepaymentSplit model active
+            if valid_splits and has_split_model:
+                formatted_notes = notes_input
+                if ref_no:
+                    formatted_notes = f"Ref: {ref_no} | {notes_input}".strip(" |")
+
+                repayment = CreditRepayment.objects.create(
+                    customer=customer_obj,
+                    transaction=transaction_obj,
+                    branch=branch_obj,
+                    created_by=user,
+                    amount=total_amount,
+                    payment_method="SPLIT",
+                    notes=formatted_notes,
+                    date=repayment_date,
+                )
+
+                split_sum = Decimal("0.00")
+                for sp in valid_splits:
+                    sp_pm = normalize_pm(sp.get("method") or sp.get("payment_method") or sp.get("channel"))
+                    sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
+                    sp_ref = str(sp.get("reference_code") or sp.get("reference_number") or ref_no).strip()
+                    split_sum += sp_amt
+
+                    CreditRepaymentSplit.objects.create(
+                        repayment=repayment,
+                        method=sp_pm,
+                        amount=sp_amt,
+                        reference_code=sp_ref,
+                    )
+
+                if split_sum > Decimal("0.00"):
+                    repayment.amount = split_sum
+                    repayment.save(update_fields=["amount"])
+
+                created_repayments.append(repayment)
+
+            # 3. Case B: Split Payment without CreditRepaymentSplit model -> Create multiple CreditRepayment entries
+            elif valid_splits:
                 for sp in valid_splits:
                     sp_pm = normalize_pm(sp.get("method") or sp.get("payment_method") or sp.get("channel"))
                     sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
@@ -1464,17 +1517,9 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     )
                     created_repayments.append(rep)
 
-            # 3. Case B: Single Payment Channel -> Create single CreditRepayment entry
+            # 4. Case C: Standard Single Payment Channel
             else:
-                raw_method = (
-                    raw_data.get("payment_method") 
-                    or raw_data.get("method") 
-                    or raw_data.get("channel")
-                    or raw_data.get("payment_channel")
-                    or "CASH"
-                )
                 payment_method = normalize_pm(raw_method)
-
                 formatted_notes = notes_input
                 if ref_no:
                     formatted_notes = f"Ref: {ref_no} | {notes_input}".strip(" |")

@@ -1,43 +1,41 @@
 import os
 import django
 
-# Initialize Django settings
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")  # Adjust to your project's settings path
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
 django.setup()
 
-from django.db import transaction
-from django.contrib.auth import get_user_model
-from stocks.models import RetailBranch, Retailer
+from datetime import date
+from stocks.models import SaleTransaction, CreditRepayment
 
-User = get_user_model()
+target_date = date(2026, 10, 26)
 
+print(f"==================================================")
+print(f" 1. DIRECT SALES TRANSACTIONS (SaleTransaction)   ")
+print(f"==================================================")
+sales = SaleTransaction.objects.filter(sale_date__date=target_date)
+for sale in sales:
+    payments = list(sale.split_payments.all())
+    print(f"Tx #{sale.id} | Method: '{sale.payment_method}' | Amount Paid: KSh {sale.amount_paid}")
+    for p in payments:
+        print(f"   └─ Child SalePayment: method='{p.method}', amount={p.amount}")
 
-def fix_retailer_foreign_keys():
-    print("--- Fixing Retailer Foreign Key References ---")
-    
-    with transaction.atomic():
-        # 1. Ensure a Retailer entity exists for every branch name
-        for branch in RetailBranch.objects.all():
-            clean_name = branch.name.strip()
-            
-            # Get or create the matching Retailer entity in stocks_retailer
-            retailer_obj, created = Retailer.objects.get_or_create(
-                name=clean_name,
-                defaults={"code": f"RET-{branch.id}"}
-            )
-            
-            # Explicitly assign and update foreign key reference
-            branch.retailer = retailer_obj
-            branch.save(update_fields=["retailer"])
-            print(f"Updated Branch '{branch.name}' (ID: {branch.id}) -> Linked to Retailer '{retailer_obj.name}' (ID: {retailer_obj.id})")
+print(f"\n==================================================")
+print(f" 2. PRIOR CREDIT REPAYMENTS COLLECTED ONLY        ")
+print(f"==================================================")
+# Filter repayments on target_date whose credit invoice was created BEFORE target_date
+# Or repayments linked to general customer balances (transaction__isnull=True)
+repayments = CreditRepayment.objects.filter(
+    date=target_date
+).filter(
+    transaction__sale_date__date__lt=target_date
+) | CreditRepayment.objects.filter(
+    date=target_date, 
+    transaction__isnull=True
+)
 
-        # 2. Clean up old synthetic accounts from auth_user table
-        deleted_users, _ = User.objects.filter(username__startswith="retailer_").delete()
-        if deleted_users:
-            print(f"Cleaned up {deleted_users} synthetic user accounts from auth_user table.")
-
-    print("\n--- Foreign key references fixed successfully! ---")
-
-
-if __name__ == "__main__":
-    fix_retailer_foreign_keys()
+for rep in repayments.distinct():
+    splits = list(rep.splits.all())
+    customer_name = rep.customer.name if getattr(rep, 'customer', None) else "N/A"
+    print(f"Repayment #{rep.id} | Customer: {customer_name} | Method: '{rep.payment_method}' | Amount: KSh {rep.amount}")
+    for s in splits:
+        print(f"   └─ Child CreditRepaymentSplit: method='{s.method}', amount={s.amount}")
