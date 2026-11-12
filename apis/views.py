@@ -7674,9 +7674,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # 2. Fetch ALL Credit Sales (regardless of paid/unpaid status)
             st_credit_filter = (
                 Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) | 
-                Q(payment_method='Credit') |
-                Q(split_payments__method='CREDIT') |
-                Q(split_payments__method='Credit')
+                Q(payment_method__iexact='CREDIT') |
+                Q(split_payments__method__iexact='CREDIT')
             )
             credit_sales_qs = SaleTransaction.objects.filter(st_credit_filter, sale_date__lte=end_dt).prefetch_related('split_payments', 'repayments', 'customer').distinct()
             legacy_sales_qs = Sale.objects.filter(payment_method='CREDIT', date__lte=end_date)
@@ -7690,24 +7689,25 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             # Process SaleTransaction records
             for sale in credit_sales_qs:
-                cust_key = sale.customer_id if sale.customer_id else (sale.customer_name or "Walk-in Debtor").strip()
+                cust_key = f"cust-{sale.customer_id}" if sale.customer_id else f"name-{(sale.customer_name or 'Walk-in Debtor').strip().lower()}"
                 cust_disp_name = sale.customer.name if sale.customer else (sale.customer_name or "Walk-in Debtor").strip()
                 cust_phone = (sale.customer.phone_number if sale.customer else sale.customer_phone) or "N/A"
 
                 if cust_key not in debtors_map:
                     debtors_map[cust_key] = {
-                        "customer_id": cust_key,
+                        "customer_id": sale.customer_id or cust_key,
                         "customer_obj": sale.customer,
                         "customer_name": cust_disp_name,
                         "phone": cust_phone,
                         "unpaid_invoices_count": 0,
                         "gross_credit": ZERO,
+                        "sale_ids": [],
                     }
 
-                norm_method = _normalize_payment_method(sale.payment_method)
+                norm_method = self._normalize_payment_method(sale.payment_method)
                 if norm_method == "SPLIT" or sale.split_payments.exists():
                     sale_credit_portion = sum(
-                        (Decimal(str(sp.amount or ZERO)) for sp in sale.split_payments.all() if _normalize_payment_method(_extract_sp_method(sp)) == "CREDIT"),
+                        (Decimal(str(sp.amount or ZERO)) for sp in sale.split_payments.all() if self._normalize_payment_method(_extract_sp_method(sp)) == "CREDIT"),
                         ZERO
                     )
                     if sale_credit_portion <= ZERO:
@@ -7716,12 +7716,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     sale_credit_portion = Decimal(str(sale.total_amount or ZERO))
 
                 debtors_map[cust_key]["gross_credit"] += sale_credit_portion
+                debtors_map[cust_key]["sale_ids"].append(sale.id)
                 debtors_map[cust_key]["unpaid_invoices_count"] += 1
                 total_unpaid_invoices_count += 1
 
             # Process Legacy Sales records
             for legacy in legacy_sales_qs:
-                cust_key = f"legacy-{legacy.customer_name or 'Walk-in'}"
+                cust_key = f"legacy-{(legacy.customer_name or 'Walk-in').strip().lower()}"
                 cust_disp_name = legacy.customer_name or "Walk-in Debtor"
 
                 if cust_key not in debtors_map:
@@ -7732,6 +7733,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         "phone": legacy.customer_phone or "N/A",
                         "unpaid_invoices_count": 0,
                         "gross_credit": ZERO,
+                        "sale_ids": [],
                     }
 
                 legacy_credit = Decimal(str(legacy.total_selling_price or ZERO))
@@ -7739,20 +7741,31 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 debtors_map[cust_key]["unpaid_invoices_count"] += 1
                 total_unpaid_invoices_count += 1
 
-            # 3. Compute Outstanding Receivables per Customer
+            # 3. Compute True Gross Credit Issued & Outstanding Receivables per Customer
             debtors_summary = []
             total_receivables = ZERO
+            total_credit_issued = ZERO
 
             for key, data in debtors_map.items():
-                cust_obj = data["customer_obj"]
-                cust_repayments = ZERO
+                gross_credit = quantize_money(data["gross_credit"])
+                total_credit_issued += gross_credit
 
+                cust_obj = data["customer_obj"]
+                sale_ids = data["sale_ids"]
+
+                rep_filter = Q()
                 if cust_obj:
-                    cust_repayments = repayment_qs.filter(customer=cust_obj).aggregate(
+                    rep_filter |= Q(customer=cust_obj)
+                if sale_ids:
+                    rep_filter |= Q(transaction_id__in=sale_ids)
+
+                cust_repayments = ZERO
+                if rep_filter:
+                    cust_repayments = repayment_qs.filter(rep_filter).distinct().aggregate(
                         total=Coalesce(Sum('amount'), ZERO)
                     )['total'] or ZERO
 
-                net_balance = max(ZERO, data["gross_credit"] - cust_repayments)
+                net_balance = max(ZERO, gross_credit - quantize_money(cust_repayments))
                 total_receivables += net_balance
 
                 if net_balance > ZERO:
