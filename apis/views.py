@@ -7692,32 +7692,35 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 split_records = extract_split_payments(sale)
                 is_credit = is_credit_sale_check(sale, credit_transaction_ids)
 
-                if method == "SPLIT" or split_records:
-                    if not split_records and is_credit:
-                        recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
-                        upfront_paid = max(ZERO, recorded_paid - repaid_by_tx.get(sale.id, ZERO))
-                        period_credit_sales_total += max(ZERO, amt - upfront_paid)
-                        if upfront_paid > ZERO:
-                            other_total += min(amt, upfront_paid)
-                        continue
+                credit_splits = [
+                    sp for sp in split_records
+                    if self._normalize_payment_method(extract_sp_method(sp)) == "CREDIT"
+                ]
 
+                if credit_splits:
+                    # True checkout split sale with an explicit CREDIT leg
                     for sp in split_records:
                         sp_method = self._normalize_payment_method(extract_sp_method(sp))
                         sp_amount = quantize_money(sp.amount or ZERO)
-
                         if sp_method == "CREDIT":
                             period_credit_sales_total += sp_amount
                         else:
                             allocate_to_channel(sp_method, sp_amount)
+                elif is_credit or method == "CREDIT":
+                    # Credit sale (including INV invoices whose payment_method/splits changed upon repayment)
+                    recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                    upfront_paid = max(ZERO, recorded_paid - repaid_by_tx.get(sale.id, ZERO))
+                    period_credit_sales_total += max(ZERO, amt - upfront_paid)
+                    if upfront_paid > ZERO:
+                        other_total += min(amt, upfront_paid)
+                elif method == "SPLIT" or split_records:
+                    # Pure non-credit split sale at checkout
+                    for sp in split_records:
+                        sp_method = self._normalize_payment_method(extract_sp_method(sp))
+                        sp_amount = quantize_money(sp.amount or ZERO)
+                        allocate_to_channel(sp_method, sp_amount)
                 else:
-                    if is_credit or method == "CREDIT":
-                        recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
-                        upfront_paid = max(ZERO, recorded_paid - repaid_by_tx.get(sale.id, ZERO))
-                        period_credit_sales_total += max(ZERO, amt - upfront_paid)
-                        if upfront_paid > ZERO:
-                            other_total += min(amt, upfront_paid)
-                    else:
-                        allocate_to_channel(method, amt)
+                    allocate_to_channel(method, amt)
 
             for rep in customer_repayments_qs.select_related("customer", "transaction").prefetch_related("splits"):
                 rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
