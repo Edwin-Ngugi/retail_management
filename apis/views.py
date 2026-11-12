@@ -1246,7 +1246,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
     def lookup_invoice(self, request):
         """
         Fast lookup endpoint for invoice search in Customer Receipts view.
-        Directly queries SaleTransaction invoices and aggregates related CreditRepayments.
+        Queries genuine credit SaleTransaction records and deducts CreditRepayments.
         """
         query = str(request.query_params.get("q", "")).strip()
         branch_id = request.query_params.get("branch") or request.query_params.get("branch_id")
@@ -1254,12 +1254,10 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         if not query or (len(query) < 3 and "_" not in query and "-" not in query and " " not in query):
             return Response([], status=status.HTTP_200_OK)
 
-        # 1. Normalize query
         raw_clean = query.upper().replace("INV", "").replace("REC", "").replace("#", "").strip()
         with_spaces = raw_clean.replace("_", " ").replace("-", " ")
         with_underscores = raw_clean.replace(" ", "_").replace("-", "_")
 
-        # 2. Filter for Invoices only (INV...) or matching customer names
         search_filter = (
             Q(receipt_number__icontains=f"INV {with_spaces}") |
             Q(receipt_number__icontains=f"INV_{with_underscores}") |
@@ -1271,33 +1269,52 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             Q(customer__name__icontains=query)
         )
 
-        sales_qs = SaleTransaction.objects.select_related("customer", "branch").filter(search_filter)
+        credit_only_filter = (
+            Q(payment_method=SaleTransaction.PaymentMethod.CREDIT)
+            | Q(payment_method__iexact="CREDIT")
+            | Q(split_payments__method__iexact="CREDIT")
+        )
 
-        # Exclude pure Cash receipts starting with 'REC-' unless explicitly queried
-        if not query.upper().startswith("REC"):
-            sales_qs = sales_qs.exclude(receipt_number__startswith="REC-")
+        sales_qs = (
+            SaleTransaction.objects.select_related("customer", "branch")
+            .prefetch_related("split_payments", "repayments")
+            .filter(search_filter & credit_only_filter)
+            .distinct()
+        )
 
         if branch_id and str(branch_id).isdigit():
             sales_qs = sales_qs.filter(branch_id=int(branch_id))
 
         results = []
         for sale in sales_qs.order_by("-sale_date")[:15]:
-            total_amt = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
-            
+            split_records = list(sale.split_payments.all())
+            if str(sale.payment_method).upper() == "SPLIT" or split_records:
+                credit_amt = sum(
+                    (
+                        quantize_money(sp.amount or ZERO)
+                        for sp in split_records
+                        if str(getattr(sp, "method", "")).upper() == "CREDIT"
+                    ),
+                    ZERO,
+                )
+            else:
+                sale_total = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
+                upfront_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                credit_amt = max(ZERO, sale_total - upfront_paid)
+
             repaid_amt = ZERO
             repayment_rel = getattr(sale, "repayments", None)
             if repayment_rel is not None:
                 try:
                     repaid_amt = sum(
                         (quantize_money(getattr(rep, "amount", ZERO) or ZERO) for rep in repayment_rel.all()),
-                        ZERO
+                        ZERO,
                     )
                 except Exception:
                     repaid_amt = ZERO
 
-            balance_due = max(ZERO, total_amt - repaid_amt)
+            balance_due = max(ZERO, credit_amt - repaid_amt)
 
-            # Only show transactions that have an outstanding balance due
             if balance_due <= ZERO and not query.upper().startswith("INV"):
                 continue
 
@@ -1306,7 +1323,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 "invoice_number": str(sale.receipt_number or f"INV-{sale.id}"),
                 "customer_id": sale.customer_id,
                 "customer_name": sale.customer.name if getattr(sale, "customer", None) else (sale.customer_name or "Walk-in Debtor"),
-                "total_amount": float(total_amt),
+                "total_amount": float(credit_amt),
                 "repaid_amount": float(repaid_amt),
                 "balance_due": float(balance_due),
                 "sale_date": sale.sale_date.strftime("%Y-%m-%d") if hasattr(sale, "sale_date") and hasattr(sale.sale_date, "strftime") else str(getattr(sale, "sale_date", "")),
@@ -1349,9 +1366,9 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
 
             amount_raw = raw_data.get("amount") or raw_data.get("repayment_amount")
             
-            if not customer_id or amount_raw in (None, ""):
+            if (not customer_id and not transaction_obj) or amount_raw in (None, ""):
                 return Response(
-                    {"error": "Customer and a valid payment amount are required."},
+                    {"error": "Customer or invoice transaction and a valid payment amount are required."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -1362,14 +1379,14 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Resolve Customer Instance
-            customer_obj = Customer.objects.filter(pk=customer_id).first()
+            # Resolve Customer Instance (optional when repaying a specific walk-in invoice)
+            customer_obj = Customer.objects.filter(pk=customer_id).first() if customer_id else None
             if not customer_obj and transaction_obj:
                 customer_obj = transaction_obj.customer
 
-            if not customer_obj:
+            if not customer_obj and not transaction_obj:
                 return Response(
-                    {"error": "Selected customer does not exist."},
+                    {"error": "Selected customer or invoice does not exist."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
@@ -7175,10 +7192,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     def _get_receivables_ledger(self, branch_obj=None, end_date=None, end_dt=None):
         """
         Single source of truth for Customer Receivables across Dashboard and Debtors Report.
-        Computes:
-          - total_credit_issued: True historical gross credit issued (never inflated by repayments)
-          - total_recovered: Cumulative credit repayments received up to end_date
-          - total_receivables: Net unpaid customer balance (gross_credit - repayments)
+        - total_credit_issued: Sum of genuine CREDIT sales only (never inflated by repayments or cash invoices)
+        - total_recovered: Cumulative credit repayments received up to end_date
+        - total_receivables: total_credit_issued - total_recovered
         """
         if end_dt is None:
             end_dt = timezone.now()
@@ -7186,7 +7202,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             end_date = end_dt.date() if isinstance(end_dt, datetime) else end_dt
 
         # 1. Fetch Credit Repayments (consistent branch filter)
-        repayment_qs = CreditRepayment.objects.filter(date__lte=end_date)
+        repayment_qs = CreditRepayment.objects.filter(date__lte=end_date).select_related(
+            "customer", "transaction"
+        )
         if branch_obj:
             repayment_qs = repayment_qs.filter(
                 Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
@@ -7196,19 +7214,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             repayment_qs.aggregate(total=Coalesce(Sum("amount"), ZERO))["total"] or ZERO
         )
 
-        # 2. Fetch Credit Sales (consistent filter & upfront amount_paid handling)
-        all_credit_ids = set(
-            repayment_qs.exclude(transaction_id=None)
-            .values_list("transaction_id", flat=True)
-            .distinct()
-        )
-
+        # 2. Fetch ONLY Genuine Credit Sales (exclude cash invoices & repayment-linked cash sales)
         st_credit_filter = (
             Q(payment_method=SaleTransaction.PaymentMethod.CREDIT)
             | Q(payment_method__iexact="CREDIT")
             | Q(split_payments__method__iexact="CREDIT")
-            | Q(is_invoice=True)
-            | Q(id__in=all_credit_ids)
         )
 
         credit_sales_qs = (
@@ -7216,42 +7226,23 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             .prefetch_related("split_payments", "customer")
             .distinct()
         )
-        legacy_sales_qs = Sale.objects.filter(payment_method="CREDIT", date__lte=end_date)
+        legacy_sales_qs = Sale.objects.filter(payment_method__iexact="CREDIT", date__lte=end_date)
 
         if branch_obj:
             credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
             legacy_sales_qs = legacy_sales_qs.filter(branch=branch_obj)
 
         debtors_map = {}
-        total_unpaid_invoices_count = 0
+        total_credit_issued = ZERO
+        sale_to_cust_key = {}
+
+        def get_customer_identity(customer_obj, fallback_name):
+            if customer_obj:
+                return f"cust-{customer_obj.id}", customer_obj.name, (customer_obj.phone_number or "N/A")
+            clean_name = (fallback_name or "Walk-in Debtor").strip()
+            return f"name-{clean_name.lower()}", clean_name, "N/A"
 
         for sale in credit_sales_qs:
-            cust_key = (
-                f"cust-{sale.customer_id}"
-                if sale.customer_id
-                else f"name-{(sale.customer_name or 'Walk-in Debtor').strip().lower()}"
-            )
-            cust_disp_name = (
-                sale.customer.name
-                if sale.customer
-                else (sale.customer_name or "Walk-in Debtor").strip()
-            )
-            cust_phone = (
-                (sale.customer.phone_number if sale.customer else getattr(sale, "customer_phone", None))
-                or "N/A"
-            )
-
-            if cust_key not in debtors_map:
-                debtors_map[cust_key] = {
-                    "customer_id": sale.customer_id or cust_key,
-                    "customer_obj": sale.customer,
-                    "customer_name": cust_disp_name,
-                    "phone": cust_phone,
-                    "unpaid_invoices_count": 0,
-                    "gross_credit": ZERO,
-                    "sale_ids": [],
-                }
-
             norm_method = self._normalize_payment_method(sale.payment_method)
             split_records = list(sale.split_payments.all())
 
@@ -7269,54 +7260,79 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 upfront_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
                 sale_credit_portion = max(ZERO, sale_total - upfront_paid)
 
-            if sale_credit_portion > ZERO:
-                debtors_map[cust_key]["gross_credit"] += sale_credit_portion
-                debtors_map[cust_key]["sale_ids"].append(sale.id)
-                debtors_map[cust_key]["unpaid_invoices_count"] += 1
+            if sale_credit_portion <= ZERO:
+                continue
+
+            total_credit_issued += sale_credit_portion
+            cust_key, cust_disp_name, cust_phone = get_customer_identity(
+                sale.customer, getattr(sale, "customer_name", None)
+            )
+            if cust_phone == "N/A" and getattr(sale, "customer_phone", None):
+                cust_phone = sale.customer_phone
+
+            sale_to_cust_key[sale.id] = cust_key
+
+            if cust_key not in debtors_map:
+                debtors_map[cust_key] = {
+                    "customer_id": sale.customer_id or cust_key,
+                    "customer_name": cust_disp_name,
+                    "phone": cust_phone,
+                    "unpaid_invoices_count": 0,
+                    "gross_credit": ZERO,
+                    "repaid": ZERO,
+                }
+
+            debtors_map[cust_key]["gross_credit"] += sale_credit_portion
+            debtors_map[cust_key]["unpaid_invoices_count"] += 1
 
         for legacy in legacy_sales_qs:
-            cust_key = f"legacy-{(legacy.customer_name or 'Walk-in').strip().lower()}"
+            legacy_credit = quantize_money(getattr(legacy, "total_selling_price", ZERO) or ZERO)
+            if legacy_credit <= ZERO:
+                continue
+
+            total_credit_issued += legacy_credit
+            cust_key, cust_disp_name, cust_phone = get_customer_identity(
+                None, getattr(legacy, "customer_name", None)
+            )
+            if cust_phone == "N/A" and getattr(legacy, "customer_phone", None):
+                cust_phone = legacy.customer_phone
+
             if cust_key not in debtors_map:
                 debtors_map[cust_key] = {
                     "customer_id": cust_key,
-                    "customer_obj": None,
-                    "customer_name": legacy.customer_name or "Walk-in Debtor",
-                    "phone": getattr(legacy, "customer_phone", None) or "N/A",
+                    "customer_name": cust_disp_name,
+                    "phone": cust_phone,
                     "unpaid_invoices_count": 0,
                     "gross_credit": ZERO,
-                    "sale_ids": [],
+                    "repaid": ZERO,
                 }
-            legacy_credit = quantize_money(getattr(legacy, "total_selling_price", ZERO) or ZERO)
+
             debtors_map[cust_key]["gross_credit"] += legacy_credit
             debtors_map[cust_key]["unpaid_invoices_count"] += 1
 
+        for rep in repayment_qs:
+            rep_amt = quantize_money(rep.amount or ZERO)
+            if rep_amt <= ZERO:
+                continue
+
+            if rep.transaction_id and rep.transaction_id in sale_to_cust_key:
+                ck = sale_to_cust_key[rep.transaction_id]
+            else:
+                fallback = (
+                    getattr(rep.transaction, "customer_name", None)
+                    if rep.transaction
+                    else getattr(rep, "customer_name", None)
+                )
+                ck, _, _ = get_customer_identity(rep.customer, fallback)
+
+            if ck in debtors_map:
+                debtors_map[ck]["repaid"] += rep_amt
+
         debtors_summary = []
-        total_receivables = ZERO
-        total_credit_issued = ZERO
+        total_unpaid_invoices_count = 0
 
         for data in debtors_map.values():
-            gross_credit = quantize_money(data["gross_credit"])
-            total_credit_issued += gross_credit
-
-            # Match repayments by Customer FK OR by SaleTransaction ID (fixes walk-in/unlinked debtors)
-            rep_filter = Q()
-            if data["customer_obj"]:
-                rep_filter |= Q(customer=data["customer_obj"])
-            if data["sale_ids"]:
-                rep_filter |= Q(transaction_id__in=data["sale_ids"])
-
-            cust_repayments = ZERO
-            if rep_filter:
-                cust_repayments = quantize_money(
-                    repayment_qs.filter(rep_filter)
-                    .distinct()
-                    .aggregate(total=Coalesce(Sum("amount"), ZERO))["total"]
-                    or ZERO
-                )
-
-            net_balance = max(ZERO, gross_credit - cust_repayments)
-            total_receivables += net_balance
-
+            net_balance = max(ZERO, quantize_money(data["gross_credit"] - data["repaid"]))
             if net_balance > ZERO:
                 total_unpaid_invoices_count += data["unpaid_invoices_count"]
                 debtors_summary.append({
@@ -7324,15 +7340,18 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "customer_name": data["customer_name"],
                     "phone": data["phone"],
                     "unpaid_invoices_count": data["unpaid_invoices_count"],
-                    "outstanding_balance": float(quantize_money(net_balance)),
+                    "outstanding_balance": float(net_balance),
                 })
 
         debtors_summary.sort(key=lambda x: x["outstanding_balance"], reverse=True)
 
+        total_credit_issued = quantize_money(total_credit_issued)
+        total_receivables = max(ZERO, quantize_money(total_credit_issued - total_recovered))
+
         return {
-            "total_credit_issued": quantize_money(total_credit_issued),
+            "total_credit_issued": total_credit_issued,
             "total_recovered": total_recovered,
-            "total_receivables": quantize_money(total_receivables),
+            "total_receivables": total_receivables,
             "unpaid_invoices_count": total_unpaid_invoices_count,
             "debtors_summary": debtors_summary,
         }
