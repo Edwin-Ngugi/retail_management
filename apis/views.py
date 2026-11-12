@@ -7192,34 +7192,64 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     def _get_receivables_ledger(self, branch_obj=None, start_date=None, end_date=None, start_dt=None, end_dt=None):
         """
         Single source of truth for Customer Receivables across Dashboard and Debtors Report.
-        - total_credit_issued: Genuine CREDIT sales issued within the selected period (e.g., current month)
+        - total_credit_issued: Genuine CREDIT sales issued within the selected period
         - total_recovered: Credit repayments received within the selected period
         - total_receivables: Cumulative net unpaid balance across all active debtors up to end_date
         """
+        tz = timezone.get_current_timezone()
+
         if end_dt is None:
             end_dt = timezone.now()
+        elif timezone.is_naive(end_dt):
+            end_dt = timezone.make_aware(end_dt, tz)
+
         if end_date is None:
-            end_date = end_dt.date() if isinstance(end_dt, datetime) else end_dt
+            end_date = timezone.localtime(end_dt).date() if isinstance(end_dt, datetime) else end_dt
+
         if start_date is None:
             start_date = end_date.replace(day=1)
+
         if start_dt is None:
-            start_dt = timezone.make_aware(datetime.combine(start_date, time.min))
+            start_dt = timezone.make_aware(datetime.combine(start_date, time.min), tz)
+        elif timezone.is_naive(start_dt):
+            start_dt = timezone.make_aware(start_dt, tz)
 
-        # 1. Cumulative Repayments up to end_date (for accurate debtor net balances)
-        cumulative_repayment_qs = CreditRepayment.objects.filter(date__lte=end_date).select_related(
-            "customer", "transaction"
-        )
+        def to_local_date(val):
+            if not val:
+                return None
+            if isinstance(val, datetime):
+                return timezone.localtime(val).date() if timezone.is_aware(val) else val.date()
+            return val
+
+        # 1. Cumulative Repayments up to end_date (deduplicated by PK before summing)
+        base_repayment_qs = CreditRepayment.objects.filter(date__lte=end_date)
         if branch_obj:
-            cumulative_repayment_qs = cumulative_repayment_qs.filter(
-                Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
-            ).distinct()
+            base_repayment_qs = base_repayment_qs.filter(
+                Q(branch=branch_obj)
+                | Q(transaction__branch=branch_obj)
+                | (Q(branch__isnull=True) & Q(transaction__isnull=True) & Q(customer__branch=branch_obj))
+            )
 
-        # Period-scoped Total Recovered (for that month)
-        period_recovered = quantize_money(
-            cumulative_repayment_qs.filter(date__range=(start_date, end_date))
-            .aggregate(total=Coalesce(Sum("amount"), ZERO))["total"]
-            or ZERO
+        repayment_ids = list(base_repayment_qs.values_list("id", flat=True).distinct())
+        cumulative_repayments = list(
+            CreditRepayment.objects.filter(id__in=repayment_ids)
+            .select_related("customer", "transaction")
+            .prefetch_related("splits")
         )
+
+        # Period-scoped Total Recovered (exact sum over deduplicated records)
+        period_recovered = ZERO
+        for rep in cumulative_repayments:
+            rep_d = to_local_date(rep.date)
+            if rep_d and start_date <= rep_d <= end_date:
+                split_rows = list(rep.splits.all()) if hasattr(rep, "splits") else []
+                if self._normalize_payment_method(getattr(rep, "payment_method", None)) == "SPLIT" and split_rows:
+                    rep_val = sum((quantize_money(sp.amount or ZERO) for sp in split_rows), ZERO)
+                else:
+                    rep_val = quantize_money(rep.amount or ZERO)
+                if rep_val > ZERO:
+                    period_recovered += rep_val
+        period_recovered = quantize_money(period_recovered)
 
         # 2. Cumulative Genuine Credit Sales up to end_dt
         st_credit_filter = (
@@ -7228,34 +7258,61 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             | Q(split_payments__method__iexact="CREDIT")
         )
 
-        credit_sales_qs = (
-            SaleTransaction.objects.filter(st_credit_filter, sale_date__lte=end_dt)
-            .prefetch_related("split_payments", "customer")
-            .distinct()
-        )
+        credit_sale_ids_qs = SaleTransaction.objects.filter(st_credit_filter, sale_date__lte=end_dt)
         legacy_sales_qs = Sale.objects.filter(payment_method__iexact="CREDIT", date__lte=end_date)
 
         if branch_obj:
-            credit_sales_qs = credit_sales_qs.filter(branch=branch_obj)
+            credit_sale_ids_qs = credit_sale_ids_qs.filter(branch=branch_obj)
             legacy_sales_qs = legacy_sales_qs.filter(branch=branch_obj)
 
-        debtors_map = {}
-        period_credit_issued = ZERO
-        period_credit_invoices_count = 0
-        sale_to_cust_key = {}
+        credit_sale_ids = list(credit_sale_ids_qs.values_list("id", flat=True).distinct())
+        credit_sales = list(
+            SaleTransaction.objects.filter(id__in=credit_sale_ids)
+            .select_related("customer")
+            .prefetch_related("split_payments")
+            .order_by("sale_date", "id")
+        )
+
+        # Map repayments per sale_id so we know exact per-invoice balances
+        repaid_by_sale_id = defaultdict(lambda: ZERO)
+        unlinked_repayments = []
+        for rep in cumulative_repayments:
+            rep_amt = quantize_money(rep.amount or ZERO)
+            if rep_amt <= ZERO:
+                continue
+            if rep.transaction_id:
+                repaid_by_sale_id[rep.transaction_id] += rep_amt
+            else:
+                unlinked_repayments.append(rep)
+
+        # Build name-to-customer_id index to unify walk-in name matches with Customer records
+        name_to_cust_id = {}
+        for sale in credit_sales:
+            if sale.customer_id and sale.customer and sale.customer.name:
+                name_to_cust_id[sale.customer.name.strip().lower()] = sale.customer_id
+        for rep in cumulative_repayments:
+            if rep.customer_id and rep.customer and rep.customer.name:
+                name_to_cust_id[rep.customer.name.strip().lower()] = rep.customer_id
 
         def get_customer_identity(customer_obj, fallback_name):
             if customer_obj:
                 return f"cust-{customer_obj.id}", customer_obj.name, (customer_obj.phone_number or "N/A")
             clean_name = (fallback_name or "Walk-in Debtor").strip()
+            matched_id = name_to_cust_id.get(clean_name.lower())
+            if matched_id:
+                return f"cust-{matched_id}", clean_name, "N/A"
             return f"name-{clean_name.lower()}", clean_name, "N/A"
 
-        for sale in credit_sales_qs:
+        debtors_map = {}
+        period_credit_issued = ZERO
+        period_credit_invoices_count = 0
+
+        for sale in credit_sales:
             norm_method = self._normalize_payment_method(sale.payment_method)
             split_records = list(sale.split_payments.all())
 
             if norm_method == "SPLIT" or split_records:
-                sale_credit_portion = sum(
+                sale_credit_principal = sum(
                     (
                         quantize_money(sp.amount or ZERO)
                         for sp in split_records
@@ -7264,18 +7321,20 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     ZERO,
                 )
             else:
+                # Principal credit is total_amount minus any upfront deposit paid at checkout
+                # (excluding post-sale CreditRepayments so repayments aren't subtracted twice)
                 sale_total = quantize_money(sale.total_amount or ZERO)
-                upfront_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
-                sale_credit_portion = max(ZERO, sale_total - upfront_paid)
+                recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                post_sale_repaid = repaid_by_sale_id.get(sale.id, ZERO)
+                upfront_deposit = max(ZERO, recorded_paid - post_sale_repaid)
+                sale_credit_principal = max(ZERO, sale_total - upfront_deposit)
 
-            if sale_credit_portion <= ZERO:
+            if sale_credit_principal <= ZERO:
                 continue
 
-            # Check if this credit sale was issued in the selected month/period
-            sale_dt_val = sale.sale_date
-            sale_d = sale_dt_val.date() if isinstance(sale_dt_val, datetime) else sale_dt_val
+            sale_d = to_local_date(sale.sale_date)
             if sale_d and start_date <= sale_d <= end_date:
-                period_credit_issued += sale_credit_portion
+                period_credit_issued += sale_credit_principal
                 period_credit_invoices_count += 1
 
             cust_key, cust_disp_name, cust_phone = get_customer_identity(
@@ -7283,8 +7342,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             )
             if cust_phone == "N/A" and getattr(sale, "customer_phone", None):
                 cust_phone = sale.customer_phone
-
-            sale_to_cust_key[sale.id] = cust_key
 
             if cust_key not in debtors_map:
                 debtors_map[cust_key] = {
@@ -7295,16 +7352,22 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "gross_credit": ZERO,
                     "repaid": ZERO,
                 }
+            elif debtors_map[cust_key]["phone"] == "N/A" and cust_phone != "N/A":
+                debtors_map[cust_key]["phone"] = cust_phone
 
-            debtors_map[cust_key]["gross_credit"] += sale_credit_portion
-            debtors_map[cust_key]["unpaid_invoices_count"] += 1
+            sale_repaid = repaid_by_sale_id.get(sale.id, ZERO)
+            debtors_map[cust_key]["gross_credit"] += sale_credit_principal
+            debtors_map[cust_key]["repaid"] += sale_repaid
+
+            if sale_credit_principal > sale_repaid:
+                debtors_map[cust_key]["unpaid_invoices_count"] += 1
 
         for legacy in legacy_sales_qs:
             legacy_credit = quantize_money(getattr(legacy, "total_selling_price", ZERO) or ZERO)
             if legacy_credit <= ZERO:
                 continue
 
-            leg_d = legacy.date.date() if isinstance(legacy.date, datetime) else legacy.date
+            leg_d = to_local_date(legacy.date)
             if leg_d and start_date <= leg_d <= end_date:
                 period_credit_issued += legacy_credit
                 period_credit_invoices_count += 1
@@ -7328,21 +7391,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             debtors_map[cust_key]["gross_credit"] += legacy_credit
             debtors_map[cust_key]["unpaid_invoices_count"] += 1
 
-        for rep in cumulative_repayment_qs:
+        # Apply customer-level repayments that weren't linked to a specific SaleTransaction
+        for rep in unlinked_repayments:
             rep_amt = quantize_money(rep.amount or ZERO)
-            if rep_amt <= ZERO:
-                continue
-
-            if rep.transaction_id and rep.transaction_id in sale_to_cust_key:
-                ck = sale_to_cust_key[rep.transaction_id]
-            else:
-                fallback = (
-                    getattr(rep.transaction, "customer_name", None)
-                    if rep.transaction
-                    else getattr(rep, "customer_name", None)
-                )
-                ck, _, _ = get_customer_identity(rep.customer, fallback)
-
+            fallback = getattr(rep, "customer_name", None)
+            ck, _, _ = get_customer_identity(rep.customer, fallback)
             if ck in debtors_map:
                 debtors_map[ck]["repaid"] += rep_amt
 
@@ -7354,12 +7407,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             net_balance = max(ZERO, quantize_money(data["gross_credit"] - data["repaid"]))
             if net_balance > ZERO:
                 total_receivables += net_balance
-                total_unpaid_invoices_count += data["unpaid_invoices_count"]
+                unpaid_cnt = max(1, data["unpaid_invoices_count"])
+                total_unpaid_invoices_count += unpaid_cnt
                 debtors_summary.append({
                     "customer_id": data["customer_id"],
                     "customer_name": data["customer_name"],
                     "phone": data["phone"],
-                    "unpaid_invoices_count": data["unpaid_invoices_count"],
+                    "unpaid_invoices_count": unpaid_cnt,
                     "outstanding_balance": float(net_balance),
                 })
 
@@ -7423,6 +7477,21 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         pass
                 return False
 
+            def allocate_to_channel(norm_m, amount_val):
+                nonlocal cash_total, paybill_total, send_money_total, mpesa_std_total, bank_total, other_total
+                if norm_m == "CASH":
+                    cash_total += amount_val
+                elif norm_m == "PAYBILL":
+                    paybill_total += amount_val
+                elif norm_m == "SEND_MONEY":
+                    send_money_total += amount_val
+                elif norm_m == "MPESA":
+                    mpesa_std_total += amount_val
+                elif norm_m == "BANK_TRANSFER":
+                    bank_total += amount_val
+                else:
+                    other_total += amount_val
+
             # -----------------------------------------------------------------
             # 1. STRICT UNFILTERED BASE QUERYSETS BY BRANCH
             # -----------------------------------------------------------------
@@ -7439,14 +7508,20 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 base_supplier_pmts_qs = base_supplier_pmts_qs.filter(purchase__branch=branch_obj)
                 if hasattr(CreditRepayment, 'branch'):
                     base_credit_repay_qs = base_credit_repay_qs.filter(
-                        Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
-                    ).distinct()
+                        Q(branch=branch_obj)
+                        | Q(transaction__branch=branch_obj)
+                        | (Q(branch__isnull=True) & Q(transaction__isnull=True) & Q(customer__branch=branch_obj))
+                    )
+
+            # Deduplicate repayment IDs before filtering or aggregating
+            all_repayment_ids = list(base_credit_repay_qs.values_list("id", flat=True).distinct())
+            dedup_base_repay_qs = CreditRepayment.objects.filter(id__in=all_repayment_ids)
 
             sales_qs = base_sales_qs
             expenses_qs = base_expenses_qs
             purchases_qs = base_purchases_qs
             supplier_payments_qs = base_supplier_pmts_qs
-            customer_repayments_qs = base_credit_repay_qs
+            customer_repayments_qs = dedup_base_repay_qs
 
             if start_date and end_date:
                 sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
@@ -7460,12 +7535,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     created_at__range=(start_dt, end_dt)
                 )
 
-            credit_transaction_ids = set(
-                base_credit_repay_qs
-                .exclude(transaction_id=None)
-                .values_list("transaction_id", flat=True)
-                .distinct()
-            )
+            # Map cumulative repayments per transaction_id to prevent double-deducting deposits
+            repaid_by_tx = defaultdict(lambda: ZERO)
+            for row in dedup_base_repay_qs.exclude(transaction_id=None).values("transaction_id").annotate(
+                total=Coalesce(Sum("amount"), ZERO)
+            ):
+                repaid_by_tx[row["transaction_id"]] = quantize_money(row["total"] or ZERO)
+
+            credit_transaction_ids = set(repaid_by_tx.keys())
 
             # -----------------------------------------------------------------
             # 2. FINANCIAL PERFORMANCE METRICS
@@ -7513,69 +7590,52 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
                 if method == "SPLIT" or split_records:
                     if not split_records and is_credit:
-                        upfront_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                        recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                        upfront_paid = max(ZERO, recorded_paid - repaid_by_tx.get(sale.id, ZERO))
                         period_credit_sales_total += max(ZERO, amt - upfront_paid)
-                        other_total += min(amt, upfront_paid)
+                        if upfront_paid > ZERO:
+                            other_total += min(amt, upfront_paid)
                         continue
 
                     for sp in split_records:
                         sp_method = self._normalize_payment_method(extract_sp_method(sp))
                         sp_amount = quantize_money(sp.amount or ZERO)
 
-                        if sp_method == "CASH":
-                            cash_total += sp_amount
-                        elif sp_method == "PAYBILL":
-                            paybill_total += sp_amount
-                        elif sp_method == "SEND_MONEY":
-                            send_money_total += sp_amount
-                        elif sp_method == "MPESA":
-                            mpesa_std_total += sp_amount
-                        elif sp_method == "BANK_TRANSFER":
-                            bank_total += sp_amount
-                        elif sp_method == "CREDIT":
+                        if sp_method == "CREDIT":
                             period_credit_sales_total += sp_amount
                         else:
-                            other_total += sp_amount
+                            allocate_to_channel(sp_method, sp_amount)
                 else:
                     if is_credit or method == "CREDIT":
-                        upfront_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                        recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                        upfront_paid = max(ZERO, recorded_paid - repaid_by_tx.get(sale.id, ZERO))
                         period_credit_sales_total += max(ZERO, amt - upfront_paid)
                         if upfront_paid > ZERO:
                             other_total += min(amt, upfront_paid)
-                    elif method == "CASH":
-                        cash_total += amt
-                    elif method == "PAYBILL":
-                        paybill_total += amt
-                    elif method == "SEND_MONEY":
-                        send_money_total += amt
-                    elif method == "MPESA":
-                        mpesa_std_total += amt
-                    elif method == "BANK_TRANSFER":
-                        bank_total += amt
                     else:
-                        other_total += amt
+                        allocate_to_channel(method, amt)
 
             period_credit_repayments_total = ZERO
-            for rep in customer_repayments_qs.select_related("customer", "transaction"):
-                rep_amt = quantize_money(rep.amount or ZERO)
-                if rep_amt <= ZERO:
-                    continue
-
+            for rep in customer_repayments_qs.select_related("customer", "transaction").prefetch_related("splits"):
                 rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
-                period_credit_repayments_total += rep_amt
+                split_rows = list(rep.splits.all()) if hasattr(rep, "splits") else []
 
-                if rep_method == "CASH":
-                    cash_total += rep_amt
-                elif rep_method == "PAYBILL":
-                    paybill_total += rep_amt
-                elif rep_method == "SEND_MONEY":
-                    send_money_total += rep_amt
-                elif rep_method == "MPESA":
-                    mpesa_std_total += rep_amt
-                elif rep_method == "BANK_TRANSFER":
-                    bank_total += rep_amt
+                if rep_method == "SPLIT" and split_rows:
+                    for sp in split_rows:
+                        sp_amt = quantize_money(sp.amount or ZERO)
+                        if sp_amt <= ZERO:
+                            continue
+                        sp_method = self._normalize_payment_method(extract_sp_method(sp))
+                        period_credit_repayments_total += sp_amt
+                        allocate_to_channel(sp_method, sp_amt)
                 else:
-                    other_total += rep_amt
+                    rep_amt = quantize_money(rep.amount or ZERO)
+                    if rep_amt <= ZERO:
+                        continue
+                    period_credit_repayments_total += rep_amt
+                    allocate_to_channel(rep_method, rep_amt)
+
+            period_credit_repayments_total = quantize_money(period_credit_repayments_total)
 
             actual_cash_receipts = (
                 cash_total +
@@ -7589,10 +7649,36 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # 4. UNIFIED RECEIVABLES LEDGER (LIVE CURRENT LEDGER PARITY)
             # -----------------------------------------------------------------
-            receivables_data = self._get_receivables_ledger(branch_obj=branch_obj)
+            effective_end_dt = end_dt or timezone.now()
+            effective_end_date = end_date or timezone.localtime(effective_end_dt).date()
+
+            receivables_data = self._get_receivables_ledger(
+                branch_obj=branch_obj,
+                start_date=start_date,
+                end_date=effective_end_date,
+                start_dt=start_dt,
+                end_dt=effective_end_dt,
+            )
             total_customer_debtors = receivables_data["total_receivables"]
-            total_recovered_lifetime = receivables_data["total_recovered"]
             unpaid_invoices_count = receivables_data["unpaid_invoices_count"]
+
+            # If a date filter was passed, align period recovered directly with the ledger's single source of truth
+            if start_date and end_date:
+                period_credit_repayments_total = receivables_data["total_recovered"]
+
+            lifetime_start_date = date(1900, 1, 1)
+            lifetime_start_dt = timezone.make_aware(
+                datetime.combine(lifetime_start_date, time.min),
+                timezone.get_current_timezone(),
+            )
+            lifetime_ledger = self._get_receivables_ledger(
+                branch_obj=branch_obj,
+                start_date=lifetime_start_date,
+                end_date=effective_end_date,
+                start_dt=lifetime_start_dt,
+                end_dt=effective_end_dt,
+            )
+            total_recovered_lifetime = lifetime_ledger["total_recovered"]
 
             # -----------------------------------------------------------------
             # 5. INVENTORY & SKUS
@@ -7659,7 +7745,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 if not s_date:
                     continue
 
-                d_key = s_date.strftime('%Y-%m-%d') if hasattr(s_date, 'strftime') else str(s_date)[:10]
+                if isinstance(s_date, datetime):
+                    local_s_date = timezone.localtime(s_date) if timezone.is_aware(s_date) else s_date
+                    d_key = local_s_date.strftime('%Y-%m-%d')
+                elif hasattr(s_date, 'strftime'):
+                    d_key = s_date.strftime('%Y-%m-%d')
+                else:
+                    d_key = str(s_date)[:10]
 
                 if d_key not in daily_sales_map:
                     daily_sales_map[d_key] = {"total_sales": ZERO, "cogs": ZERO}
