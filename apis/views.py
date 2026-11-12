@@ -7312,12 +7312,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             Q(payment_method=SaleTransaction.PaymentMethod.CREDIT)
             | Q(payment_method__iexact="CREDIT")
             | Q(split_payments__method__iexact="CREDIT")
+            | Q(receipt_number__istartswith="INV")
+            | Q(repayments__isnull=False)
         )
 
         credit_sale_ids_qs = SaleTransaction.objects.filter(st_credit_filter, sale_date__lte=end_dt)
         # Only standalone legacy Sale records (exclude item rows attached to a SaleTransaction)
         legacy_sales_qs = Sale.objects.filter(
-            payment_method__iexact="CREDIT",
+            Q(payment_method__iexact="CREDIT") | Q(receipt_number__istartswith="INV"),
             date__lte=end_date,
             transaction__isnull=True,
         )
@@ -7340,22 +7342,27 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         for sale in credit_sales:
             norm_method = self._normalize_payment_method(sale.payment_method)
             split_records = list(sale.split_payments.all())
+            is_inv_receipt = str(getattr(sale, "receipt_number", "") or "").strip().upper().startswith("INV")
+            has_repayments = all_time_repaid_by_sale_id.get(sale.id, ZERO) > ZERO
 
-            if norm_method == "SPLIT" or split_records:
+            credit_splits = [
+                sp for sp in split_records
+                if self._normalize_payment_method(getattr(sp, "method", None)) == "CREDIT"
+            ]
+
+            if credit_splits:
                 sale_credit_principal = sum(
-                    (
-                        quantize_money(sp.amount or ZERO)
-                        for sp in split_records
-                        if self._normalize_payment_method(getattr(sp, "method", None)) == "CREDIT"
-                    ),
+                    (quantize_money(sp.amount or ZERO) for sp in credit_splits),
                     ZERO,
                 )
-            else:
+            elif is_inv_receipt or has_repayments or norm_method == "CREDIT":
                 sale_total = quantize_money(sale.total_amount or ZERO)
                 recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
                 all_post_sale_repaid = all_time_repaid_by_sale_id.get(sale.id, ZERO)
                 upfront_deposit = max(ZERO, recorded_paid - all_post_sale_repaid)
                 sale_credit_principal = max(ZERO, sale_total - upfront_deposit)
+            else:
+                sale_credit_principal = ZERO
 
             if sale_credit_principal > ZERO:
                 credit_principal_by_sale_id[sale.id] = sale_credit_principal
@@ -7560,6 +7567,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             def is_credit_sale_check(sale_obj, c_ids=None):
                 method = self._normalize_payment_method(getattr(sale_obj, "payment_method", None))
                 if method == "CREDIT":
+                    return True
+                receipt_no = str(getattr(sale_obj, "receipt_number", "") or "").strip().upper()
+                if receipt_no.startswith("INV"):
                     return True
                 if c_ids and getattr(sale_obj, "pk", None) in c_ids:
                     return True
