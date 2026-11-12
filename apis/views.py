@@ -1233,7 +1233,8 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         customer_id = self.request.query_params.get("customer")
         if branch_obj:
             queryset = queryset.filter(
-                Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
+                Q(branch=branch_obj)
+                | (Q(branch__isnull=True) & Q(transaction__branch=branch_obj))
             )
         if customer_id:
             queryset = queryset.filter(customer_id=customer_id)
@@ -1249,7 +1250,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
         Queries genuine credit SaleTransaction records and deducts CreditRepayments.
         """
         query = str(request.query_params.get("q", "")).strip()
-        branch_id = request.query_params.get("branch") or request.query_params.get("branch_id")
+        branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
 
         if not query or (len(query) < 3 and "_" not in query and "-" not in query and " " not in query):
             return Response([], status=status.HTTP_200_OK)
@@ -1282,11 +1283,26 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
             .distinct()
         )
 
-        if branch_id and str(branch_id).isdigit():
-            sales_qs = sales_qs.filter(branch_id=int(branch_id))
+        if branch_param and str(branch_param).lower() not in ("all", "none", "", "null"):
+            clean_branch = str(branch_param).strip()
+            if clean_branch.isdigit():
+                sales_qs = sales_qs.filter(branch_id=int(clean_branch))
+            else:
+                sales_qs = sales_qs.filter(branch__name__iexact=clean_branch)
 
         results = []
         for sale in sales_qs.order_by("-sale_date")[:15]:
+            repaid_amt = ZERO
+            repayment_rel = getattr(sale, "repayments", None)
+            if repayment_rel is not None:
+                try:
+                    repaid_amt = sum(
+                        (quantize_money(getattr(rep, "amount", ZERO) or ZERO) for rep in repayment_rel.all()),
+                        ZERO,
+                    )
+                except Exception:
+                    repaid_amt = ZERO
+
             split_records = list(sale.split_payments.all())
             if str(sale.payment_method).upper() == "SPLIT" or split_records:
                 credit_amt = sum(
@@ -1299,19 +1315,10 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 )
             else:
                 sale_total = quantize_money(getattr(sale, "total_amount", ZERO) or ZERO)
-                upfront_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                # Back out post-sale CreditRepayments so they are not subtracted twice
+                upfront_paid = max(ZERO, recorded_paid - repaid_amt)
                 credit_amt = max(ZERO, sale_total - upfront_paid)
-
-            repaid_amt = ZERO
-            repayment_rel = getattr(sale, "repayments", None)
-            if repayment_rel is not None:
-                try:
-                    repaid_amt = sum(
-                        (quantize_money(getattr(rep, "amount", ZERO) or ZERO) for rep in repayment_rel.all()),
-                        ZERO,
-                    )
-                except Exception:
-                    repaid_amt = ZERO
 
             balance_due = max(ZERO, credit_amt - repaid_amt)
 
@@ -1343,7 +1350,6 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 or raw_data.get("client")
                 or raw_data.get("client_id")
             )
-
             if isinstance(customer_id, dict):
                 customer_id = customer_id.get("id") or customer_id.get("pk")
 
@@ -1354,25 +1360,29 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                 or raw_data.get("sale")
                 or raw_data.get("sale_id")
             )
-
             if isinstance(transaction_id, dict):
                 transaction_id = transaction_id.get("id") or transaction_id.get("pk")
 
             transaction_obj = None
             if transaction_id:
-                transaction_obj = SaleTransaction.objects.filter(pk=transaction_id).first()
+                transaction_obj = (
+                    SaleTransaction.objects.select_for_update()
+                    .prefetch_related("split_payments")
+                    .filter(pk=transaction_id)
+                    .first()
+                )
                 if transaction_obj and not customer_id:
                     customer_id = transaction_obj.customer_id
 
             amount_raw = raw_data.get("amount") or raw_data.get("repayment_amount")
-            
+
             if (not customer_id and not transaction_obj) or amount_raw in (None, ""):
                 return Response(
                     {"error": "Customer or invoice transaction and a valid payment amount are required."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            total_amount = Decimal(str(amount_raw))
+            total_amount = quantize_money(amount_raw)
             if total_amount <= Decimal("0.00"):
                 return Response(
                     {"error": "Repayment amount must be greater than zero."},
@@ -1389,6 +1399,70 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     {"error": "Selected customer or invoice does not exist."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+
+            # Parse split payments list / details early so we can validate exact total
+            split_payload = (
+                raw_data.get("split_payments")
+                or raw_data.get("splits")
+                or raw_data.get("split_details")
+                or raw_data.get("repayment_splits")
+                or []
+            )
+
+            valid_splits = []
+            if isinstance(split_payload, list):
+                for sp in split_payload:
+                    if isinstance(sp, dict):
+                        sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
+                        if sp_amt > Decimal("0.00"):
+                            valid_splits.append(sp)
+            elif isinstance(split_payload, dict):
+                for k, v in split_payload.items():
+                    amt_dec = quantize_money(v)
+                    if amt_dec > Decimal("0.00"):
+                        valid_splits.append({"method": k, "amount": amt_dec})
+
+            effective_payment_total = (
+                sum((quantize_money(sp.get("amount", ZERO)) for sp in valid_splits), ZERO)
+                if valid_splits
+                else total_amount
+            )
+
+            # Guard against overpaying a linked credit invoice
+            if transaction_obj is not None:
+                already_repaid = (
+                    CreditRepayment.objects.filter(transaction=transaction_obj)
+                    .aggregate(total=Coalesce(Sum("amount"), ZERO))["total"]
+                )
+                already_repaid = quantize_money(already_repaid)
+
+                split_records = list(transaction_obj.split_payments.all())
+                if str(transaction_obj.payment_method).upper() == "SPLIT" or split_records:
+                    original_credit = sum(
+                        (
+                            quantize_money(sp.amount or ZERO)
+                            for sp in split_records
+                            if str(getattr(sp, "method", "")).upper() == "CREDIT"
+                        ),
+                        ZERO,
+                    )
+                else:
+                    sale_total = quantize_money(transaction_obj.total_amount or ZERO)
+                    recorded_paid = quantize_money(transaction_obj.amount_paid or ZERO)
+                    upfront_paid = max(ZERO, recorded_paid - already_repaid)
+                    original_credit = max(ZERO, sale_total - upfront_paid)
+
+                remaining_due = max(ZERO, original_credit - already_repaid)
+                if effective_payment_total > remaining_due:
+                    return Response(
+                        {
+                            "error": (
+                                f"Repayment amount (KSh {effective_payment_total:,.2f}) exceeds "
+                                f"remaining invoice balance (KSh {remaining_due:,.2f})."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
             # Resolve Branch Instance
             branch_param = (
@@ -1434,31 +1508,9 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     return "BANK_TRANSFER"
                 return clean or "CASH"
 
-            # Parse split payments list / details
-            split_payload = (
-                raw_data.get("split_payments")
-                or raw_data.get("splits")
-                or raw_data.get("split_details")
-                or raw_data.get("repayment_splits")
-                or []
-            )
-
-            valid_splits = []
-            if isinstance(split_payload, list):
-                for sp in split_payload:
-                    if isinstance(sp, dict):
-                        sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
-                        if sp_amt > Decimal("0.00"):
-                            valid_splits.append(sp)
-            elif isinstance(split_payload, dict):
-                for k, v in split_payload.items():
-                    amt_dec = quantize_money(v)
-                    if amt_dec > Decimal("0.00"):
-                        valid_splits.append({"method": k, "amount": amt_dec})
-
             raw_method = (
-                raw_data.get("payment_method") 
-                or raw_data.get("method") 
+                raw_data.get("payment_method")
+                or raw_data.get("method")
                 or raw_data.get("channel")
                 or raw_data.get("payment_channel")
                 or "CASH"
@@ -1485,18 +1537,16 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     transaction=transaction_obj,
                     branch=branch_obj,
                     created_by=user,
-                    amount=total_amount,
+                    amount=effective_payment_total,
                     payment_method="SPLIT",
                     notes=formatted_notes,
                     date=repayment_date,
                 )
 
-                split_sum = Decimal("0.00")
                 for sp in valid_splits:
                     sp_pm = normalize_pm(sp.get("method") or sp.get("payment_method") or sp.get("channel"))
                     sp_amt = quantize_money(sp.get("amount", Decimal("0.00")))
                     sp_ref = str(sp.get("reference_code") or sp.get("reference_number") or ref_no).strip()
-                    split_sum += sp_amt
 
                     CreditRepaymentSplit.objects.create(
                         repayment=repayment,
@@ -1504,10 +1554,6 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                         amount=sp_amt,
                         reference_code=sp_ref,
                     )
-
-                if split_sum > Decimal("0.00"):
-                    repayment.amount = split_sum
-                    repayment.save(update_fields=["amount"])
 
                 created_repayments.append(repayment)
 
@@ -1546,7 +1592,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                     transaction=transaction_obj,
                     branch=branch_obj,
                     created_by=user,
-                    amount=total_amount,
+                    amount=effective_payment_total,
                     payment_method=payment_method,
                     notes=formatted_notes,
                     date=repayment_date,
@@ -1566,7 +1612,7 @@ class CreditRepaymentViewSet(viewsets.ModelViewSet):
                                 "event": "REPAYMENT_RECORDED",
                                 "customer_id": main_repayment.customer_id,
                                 "payment_method": main_repayment.payment_method,
-                                "amount": float(total_amount),
+                                "amount": float(effective_payment_total),
                             },
                         )
                     except Exception:
@@ -7515,8 +7561,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 method = self._normalize_payment_method(getattr(sale_obj, "payment_method", None))
                 if method == "CREDIT":
                     return True
-                if getattr(sale_obj, "is_invoice", False):
-                    return True
                 if c_ids and getattr(sale_obj, "pk", None) in c_ids:
                     return True
                 balance_due = getattr(sale_obj, "balance_due", None)
@@ -7560,8 +7604,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 if hasattr(CreditRepayment, 'branch'):
                     base_credit_repay_qs = base_credit_repay_qs.filter(
                         Q(branch=branch_obj)
-                        | Q(transaction__branch=branch_obj)
-                        | (Q(branch__isnull=True) & Q(transaction__isnull=True) & Q(customer__branch=branch_obj))
+                        | (Q(branch__isnull=True) & Q(transaction__branch=branch_obj))
                     )
 
             # Deduplicate repayment IDs before filtering or aggregating
@@ -7666,7 +7709,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     else:
                         allocate_to_channel(method, amt)
 
-            period_credit_repayments_total = ZERO
             for rep in customer_repayments_qs.select_related("customer", "transaction").prefetch_related("splits"):
                 rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
                 split_rows = list(rep.splits.all()) if hasattr(rep, "splits") else []
@@ -7677,59 +7719,58 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         if sp_amt <= ZERO:
                             continue
                         sp_method = self._normalize_payment_method(extract_sp_method(sp))
-                        period_credit_repayments_total += sp_amt
                         allocate_to_channel(sp_method, sp_amt)
                 else:
                     rep_amt = quantize_money(rep.amount or ZERO)
                     if rep_amt <= ZERO:
                         continue
-                    period_credit_repayments_total += rep_amt
                     allocate_to_channel(rep_method, rep_amt)
 
-            period_credit_repayments_total = quantize_money(period_credit_repayments_total)
-
-            actual_cash_receipts = (
-                cash_total +
-                paybill_total +
-                send_money_total +
-                mpesa_std_total +
-                bank_total +
-                other_total
+            actual_cash_receipts = quantize_money(
+                cash_total
+                + paybill_total
+                + send_money_total
+                + mpesa_std_total
+                + bank_total
+                + other_total
             )
 
             # -----------------------------------------------------------------
-            # 4. UNIFIED RECEIVABLES LEDGER (LIVE CURRENT LEDGER PARITY)
+            # 4. UNIFIED RECEIVABLES LEDGER (SINGLE SOURCE OF TRUTH)
             # -----------------------------------------------------------------
-            effective_end_dt = end_dt or timezone.now()
-            effective_end_date = end_date or timezone.localtime(effective_end_dt).date()
-
-            receivables_data = self._get_receivables_ledger(
-                branch_obj=branch_obj,
-                start_date=start_date,
-                end_date=effective_end_date,
-                start_dt=start_dt,
-                end_dt=effective_end_dt,
-            )
-            total_customer_debtors = receivables_data["total_receivables"]
-            unpaid_invoices_count = receivables_data["unpaid_invoices_count"]
-
-            # If a date filter was passed, align period recovered directly with the ledger's single source of truth
-            if start_date and end_date:
-                period_credit_repayments_total = receivables_data["total_recovered"]
-
             lifetime_start_date = date(1900, 1, 1)
             lifetime_start_dt = timezone.make_aware(
                 datetime.combine(lifetime_start_date, time.min),
                 timezone.get_current_timezone(),
             )
-            lifetime_ledger = self._get_receivables_ledger(
+
+            effective_end_dt = end_dt or timezone.now()
+            effective_end_date = end_date or timezone.localtime(effective_end_dt).date()
+            effective_start_date = start_date or lifetime_start_date
+            effective_start_dt = start_dt or lifetime_start_dt
+
+            receivables_data = self._get_receivables_ledger(
                 branch_obj=branch_obj,
-                start_date=lifetime_start_date,
+                start_date=effective_start_date,
                 end_date=effective_end_date,
-                start_dt=lifetime_start_dt,
+                start_dt=effective_start_dt,
                 end_dt=effective_end_dt,
             )
-            total_recovered_lifetime = lifetime_ledger["total_recovered"]
+            total_customer_debtors = receivables_data["total_receivables"]
+            unpaid_invoices_count = receivables_data["unpaid_invoices_count"]
+            period_credit_repayments_total = receivables_data["total_recovered"]
+
+            if effective_start_date == lifetime_start_date:
+                total_recovered_lifetime = period_credit_repayments_total
+            else:
+                lifetime_ledger = self._get_receivables_ledger(
+                    branch_obj=branch_obj,
+                    start_date=lifetime_start_date,
+                    end_date=effective_end_date,
+                    start_dt=lifetime_start_dt,
+                    end_dt=effective_end_dt,
+                )
+                total_recovered_lifetime = lifetime_ledger["total_recovered"]
 
             # -----------------------------------------------------------------
             # 5. INVENTORY & SKUS
