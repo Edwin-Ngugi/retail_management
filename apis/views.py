@@ -7190,399 +7190,399 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         return (branch.pk if branch else None), start_date, end_date
 
     def _get_receivables_ledger(
-    self,
-    branch_obj=None,
-    start_date=None,
-    end_date=None,
-    start_dt=None,
-    end_dt=None,
-):
+        self,
+        branch_obj=None,
+        start_date=None,
+        end_date=None,
+        start_dt=None,
+        end_dt=None,
+    ):
 
-    tz = timezone.get_current_timezone()
+        tz = timezone.get_current_timezone()
 
-    # ---------------------------------------------------------
-    # 1. Normalize reporting dates
-    # ---------------------------------------------------------
-    if end_dt is None:
-        end_dt = timezone.now()
-    elif timezone.is_naive(end_dt):
-        end_dt = timezone.make_aware(end_dt, tz)
+        # ---------------------------------------------------------
+        # 1. Normalize reporting dates
+        # ---------------------------------------------------------
+        if end_dt is None:
+            end_dt = timezone.now()
+        elif timezone.is_naive(end_dt):
+            end_dt = timezone.make_aware(end_dt, tz)
 
-    if end_date is None:
-        end_date = (
-            timezone.localtime(end_dt).date()
-            if isinstance(end_dt, datetime)
-            else end_dt
-        )
-
-    if start_date is None:
-        start_date = end_date.replace(day=1)
-
-    if start_dt is None:
-        start_dt = timezone.make_aware(
-            datetime.combine(start_date, time.min),
-            tz,
-        )
-    elif timezone.is_naive(start_dt):
-        start_dt = timezone.make_aware(start_dt, tz)
-
-    def to_local_date(value):
-        if not value:
-            return None
-
-        if isinstance(value, datetime):
-            if timezone.is_aware(value):
-                return timezone.localtime(value).date()
-            return value.date()
-
-        return value
-
-    # ---------------------------------------------------------
-    # 2. Retrieve repayments up to the reporting end date
-    # ---------------------------------------------------------
-    repayment_qs = CreditRepayment.objects.filter(
-        date__lte=end_date
-    )
-
-    if branch_obj:
-        repayment_qs = repayment_qs.filter(
-            Q(branch=branch_obj)
-            | (Q(branch__isnull=True) & Q(transaction__branch=branch_obj))
-        )
-
-    cumulative_repayments = list(
-        repayment_qs
-        .select_related("customer", "transaction", "branch")
-        .prefetch_related("splits")
-        .order_by("date", "created_at", "id")
-    )
-
-    # ---------------------------------------------------------
-    # 3. Retrieve genuine credit transactions
-    # ---------------------------------------------------------
-    credit_filter = (
-        Q(payment_method__iexact="CREDIT")
-        | Q(
-            payment_method__iexact="SPLIT",
-            split_payments__method__iexact="CREDIT",
-        )
-    )
-
-    credit_sales_qs = SaleTransaction.objects.filter(
-        credit_filter,
-        sale_date__lte=end_dt,
-    )
-
-    if branch_obj:
-        credit_sales_qs = credit_sales_qs.filter(
-            branch=branch_obj
-        )
-
-    credit_sales = list(
-        credit_sales_qs
-        .select_related("customer", "branch")
-        .prefetch_related("split_payments")
-        .distinct()
-        .order_by("sale_date", "id")
-    )
-
-    # Map sale ID -> original credit principal for overpayment capping
-    credit_principal_by_sale_id = {}
-    for sale in credit_sales:
-        principal = quantize_money(sale.credit_payment_amount or ZERO)
-        if principal > ZERO:
-            credit_principal_by_sale_id[sale.id] = principal
-
-    # ---------------------------------------------------------
-    # 4. Retrieve independent legacy Sale records
-    # ---------------------------------------------------------
-    legacy_sales_qs = Sale.objects.filter(
-        payment_method__iexact="CREDIT",
-        date__lte=end_date,
-        transaction__isnull=True,
-    )
-
-    if branch_obj:
-        legacy_sales_qs = legacy_sales_qs.filter(
-            branch=branch_obj
-        )
-
-    legacy_sales = list(
-        legacy_sales_qs.select_related("branch").order_by(
-            "date", "id"
-        )
-    )
-
-    # ---------------------------------------------------------
-    # 5. Build canonical customer identity mappings
-    # ---------------------------------------------------------
-    name_to_customer_id = {}
-    phone_to_customer_id = {}
-
-    for sale in credit_sales:
-        customer = sale.customer
-        if customer:
-            if customer.name:
-                name_to_customer_id[customer.name.strip().lower()] = customer.id
-            if customer.phone_number:
-                phone_to_customer_id[customer.phone_number.strip()] = customer.id
-
-    for repayment in cumulative_repayments:
-        customer = repayment.customer
-        if customer:
-            if customer.name:
-                name_to_customer_id[customer.name.strip().lower()] = customer.id
-            if customer.phone_number:
-                phone_to_customer_id[customer.phone_number.strip()] = customer.id
-
-    def get_customer_identity(customer_obj, fallback_name=None, fallback_phone=None):
-        if customer_obj:
-            return (
-                f"cust-{customer_obj.id}",
-                customer_obj.name or fallback_name or "Unknown Customer",
-                customer_obj.phone_number or fallback_phone or "N/A",
+        if end_date is None:
+            end_date = (
+                timezone.localtime(end_dt).date()
+                if isinstance(end_dt, datetime)
+                else end_dt
             )
 
-        clean_name = str(fallback_name or "Walk-in Debtor").strip()
-        clean_phone = str(fallback_phone or "").strip()
+        if start_date is None:
+            start_date = end_date.replace(day=1)
 
-        matched_id = None
-        if clean_phone:
-            matched_id = phone_to_customer_id.get(clean_phone)
-        if not matched_id and clean_name:
-            matched_id = name_to_customer_id.get(clean_name.lower())
+        if start_dt is None:
+            start_dt = timezone.make_aware(
+                datetime.combine(start_date, time.min),
+                tz,
+            )
+        elif timezone.is_naive(start_dt):
+            start_dt = timezone.make_aware(start_dt, tz)
 
-        if matched_id:
+        def to_local_date(value):
+            if not value:
+                return None
+
+            if isinstance(value, datetime):
+                if timezone.is_aware(value):
+                    return timezone.localtime(value).date()
+                return value.date()
+
+            return value
+
+        # ---------------------------------------------------------
+        # 2. Retrieve repayments up to the reporting end date
+        # ---------------------------------------------------------
+        repayment_qs = CreditRepayment.objects.filter(
+            date__lte=end_date
+        )
+
+        if branch_obj:
+            repayment_qs = repayment_qs.filter(
+                Q(branch=branch_obj)
+                | (Q(branch__isnull=True) & Q(transaction__branch=branch_obj))
+            )
+
+        cumulative_repayments = list(
+            repayment_qs
+            .select_related("customer", "transaction", "branch")
+            .prefetch_related("splits")
+            .order_by("date", "created_at", "id")
+        )
+
+        # ---------------------------------------------------------
+        # 3. Retrieve genuine credit transactions
+        # ---------------------------------------------------------
+        credit_filter = (
+            Q(payment_method__iexact="CREDIT")
+            | Q(
+                payment_method__iexact="SPLIT",
+                split_payments__method__iexact="CREDIT",
+            )
+        )
+
+        credit_sales_qs = SaleTransaction.objects.filter(
+            credit_filter,
+            sale_date__lte=end_dt,
+        )
+
+        if branch_obj:
+            credit_sales_qs = credit_sales_qs.filter(
+                branch=branch_obj
+            )
+
+        credit_sales = list(
+            credit_sales_qs
+            .select_related("customer", "branch")
+            .prefetch_related("split_payments")
+            .distinct()
+            .order_by("sale_date", "id")
+        )
+
+        # Map sale ID -> original credit principal for overpayment capping
+        credit_principal_by_sale_id = {}
+        for sale in credit_sales:
+            principal = quantize_money(sale.credit_payment_amount or ZERO)
+            if principal > ZERO:
+                credit_principal_by_sale_id[sale.id] = principal
+
+        # ---------------------------------------------------------
+        # 4. Retrieve independent legacy Sale records
+        # ---------------------------------------------------------
+        legacy_sales_qs = Sale.objects.filter(
+            payment_method__iexact="CREDIT",
+            date__lte=end_date,
+            transaction__isnull=True,
+        )
+
+        if branch_obj:
+            legacy_sales_qs = legacy_sales_qs.filter(
+                branch=branch_obj
+            )
+
+        legacy_sales = list(
+            legacy_sales_qs.select_related("branch").order_by(
+                "date", "id"
+            )
+        )
+
+        # ---------------------------------------------------------
+        # 5. Build canonical customer identity mappings
+        # ---------------------------------------------------------
+        name_to_customer_id = {}
+        phone_to_customer_id = {}
+
+        for sale in credit_sales:
+            customer = sale.customer
+            if customer:
+                if customer.name:
+                    name_to_customer_id[customer.name.strip().lower()] = customer.id
+                if customer.phone_number:
+                    phone_to_customer_id[customer.phone_number.strip()] = customer.id
+
+        for repayment in cumulative_repayments:
+            customer = repayment.customer
+            if customer:
+                if customer.name:
+                    name_to_customer_id[customer.name.strip().lower()] = customer.id
+                if customer.phone_number:
+                    phone_to_customer_id[customer.phone_number.strip()] = customer.id
+
+        def get_customer_identity(customer_obj, fallback_name=None, fallback_phone=None):
+            if customer_obj:
+                return (
+                    f"cust-{customer_obj.id}",
+                    customer_obj.name or fallback_name or "Unknown Customer",
+                    customer_obj.phone_number or fallback_phone or "N/A",
+                )
+
+            clean_name = str(fallback_name or "Walk-in Debtor").strip()
+            clean_phone = str(fallback_phone or "").strip()
+
+            matched_id = None
+            if clean_phone:
+                matched_id = phone_to_customer_id.get(clean_phone)
+            if not matched_id and clean_name:
+                matched_id = name_to_customer_id.get(clean_name.lower())
+
+            if matched_id:
+                return (
+                    f"cust-{matched_id}",
+                    clean_name,
+                    clean_phone or "N/A",
+                )
+
             return (
-                f"cust-{matched_id}",
+                f"name-{clean_name.lower()}",
                 clean_name,
                 clean_phone or "N/A",
             )
 
-        return (
-            f"name-{clean_name.lower()}",
-            clean_name,
-            clean_phone or "N/A",
-        )
+        # ---------------------------------------------------------
+        # 6. Calculate repayments received (capped at invoice principal)
+        # ---------------------------------------------------------
+        period_recovered = ZERO
+        repaid_by_sale_id = defaultdict(lambda: ZERO)
+        unlinked_repayments = []
 
-    # ---------------------------------------------------------
-    # 6. Calculate repayments received (capped at invoice principal)
-    # ---------------------------------------------------------
-    period_recovered = ZERO
-    repaid_by_sale_id = defaultdict(lambda: ZERO)
-    unlinked_repayments = []
+        for repayment in cumulative_repayments:
+            repayment_amount = quantize_money(repayment.amount or ZERO)
+            if repayment_amount <= ZERO:
+                continue
 
-    for repayment in cumulative_repayments:
-        repayment_amount = quantize_money(repayment.amount or ZERO)
-        if repayment_amount <= ZERO:
-            continue
+            repayment_date = to_local_date(repayment.date)
+            in_period = bool(
+                repayment_date and start_date <= repayment_date <= end_date
+            )
 
-        repayment_date = to_local_date(repayment.date)
-        in_period = bool(
-            repayment_date and start_date <= repayment_date <= end_date
-        )
+            if repayment.transaction_id:
+                sale_id = repayment.transaction_id
+                already_repaid = repaid_by_sale_id[sale_id]
 
-        if repayment.transaction_id:
-            sale_id = repayment.transaction_id
-            already_repaid = repaid_by_sale_id[sale_id]
+                if sale_id in credit_principal_by_sale_id:
+                    max_remaining = max(
+                        ZERO,
+                        credit_principal_by_sale_id[sale_id] - already_repaid,
+                    )
+                    effective_repayment = min(repayment_amount, max_remaining)
+                else:
+                    effective_repayment = repayment_amount
 
-            if sale_id in credit_principal_by_sale_id:
-                max_remaining = max(
-                    ZERO,
-                    credit_principal_by_sale_id[sale_id] - already_repaid,
+                repaid_by_sale_id[sale_id] = quantize_money(
+                    already_repaid + effective_repayment
                 )
-                effective_repayment = min(repayment_amount, max_remaining)
+
+                if in_period:
+                    period_recovered += effective_repayment
             else:
-                effective_repayment = repayment_amount
+                unlinked_repayments.append((repayment, repayment_amount, in_period))
 
-            repaid_by_sale_id[sale_id] = quantize_money(
-                already_repaid + effective_repayment
+        # ---------------------------------------------------------
+        # 7. Initialize debtor records
+        # ---------------------------------------------------------
+        debtors_map = {}
+
+        def ensure_debtor(customer_key, name, phone):
+            if customer_key not in debtors_map:
+                debtors_map[customer_key] = {
+                    "customer_id": customer_key,
+                    "customer_name": name,
+                    "phone": phone or "N/A",
+                    "gross_credit": ZERO,
+                    "repaid": ZERO,
+                    "unpaid_invoices_count": 0,
+                }
+            elif (
+                debtors_map[customer_key]["phone"] == "N/A"
+                and phone
+                and phone != "N/A"
+            ):
+                debtors_map[customer_key]["phone"] = phone
+
+            return debtors_map[customer_key]
+
+        period_credit_issued = ZERO
+        period_credit_invoices_count = 0
+
+        # ---------------------------------------------------------
+        # 8. Process modern SaleTransaction credit sales
+        # ---------------------------------------------------------
+        for sale in credit_sales:
+            credit_principal = credit_principal_by_sale_id.get(sale.id, ZERO)
+            if credit_principal <= ZERO:
+                continue
+
+            sale_date = to_local_date(sale.sale_date)
+            if sale_date and start_date <= sale_date <= end_date:
+                period_credit_issued += credit_principal
+                period_credit_invoices_count += 1
+
+            customer_key, customer_name, customer_phone = get_customer_identity(
+                sale.customer,
+                getattr(sale, "customer_name", None),
+                getattr(sale, "customer_phone", None),
             )
 
-            if in_period:
-                period_recovered += effective_repayment
-        else:
-            unlinked_repayments.append((repayment, repayment_amount, in_period))
-
-    # ---------------------------------------------------------
-    # 7. Initialize debtor records
-    # ---------------------------------------------------------
-    debtors_map = {}
-
-    def ensure_debtor(customer_key, name, phone):
-        if customer_key not in debtors_map:
-            debtors_map[customer_key] = {
-                "customer_id": customer_key,
-                "customer_name": name,
-                "phone": phone or "N/A",
-                "gross_credit": ZERO,
-                "repaid": ZERO,
-                "unpaid_invoices_count": 0,
-            }
-        elif (
-            debtors_map[customer_key]["phone"] == "N/A"
-            and phone
-            and phone != "N/A"
-        ):
-            debtors_map[customer_key]["phone"] = phone
-
-        return debtors_map[customer_key]
-
-    period_credit_issued = ZERO
-    period_credit_invoices_count = 0
-
-    # ---------------------------------------------------------
-    # 8. Process modern SaleTransaction credit sales
-    # ---------------------------------------------------------
-    for sale in credit_sales:
-        credit_principal = credit_principal_by_sale_id.get(sale.id, ZERO)
-        if credit_principal <= ZERO:
-            continue
-
-        sale_date = to_local_date(sale.sale_date)
-        if sale_date and start_date <= sale_date <= end_date:
-            period_credit_issued += credit_principal
-            period_credit_invoices_count += 1
-
-        customer_key, customer_name, customer_phone = get_customer_identity(
-            sale.customer,
-            getattr(sale, "customer_name", None),
-            getattr(sale, "customer_phone", None),
-        )
-
-        debtor = ensure_debtor(
-            customer_key,
-            customer_name,
-            customer_phone,
-        )
-
-        repayment_amount = quantize_money(
-            repaid_by_sale_id.get(sale.id, ZERO)
-        )
-
-        debtor["gross_credit"] += credit_principal
-        debtor["repaid"] += repayment_amount
-
-        if credit_principal > repayment_amount:
-            debtor["unpaid_invoices_count"] += 1
-
-    # ---------------------------------------------------------
-    # 9. Process independent legacy Sale records
-    # ---------------------------------------------------------
-    period_legacy_invoice_keys = set()
-
-    for legacy in legacy_sales:
-        legacy_amount = quantize_money(legacy.total_selling_price or ZERO)
-        if legacy_amount <= ZERO:
-            continue
-
-        customer_key, customer_name, customer_phone = get_customer_identity(
-            None,
-            getattr(legacy, "customer_name", None),
-            getattr(legacy, "customer_phone", None),
-        )
-
-        debtor = ensure_debtor(
-            customer_key,
-            customer_name,
-            customer_phone,
-        )
-
-        debtor["gross_credit"] += legacy_amount
-
-        legacy_date = to_local_date(legacy.date)
-        if legacy_date and start_date <= legacy_date <= end_date:
-            period_credit_issued += legacy_amount
-
-            invoice_reference = (
-                getattr(legacy, "invoice_number", None)
-                or getattr(legacy, "receipt_number", None)
-                or f"legacy-sale-{legacy.id}"
-            )
-            invoice_key = (
+            debtor = ensure_debtor(
                 customer_key,
-                str(invoice_reference).strip().lower(),
+                customer_name,
+                customer_phone,
             )
-            period_legacy_invoice_keys.add(invoice_key)
 
-    period_credit_invoices_count += len(period_legacy_invoice_keys)
+            repayment_amount = quantize_money(
+                repaid_by_sale_id.get(sale.id, ZERO)
+            )
 
-    # ---------------------------------------------------------
-    # 10. Apply unlinked repayments (capped at debtor's remaining balance)
-    # ---------------------------------------------------------
-    for repayment, repayment_amount, in_period in unlinked_repayments:
-        customer_key, customer_name, customer_phone = get_customer_identity(
-            repayment.customer,
-            getattr(repayment, "customer_name", None),
-            None,
-        )
+            debtor["gross_credit"] += credit_principal
+            debtor["repaid"] += repayment_amount
 
-        if customer_key in debtors_map:
-            debtor = debtors_map[customer_key]
-            remaining_debt = max(
+            if credit_principal > repayment_amount:
+                debtor["unpaid_invoices_count"] += 1
+
+        # ---------------------------------------------------------
+        # 9. Process independent legacy Sale records
+        # ---------------------------------------------------------
+        period_legacy_invoice_keys = set()
+
+        for legacy in legacy_sales:
+            legacy_amount = quantize_money(legacy.total_selling_price or ZERO)
+            if legacy_amount <= ZERO:
+                continue
+
+            customer_key, customer_name, customer_phone = get_customer_identity(
+                None,
+                getattr(legacy, "customer_name", None),
+                getattr(legacy, "customer_phone", None),
+            )
+
+            debtor = ensure_debtor(
+                customer_key,
+                customer_name,
+                customer_phone,
+            )
+
+            debtor["gross_credit"] += legacy_amount
+
+            legacy_date = to_local_date(legacy.date)
+            if legacy_date and start_date <= legacy_date <= end_date:
+                period_credit_issued += legacy_amount
+
+                invoice_reference = (
+                    getattr(legacy, "invoice_number", None)
+                    or getattr(legacy, "receipt_number", None)
+                    or f"legacy-sale-{legacy.id}"
+                )
+                invoice_key = (
+                    customer_key,
+                    str(invoice_reference).strip().lower(),
+                )
+                period_legacy_invoice_keys.add(invoice_key)
+
+        period_credit_invoices_count += len(period_legacy_invoice_keys)
+
+        # ---------------------------------------------------------
+        # 10. Apply unlinked repayments (capped at debtor's remaining balance)
+        # ---------------------------------------------------------
+        for repayment, repayment_amount, in_period in unlinked_repayments:
+            customer_key, customer_name, customer_phone = get_customer_identity(
+                repayment.customer,
+                getattr(repayment, "customer_name", None),
+                None,
+            )
+
+            if customer_key in debtors_map:
+                debtor = debtors_map[customer_key]
+                remaining_debt = max(
+                    ZERO,
+                    quantize_money(debtor["gross_credit"] - debtor["repaid"]),
+                )
+                effective_repayment = min(repayment_amount, remaining_debt)
+                debtor["repaid"] = quantize_money(
+                    debtor["repaid"] + effective_repayment
+                )
+
+                if in_period:
+                    period_recovered += effective_repayment
+
+        period_recovered = quantize_money(period_recovered)
+        period_credit_issued = quantize_money(period_credit_issued)
+
+        # ---------------------------------------------------------
+        # 11. Calculate outstanding customer balances
+        # ---------------------------------------------------------
+        debtors_summary = []
+        total_receivables = ZERO
+        total_unpaid_invoices_count = 0
+
+        for customer_key, data in debtors_map.items():
+            gross_credit = quantize_money(data["gross_credit"])
+            total_customer_repaid = quantize_money(data["repaid"])
+
+            outstanding = max(
                 ZERO,
-                quantize_money(debtor["gross_credit"] - debtor["repaid"]),
-            )
-            effective_repayment = min(repayment_amount, remaining_debt)
-            debtor["repaid"] = quantize_money(
-                debtor["repaid"] + effective_repayment
+                quantize_money(gross_credit - total_customer_repaid),
             )
 
-            if in_period:
-                period_recovered += effective_repayment
+            if outstanding <= ZERO:
+                continue
 
-    period_recovered = quantize_money(period_recovered)
-    period_credit_issued = quantize_money(period_credit_issued)
+            total_receivables += outstanding
+            unpaid_count = max(1, data["unpaid_invoices_count"])
+            total_unpaid_invoices_count += unpaid_count
 
-    # ---------------------------------------------------------
-    # 11. Calculate outstanding customer balances
-    # ---------------------------------------------------------
-    debtors_summary = []
-    total_receivables = ZERO
-    total_unpaid_invoices_count = 0
+            debtors_summary.append({
+                "customer_id": data["customer_id"],
+                "customer_name": data["customer_name"],
+                "phone": data["phone"],
+                "unpaid_invoices_count": unpaid_count,
+                "outstanding_balance": float(outstanding),
+            })
 
-    for customer_key, data in debtors_map.items():
-        gross_credit = quantize_money(data["gross_credit"])
-        total_customer_repaid = quantize_money(data["repaid"])
+        total_receivables = quantize_money(total_receivables)
 
-        outstanding = max(
-            ZERO,
-            quantize_money(gross_credit - total_customer_repaid),
+        debtors_summary.sort(
+            key=lambda item: item["outstanding_balance"],
+            reverse=True,
         )
 
-        if outstanding <= ZERO:
-            continue
-
-        total_receivables += outstanding
-        unpaid_count = max(1, data["unpaid_invoices_count"])
-        total_unpaid_invoices_count += unpaid_count
-
-        debtors_summary.append({
-            "customer_id": data["customer_id"],
-            "customer_name": data["customer_name"],
-            "phone": data["phone"],
-            "unpaid_invoices_count": unpaid_count,
-            "outstanding_balance": float(outstanding),
-        })
-
-    total_receivables = quantize_money(total_receivables)
-
-    debtors_summary.sort(
-        key=lambda item: item["outstanding_balance"],
-        reverse=True,
-    )
-
-    # ---------------------------------------------------------
-    # 12. Return ledger
-    # ---------------------------------------------------------
-    return {
-        "total_credit_issued": period_credit_issued,
-        "period_credit_invoices_count": period_credit_invoices_count,
-        "total_recovered": period_recovered,
-        "total_receivables": total_receivables,
-        "unpaid_invoices_count": total_unpaid_invoices_count,
-        "debtors_summary": debtors_summary,
-    }
+        # ---------------------------------------------------------
+        # 12. Return ledger
+        # ---------------------------------------------------------
+        return {
+            "total_credit_issued": period_credit_issued,
+            "period_credit_invoices_count": period_credit_invoices_count,
+            "total_recovered": period_recovered,
+            "total_receivables": total_receivables,
+            "unpaid_invoices_count": total_unpaid_invoices_count,
+            "debtors_summary": debtors_summary,
+        }
 
     # =========================================================================
     # DASHBOARD & FINANCIALS
