@@ -7342,6 +7342,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 amt = quantize_money(sale.total_amount or ZERO)
                 method = self._normalize_payment_method(getattr(sale, "payment_method", None))
                 split_records = extract_split_payments(sale)
+                is_credit = is_credit_sale_check(sale, credit_transaction_ids)
+
+                # If this sale is a credit invoice tracked via CreditRepayment,
+                # do not count post-sale SalePayment records as direct cash sales.
+                if is_credit and method == "CREDIT":
+                    period_credit_sales_total += amt
+                    continue
 
                 if method == "SPLIT" or split_records:
                     for sp in split_records:
@@ -7363,8 +7370,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         else:
                             other_total += sp_amount
                 else:
-                    is_credit = is_credit_sale_check(sale, credit_transaction_ids)
-
                     if is_credit or method == "CREDIT":
                         period_credit_sales_total += amt
                     elif method == "CASH":
