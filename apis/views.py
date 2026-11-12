@@ -7189,32 +7189,39 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         )
         return (branch.pk if branch else None), start_date, end_date
 
-    def _get_receivables_ledger(self, branch_obj=None, end_date=None, end_dt=None):
+    def _get_receivables_ledger(self, branch_obj=None, start_date=None, end_date=None, start_dt=None, end_dt=None):
         """
         Single source of truth for Customer Receivables across Dashboard and Debtors Report.
-        - total_credit_issued: Sum of genuine CREDIT sales only (never inflated by repayments or cash invoices)
-        - total_recovered: Cumulative credit repayments received up to end_date
-        - total_receivables: total_credit_issued - total_recovered
+        - total_credit_issued: Genuine CREDIT sales issued within the selected period (e.g., current month)
+        - total_recovered: Credit repayments received within the selected period
+        - total_receivables: Cumulative net unpaid balance across all active debtors up to end_date
         """
         if end_dt is None:
             end_dt = timezone.now()
         if end_date is None:
             end_date = end_dt.date() if isinstance(end_dt, datetime) else end_dt
+        if start_date is None:
+            start_date = end_date.replace(day=1)
+        if start_dt is None:
+            start_dt = timezone.make_aware(datetime.combine(start_date, time.min))
 
-        # 1. Fetch Credit Repayments (consistent branch filter)
-        repayment_qs = CreditRepayment.objects.filter(date__lte=end_date).select_related(
+        # 1. Cumulative Repayments up to end_date (for accurate debtor net balances)
+        cumulative_repayment_qs = CreditRepayment.objects.filter(date__lte=end_date).select_related(
             "customer", "transaction"
         )
         if branch_obj:
-            repayment_qs = repayment_qs.filter(
+            cumulative_repayment_qs = cumulative_repayment_qs.filter(
                 Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
             ).distinct()
 
-        total_recovered = quantize_money(
-            repayment_qs.aggregate(total=Coalesce(Sum("amount"), ZERO))["total"] or ZERO
+        # Period-scoped Total Recovered (for that month)
+        period_recovered = quantize_money(
+            cumulative_repayment_qs.filter(date__range=(start_date, end_date))
+            .aggregate(total=Coalesce(Sum("amount"), ZERO))["total"]
+            or ZERO
         )
 
-        # 2. Fetch ONLY Genuine Credit Sales (exclude cash invoices & repayment-linked cash sales)
+        # 2. Cumulative Genuine Credit Sales up to end_dt
         st_credit_filter = (
             Q(payment_method=SaleTransaction.PaymentMethod.CREDIT)
             | Q(payment_method__iexact="CREDIT")
@@ -7233,7 +7240,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             legacy_sales_qs = legacy_sales_qs.filter(branch=branch_obj)
 
         debtors_map = {}
-        total_credit_issued = ZERO
+        period_credit_issued = ZERO
+        period_credit_invoices_count = 0
         sale_to_cust_key = {}
 
         def get_customer_identity(customer_obj, fallback_name):
@@ -7263,7 +7271,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             if sale_credit_portion <= ZERO:
                 continue
 
-            total_credit_issued += sale_credit_portion
+            # Check if this credit sale was issued in the selected month/period
+            sale_dt_val = sale.sale_date
+            sale_d = sale_dt_val.date() if isinstance(sale_dt_val, datetime) else sale_dt_val
+            if sale_d and start_date <= sale_d <= end_date:
+                period_credit_issued += sale_credit_portion
+                period_credit_invoices_count += 1
+
             cust_key, cust_disp_name, cust_phone = get_customer_identity(
                 sale.customer, getattr(sale, "customer_name", None)
             )
@@ -7290,7 +7304,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             if legacy_credit <= ZERO:
                 continue
 
-            total_credit_issued += legacy_credit
+            leg_d = legacy.date.date() if isinstance(legacy.date, datetime) else legacy.date
+            if leg_d and start_date <= leg_d <= end_date:
+                period_credit_issued += legacy_credit
+                period_credit_invoices_count += 1
+
             cust_key, cust_disp_name, cust_phone = get_customer_identity(
                 None, getattr(legacy, "customer_name", None)
             )
@@ -7310,7 +7328,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             debtors_map[cust_key]["gross_credit"] += legacy_credit
             debtors_map[cust_key]["unpaid_invoices_count"] += 1
 
-        for rep in repayment_qs:
+        for rep in cumulative_repayment_qs:
             rep_amt = quantize_money(rep.amount or ZERO)
             if rep_amt <= ZERO:
                 continue
@@ -7329,11 +7347,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 debtors_map[ck]["repaid"] += rep_amt
 
         debtors_summary = []
+        total_receivables = ZERO
         total_unpaid_invoices_count = 0
 
         for data in debtors_map.values():
             net_balance = max(ZERO, quantize_money(data["gross_credit"] - data["repaid"]))
             if net_balance > ZERO:
+                total_receivables += net_balance
                 total_unpaid_invoices_count += data["unpaid_invoices_count"]
                 debtors_summary.append({
                     "customer_id": data["customer_id"],
@@ -7345,13 +7365,11 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
         debtors_summary.sort(key=lambda x: x["outstanding_balance"], reverse=True)
 
-        total_credit_issued = quantize_money(total_credit_issued)
-        total_receivables = max(ZERO, quantize_money(total_credit_issued - total_recovered))
-
         return {
-            "total_credit_issued": total_credit_issued,
-            "total_recovered": total_recovered,
-            "total_receivables": total_receivables,
+            "total_credit_issued": quantize_money(period_credit_issued),
+            "period_credit_invoices_count": period_credit_invoices_count,
+            "total_recovered": period_recovered,
+            "total_receivables": quantize_money(total_receivables),
             "unpaid_invoices_count": total_unpaid_invoices_count,
             "debtors_summary": debtors_summary,
         }
@@ -7725,25 +7743,15 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='customer-receivables')
     def customer_receivables_report(self, request):
         try:
-            branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
-            branch_obj = (
-                _resolve_branch(branch_id)
-                if branch_id and str(branch_id).lower() not in ['all', 'null', 'undefined', '']
-                else None
+            branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
+
+            ledger = self._get_receivables_ledger(
+                branch_obj=branch_obj,
+                start_date=start_date,
+                end_date=end_date,
+                start_dt=start_dt,
+                end_dt=end_dt,
             )
-
-            end_date_str = request.query_params.get('end_date') or request.query_params.get('endDate')
-            end_dt = None
-            end_date = None
-
-            if end_date_str:
-                try:
-                    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-                    end_dt = timezone.make_aware(datetime.combine(end_date, time.max))
-                except ValueError:
-                    pass
-
-            ledger = self._get_receivables_ledger(branch_obj=branch_obj, end_date=end_date, end_dt=end_dt)
 
             total_receivables = ledger["total_receivables"]
             total_recovered = ledger["total_recovered"]
@@ -7764,15 +7772,16 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             return Response({
                 "as_at_date": (end_date or timezone.localdate()).strftime('%d %b %Y'),
+                "period_label": (start_date or timezone.localdate()).strftime('%b %Y'),
                 "total_receivables": float(total_receivables),
                 "outstanding_balance": float(total_receivables),
                 "total_recovered": float(total_recovered),
                 "total_credit_issued": float(total_credit_issued),
                 "recovery_rate": float(quantize_money(recovery_rate)),
                 "active_debtors_count": active_debtors_count,
-                "total_unpaid_invoices": ledger["unpaid_invoices_count"],
-                "average_debt_per_customer": float(quantize_money(avg_debt)),
+                "total_unpaid_invoices": ledger["period_credit_invoices_count"],
                 "debtors_summary": debtors_summary,
+                "average_debt_per_customer": float(quantize_money(avg_debt)),
             }, status=status.HTTP_200_OK)
 
         except Exception:
