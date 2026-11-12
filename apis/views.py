@@ -7146,12 +7146,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         Uses _get_reporting_filters to parse dates/period, but explicitly handles 
         strict branch lookup to avoid leaking data across branches.
         """
-        # Parse standard reporting filters (dates and period)
         branch_obj, start_date, end_date, start_dt, end_dt, period_type = _get_reporting_filters(
             request, default_period="month"
         )
 
-        # Extract raw branch parameter directly from request
         branch_param = (
             request.query_params.get("branch")
             or request.query_params.get("branch_id")
@@ -7159,7 +7157,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             or (request.data.get("branch_id") if isinstance(request.data, dict) else None)
         )
 
-        # If a branch parameter was passed explicitly, enforce strict resolution
         if branch_param:
             branch_str = str(branch_param).strip()
             if branch_str.isdigit():
@@ -7168,7 +7165,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 branch_obj = RetailBranch.objects.filter(name__iexact=branch_str).first()
 
         return branch_obj, start_date, end_date, start_dt, end_dt, period_type
-
 
     def _get_filter_params(self, request):
         branch, start_date, end_date, _start_dt, _end_dt, _period = (
@@ -7184,7 +7180,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, period_type = self._get_branch_and_dates(request)
 
-            # Check if a branch parameter was passed but could not be resolved
             raw_branch_param = request.query_params.get("branch") or request.query_params.get("branch_id")
             if raw_branch_param and not branch_obj:
                 return Response(
@@ -7237,7 +7232,8 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         sp_method = self._normalize_payment_method(extract_sp_method(sp))
                         if sp_method == "CREDIT":
                             credit_total += quantize_money(sp.amount or ZERO)
-                    return quantize_money(credit_total)
+                    if credit_total > ZERO:
+                        return quantize_money(credit_total)
 
                 if is_credit_sale_check(sale_obj, c_ids):
                     if method == "CREDIT":
@@ -7270,10 +7266,9 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 base_purchases_qs = base_purchases_qs.filter(branch=branch_obj)
                 base_supplier_pmts_qs = base_supplier_pmts_qs.filter(purchase__branch=branch_obj)
                 if hasattr(CreditRepayment, 'branch'):
-                    # STRICT FILTERING (Removed Q(branch__isnull=True) leak)
                     base_credit_repay_qs = base_credit_repay_qs.filter(
                         Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
-                    )
+                    ).distinct()
 
             sales_qs = base_sales_qs
             expenses_qs = base_expenses_qs
@@ -7344,13 +7339,16 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                 split_records = extract_split_payments(sale)
                 is_credit = is_credit_sale_check(sale, credit_transaction_ids)
 
-                # If this sale is a credit invoice tracked via CreditRepayment,
-                # do not count post-sale SalePayment records as direct cash sales.
+                # Guard against double-counting post-sale repayments attached as SalePayment rows
                 if is_credit and method == "CREDIT":
                     period_credit_sales_total += amt
                     continue
 
                 if method == "SPLIT" or split_records:
+                    if not split_records and is_credit:
+                        period_credit_sales_total += amt
+                        continue
+
                     for sp in split_records:
                         sp_method = self._normalize_payment_method(extract_sp_method(sp))
                         sp_amount = quantize_money(sp.amount or ZERO)
@@ -7419,22 +7417,23 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # -----------------------------------------------------------------
             # 4. UNIFIED RECEIVABLES LEDGER (PER DEBTOR AGGREGATION)
             # -----------------------------------------------------------------
-            st_credit_filter = (
-                Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) |
-                Q(payment_method='Credit') |
-                Q(split_payments__method='CREDIT') |
-                Q(split_payments__method='Credit')
-            )
-            all_credit_sales = base_sales_qs.filter(st_credit_filter).prefetch_related('split_payments', 'customer').distinct()
-            if end_dt:
-                all_credit_sales = all_credit_sales.filter(sale_date__lte=end_dt)
-
             all_credit_ids = set(
                 base_credit_repay_qs
                 .exclude(transaction_id=None)
                 .values_list("transaction_id", flat=True)
                 .distinct()
             )
+
+            st_credit_filter = (
+                Q(payment_method=SaleTransaction.PaymentMethod.CREDIT) |
+                Q(payment_method__iexact='CREDIT') |
+                Q(split_payments__method__iexact='CREDIT') |
+                Q(is_invoice=True) |
+                Q(id__in=all_credit_ids)
+            )
+            all_credit_sales = base_sales_qs.filter(st_credit_filter).prefetch_related('split_payments', 'customer').distinct()
+            if end_dt:
+                all_credit_sales = all_credit_sales.filter(sale_date__lte=end_dt)
 
             repayments_to_date_qs = base_credit_repay_qs
             if end_date:
