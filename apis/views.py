@@ -9258,6 +9258,211 @@ class ManagementReportsViewSet(viewsets.ViewSet):
         )
         return branch, start_date, end_date, start_dt, end_dt
 
+
+    def _normalize_payment_method(self, raw_method):
+        if "_normalize_payment_method" in globals() and callable(globals()["_normalize_payment_method"]):
+            return globals()["_normalize_payment_method"](raw_method)
+        m = str(raw_method or "CASH").strip().upper().replace("-", "_").replace(" ", "_")
+        if "PAYBILL" in m:
+            return "PAYBILL"
+        if "SEND" in m:
+            return "SEND_MONEY"
+        if "MPESA" in m or "TILL" in m or "BUY_GOODS" in m:
+            return "MPESA"
+        if "BANK" in m or "TRANSFER" in m or "EFT" in m:
+            return "BANK_TRANSFER"
+        if "CREDIT" in m or "INVOICE" in m:
+            return "CREDIT"
+        if "SPLIT" in m:
+            return "SPLIT"
+        return m or "CASH"
+
+    def _get_receivables_ledger(self, branch_obj=None, start_date=None, end_date=None, start_dt=None, end_dt=None):
+        tz = timezone.get_current_timezone()
+        lifetime_start_date = date(1900, 1, 1)
+        eff_end_date = end_date.date() if isinstance(end_date, datetime) else (end_date or timezone.localdate())
+        eff_end_dt = end_dt or timezone.make_aware(datetime.combine(eff_end_date, time.max), tz)
+
+        eff_start_date = start_date.date() if isinstance(start_date, datetime) else (start_date or lifetime_start_date)
+        eff_start_dt = start_dt or timezone.make_aware(datetime.combine(eff_start_date, time.min), tz)
+
+        sales_qs = SaleTransaction.objects.filter(sale_date__lte=eff_end_dt).select_related("customer", "branch").prefetch_related("split_payments")
+        repay_qs = CreditRepayment.objects.all()
+
+        if branch_obj:
+            sales_qs = sales_qs.filter(branch=branch_obj)
+            repay_qs = repay_qs.filter(
+                Q(branch=branch_obj)
+                | (Q(branch__isnull=True) & Q(transaction__branch=branch_obj))
+            )
+
+        dedup_repay_ids = list(repay_qs.values_list("id", flat=True).distinct())
+        dedup_repay_qs = CreditRepayment.objects.filter(id__in=dedup_repay_ids)
+
+        all_time_repaid_by_sale_id = defaultdict(lambda: ZERO)
+        repaid_to_as_at_by_sale_id = defaultdict(lambda: ZERO)
+
+        for row in (
+            dedup_repay_qs.exclude(transaction_id=None)
+            .values("transaction_id")
+            .annotate(total=Coalesce(Sum("amount"), ZERO))
+        ):
+            all_time_repaid_by_sale_id[row["transaction_id"]] = quantize_money(row["total"] or ZERO)
+
+        for row in (
+            dedup_repay_qs.filter(date__lte=eff_end_date)
+            .exclude(transaction_id=None)
+            .values("transaction_id")
+            .annotate(total=Coalesce(Sum("amount"), ZERO))
+        ):
+            repaid_to_as_at_by_sale_id[row["transaction_id"]] = quantize_money(row["total"] or ZERO)
+
+        credit_sale_ids_from_repayments = set(all_time_repaid_by_sale_id.keys())
+        credit_sales = [
+            s for s in sales_qs
+            if self._normalize_payment_method(s.payment_method) == "CREDIT"
+            or str(getattr(s, "receipt_number", "") or "").strip().upper().startswith("INV")
+            or s.id in credit_sale_ids_from_repayments
+            or any(self._normalize_payment_method(getattr(sp, "method", None)) == "CREDIT" for sp in s.split_payments.all())
+        ]
+
+        credit_principal_by_sale_id = {}
+        for sale in credit_sales:
+            norm_method = self._normalize_payment_method(sale.payment_method)
+            split_records = list(sale.split_payments.all())
+            is_inv_receipt = str(getattr(sale, "receipt_number", "") or "").strip().upper().startswith("INV")
+            has_repayments = all_time_repaid_by_sale_id.get(sale.id, ZERO) > ZERO
+
+            credit_splits = [
+                sp for sp in split_records
+                if self._normalize_payment_method(getattr(sp, "method", None)) == "CREDIT"
+            ]
+
+            if credit_splits:
+                sale_credit_principal = sum(
+                    (quantize_money(sp.amount or ZERO) for sp in credit_splits),
+                    ZERO,
+                )
+            elif is_inv_receipt or has_repayments or norm_method == "CREDIT":
+                sale_total = quantize_money(sale.total_amount or ZERO)
+                recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                all_post_sale_repaid = all_time_repaid_by_sale_id.get(sale.id, ZERO)
+                upfront_deposit = max(ZERO, recorded_paid - all_post_sale_repaid)
+                sale_credit_principal = max(ZERO, sale_total - upfront_deposit)
+            else:
+                sale_credit_principal = ZERO
+
+            if sale_credit_principal > ZERO:
+                credit_principal_by_sale_id[sale.id] = sale_credit_principal
+
+        # Capped period repayments (prevents over-repayment or unlinked phantom repayments from distorting totals)
+        period_repaid_raw_by_sale_id = defaultdict(lambda: ZERO)
+        unlinked_period_repaid = ZERO
+        for row in (
+            dedup_repay_qs.filter(date__range=(eff_start_date, eff_end_date))
+            .values("transaction_id")
+            .annotate(total=Coalesce(Sum("amount"), ZERO))
+        ):
+            tx_id = row["transaction_id"]
+            amt = quantize_money(row["total"] or ZERO)
+            if tx_id is None:
+                unlinked_period_repaid += amt
+            else:
+                period_repaid_raw_by_sale_id[tx_id] += amt
+
+        total_recovered = unlinked_period_repaid
+        for tx_id, p_amt in period_repaid_raw_by_sale_id.items():
+            principal_cap = credit_principal_by_sale_id.get(tx_id)
+            total_recovered += min(p_amt, principal_cap) if principal_cap is not None else p_amt
+
+        total_receivables = ZERO
+        unpaid_invoices_count = 0
+        total_credit_issued = ZERO
+        period_credit_invoices_count = 0
+        debtors_acc = {}
+
+        for sale in credit_sales:
+            principal = credit_principal_by_sale_id.get(sale.id, ZERO)
+            if principal <= ZERO:
+                continue
+
+            s_date = getattr(sale, "sale_date", None)
+            if isinstance(s_date, datetime):
+                local_s = timezone.localtime(s_date) if timezone.is_aware(s_date) else s_date
+                in_period = eff_start_dt <= local_s <= eff_end_dt
+                sale_date_str = local_s.strftime("%Y-%m-%d")
+            elif s_date:
+                in_period = eff_start_date <= s_date <= eff_end_date
+                sale_date_str = str(s_date)
+            else:
+                in_period = False
+                sale_date_str = ""
+
+            if in_period:
+                total_credit_issued += principal
+                period_credit_invoices_count += 1
+
+            repaid_so_far = min(principal, repaid_to_as_at_by_sale_id.get(sale.id, ZERO))
+            balance = max(ZERO, principal - repaid_so_far)
+
+            if balance > ZERO:
+                total_receivables += balance
+                unpaid_invoices_count += 1
+
+                cust_id = sale.customer_id
+                cust_name = (
+                    (sale.customer.name if sale.customer else None)
+                    or getattr(sale, "customer_name", None)
+                    or "Walk-in Debtor"
+                ).strip()
+                cust_phone = getattr(sale.customer, "phone", "") if sale.customer else ""
+                key = f"id:{cust_id}" if cust_id else f"name:{cust_name.lower()}"
+
+                if key not in debtors_acc:
+                    debtors_acc[key] = {
+                        "customer_id": cust_id,
+                        "customer_name": cust_name,
+                        "phone": cust_phone or "",
+                        "total_credit": ZERO,
+                        "total_paid": ZERO,
+                        "balance_due": ZERO,
+                        "unpaid_invoices": 0,
+                        "oldest_invoice_date": sale_date_str,
+                    }
+
+                debtors_acc[key]["total_credit"] += principal
+                debtors_acc[key]["total_paid"] += repaid_so_far
+                debtors_acc[key]["balance_due"] += balance
+                debtors_acc[key]["unpaid_invoices"] += 1
+                if sale_date_str and (
+                    not debtors_acc[key]["oldest_invoice_date"]
+                    or sale_date_str < debtors_acc[key]["oldest_invoice_date"]
+                ):
+                    debtors_acc[key]["oldest_invoice_date"] = sale_date_str
+
+        debtors_summary = sorted(
+            [
+                {
+                    **d,
+                    "total_credit": float(quantize_money(d["total_credit"])),
+                    "total_paid": float(quantize_money(d["total_paid"])),
+                    "balance_due": float(quantize_money(d["balance_due"])),
+                }
+                for d in debtors_acc.values()
+            ],
+            key=lambda x: x["balance_due"],
+            reverse=True,
+        )
+
+        return {
+            "total_receivables": quantize_money(total_receivables),
+            "unpaid_invoices_count": unpaid_invoices_count,
+            "total_recovered": quantize_money(total_recovered),
+            "total_credit_issued": quantize_money(total_credit_issued),
+            "period_credit_invoices_count": period_credit_invoices_count,
+            "debtors_summary": debtors_summary,
+        }
+
     # =========================================================================
     # PROFIT & LOSS REPORT
     # =========================================================================
