@@ -9253,10 +9253,29 @@ class ManagementReportsViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_branch_and_dates(self, request):
-        branch, start_date, end_date, start_dt, end_dt, _period = (
-            _get_reporting_filters(request, default_period="month")
+        """
+        Extracts branch & reporting period filters with strict RetailBranch lookup 
+        to prevent leaking data across branches.
+        """
+        branch_obj, start_date, end_date, start_dt, end_dt, period_type = _get_reporting_filters(
+            request, default_period="month"
         )
-        return branch, start_date, end_date, start_dt, end_dt
+
+        branch_param = (
+            request.query_params.get("branch")
+            or request.query_params.get("branch_id")
+            or (request.data.get("branch") if isinstance(request.data, dict) else None)
+            or (request.data.get("branch_id") if isinstance(request.data, dict) else None)
+        )
+
+        if branch_param:
+            branch_str = str(branch_param).strip()
+            if branch_str.isdigit():
+                branch_obj = RetailBranch.objects.filter(id=int(branch_str)).first()
+            else:
+                branch_obj = RetailBranch.objects.filter(name__iexact=branch_str).first()
+
+        return branch_obj, start_date, end_date, start_dt, end_dt, period_type
 
 
     def _normalize_payment_method(self, raw_method):
