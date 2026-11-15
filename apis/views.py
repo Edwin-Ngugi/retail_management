@@ -3326,17 +3326,24 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
         return queryset
 
     def create(self, request, *args, **kwargs):
+        """Create a sale using batched catalog/pricing reads and deferred WAC work.
+
+        SaleItem.save() intentionally retains its normal side effects for other
+        application paths. This checkout path performs those side effects in
+        batches so a multi-item cart does not run a complete WAC ledger replay
+        once per line item.
+        """
         try:
             data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data or {})
             items_payload = data.get("items") or data.get("sale_items") or []
 
-            if not items_payload:
+            if not isinstance(items_payload, list) or not items_payload:
                 return Response(
                     {"error": "At least one sale item is required to complete transaction."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # 1. Resolve Branch
+            # 1. Resolve branch (retain existing compatibility/fallback behavior).
             branch_param = (
                 data.get("branch")
                 or data.get("branch_id")
@@ -3344,13 +3351,12 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 or request.query_params.get("branch_id")
             )
             branch_obj = None
-            if branch_param is not None:
-                if isinstance(branch_param, RetailBranch):
-                    branch_obj = branch_param
-                elif str(branch_param).isdigit():
-                    branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
-                elif isinstance(branch_param, str) and branch_param.strip():
-                    branch_obj = RetailBranch.objects.filter(name__iexact=branch_param.strip()).first()
+            if isinstance(branch_param, RetailBranch):
+                branch_obj = branch_param
+            elif branch_param is not None and str(branch_param).isdigit():
+                branch_obj = RetailBranch.objects.filter(pk=int(branch_param)).first()
+            elif isinstance(branch_param, str) and branch_param.strip():
+                branch_obj = RetailBranch.objects.filter(name__iexact=branch_param.strip()).first()
 
             if not branch_obj:
                 user = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
@@ -3365,34 +3371,29 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # 2. Normalize Payment Method & Date
-            raw_payment = data.get("payment_method") or "CASH"
-            normalized_pm = self._normalize_payment_method(raw_payment)
-            
-            raw_date = data.get("sale_date") or data.get("date")
-            parsed_date = self._normalize_sale_date(raw_date)
+            # 2. Normalize payment, date and customer details.
+            normalized_pm = self._normalize_payment_method(data.get("payment_method") or "CASH")
+            parsed_date = self._normalize_sale_date(data.get("sale_date") or data.get("date"))
 
-            # 3. Resolve Customer Object or Name
             customer_id = data.get("customer") or data.get("customer_id")
             customer_obj = None
             if customer_id and str(customer_id).isdigit():
                 customer_obj = Customer.objects.filter(pk=int(customer_id)).first()
 
             customer_name = (
-                data.get("customer_name") 
+                data.get("customer_name")
                 or (customer_obj.name if customer_obj else "")
                 or ("Walk-in Customer" if normalized_pm != "CREDIT" else "")
             )
 
-            # 4. Capture Custom Invoice / Receipt Code ONLY for Credit Sales
             custom_receipt = None
             if normalized_pm == "CREDIT":
                 raw_custom = data.get("receipt_number") or data.get("invoice_number") or data.get("receipt")
                 if raw_custom and str(raw_custom).strip():
                     custom_receipt = str(raw_custom).strip()
 
-            # 5. Extract Split Payments Payload (Comprehensive Key Checks & Format Resolution)
-            split_payments_payload = (
+            # 3. Normalize payment split formats exactly once.
+            split_payload = (
                 data.get("split_payments")
                 or data.get("payments")
                 or data.get("splits")
@@ -3402,37 +3403,102 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 or data.get("split_methods")
                 or []
             )
-
-            # If payload comes as a dictionary (e.g., {"CASH": 1000, "PAYBILL": 700})
-            if isinstance(split_payments_payload, dict):
-                formatted_splits = []
-                for k, v in split_payments_payload.items():
-                    amt_dec = quantize_money(v)
-                    if amt_dec > ZERO:
-                        formatted_splits.append({"method": k, "amount": amt_dec})
-                split_payments_payload = formatted_splits
+            if isinstance(split_payload, dict):
+                split_payload = [
+                    {"method": method, "amount": amount}
+                    for method, amount in split_payload.items()
+                    if quantize_money(amount) > ZERO
+                ]
 
             valid_splits = []
-            if isinstance(split_payments_payload, list):
-                for sp in split_payments_payload:
-                    if isinstance(sp, dict):
-                        amt = quantize_money(sp.get("amount", ZERO))
-                        if amt > ZERO:
-                            valid_splits.append(sp)
+            if isinstance(split_payload, list):
+                for split in split_payload:
+                    if isinstance(split, dict) and quantize_money(split.get("amount", ZERO)) > ZERO:
+                        valid_splits.append(split)
 
-            # Truly SPLIT only if explicitly requested or if >= 2 distinct payment entries are provided
             if normalized_pm == "SPLIT" or len(valid_splits) > 1:
                 final_pm = "SPLIT"
             elif len(valid_splits) == 1:
-                sp_raw = valid_splits[0].get("method") or valid_splits[0].get("payment_method") or valid_splits[0].get("channel")
-                final_pm = self._normalize_payment_method(sp_raw)
+                split_method = (
+                    valid_splits[0].get("method")
+                    or valid_splits[0].get("payment_method")
+                    or valid_splits[0].get("channel")
+                )
+                final_pm = self._normalize_payment_method(split_method)
             else:
                 final_pm = normalized_pm
 
-            # 6. Process Sale via Transaction Atomic Block
-            with transaction.atomic():
-                amount_paid_quantized = quantize_money(data.get("amount_paid") or "0.00")
+            # 4. Validate cart shape and collect unique IDs before touching the DB.
+            normalized_lines = []
+            item_ids = set()
+            for index, row in enumerate(items_payload, start=1):
+                if not isinstance(row, dict):
+                    raise DRFValidationError({"items": f"Item row {index} must be an object."})
 
+                raw_item_id = row.get("item") or row.get("item_id") or row.get("id")
+                try:
+                    item_id = int(raw_item_id)
+                except (TypeError, ValueError):
+                    raise DRFValidationError({"items": f"A valid item ID is required on row {index}."})
+
+                try:
+                    qty = Decimal(str(row.get("quantity") or row.get("quantity_sold") or 1))
+                    retail_price = quantize_money(
+                        row.get("unit_selling_price")
+                        or row.get("unit_retail_price")
+                        or row.get("unit_price")
+                        or ZERO
+                    )
+                    discount = quantize_money(row.get("discount_per_item") or ZERO)
+                except Exception:
+                    raise DRFValidationError({"items": f"Invalid quantity or price on row {index}."})
+
+                if not qty.is_finite() or qty <= ZERO:
+                    raise DRFValidationError({"items": f"Quantity on row {index} must be greater than zero."})
+                if retail_price < ZERO or discount < ZERO or discount > retail_price:
+                    raise DRFValidationError({"items": f"Invalid selling price or discount on row {index}."})
+
+                normalized_lines.append({
+                    "item_id": item_id,
+                    "quantity": qty,
+                    "retail_price": retail_price,
+                    "discount": discount,
+                })
+                item_ids.add(item_id)
+
+            # 5. Do all writes atomically. Lock in a stable order to reduce
+            # deadlock risk when two tills sell overlapping products.
+            with transaction.atomic():
+                locked_items = {
+                    obj.pk: obj
+                    for obj in Item.objects.select_for_update()
+                    .filter(pk__in=item_ids)
+                    .order_by("pk")
+                }
+                missing_ids = sorted(item_ids - set(locked_items))
+                if missing_ids:
+                    raise DRFValidationError({"items": f"Item(s) not found: {', '.join(map(str, missing_ids))}."})
+
+                # StockMovement.clean() historically linked unassigned catalog
+                # items to the branch retailer. Preserve that side effect here,
+                # because bulk_create deliberately bypasses model save/clean.
+                items_to_link = [
+                    obj for obj in locked_items.values()
+                    if obj.retailer_id is None and branch_obj.retailer_id is not None
+                ]
+                if items_to_link:
+                    for obj in items_to_link:
+                        obj.retailer_id = branch_obj.retailer_id
+                    Item.objects.bulk_update(items_to_link, ["retailer"])
+
+                pricing_by_item = {
+                    pricing.item_id: pricing
+                    for pricing in BranchItemPricing.objects.select_for_update()
+                    .filter(branch=branch_obj, item_id__in=item_ids)
+                    .order_by("item_id")
+                }
+
+                amount_paid = quantize_money(data.get("amount_paid") or ZERO)
                 create_kwargs = {
                     "branch": branch_obj,
                     "customer": customer_obj,
@@ -3440,83 +3506,107 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                     "payment_method": final_pm,
                     "sale_date": parsed_date,
                     "total_amount": ZERO,
-                    "amount_paid": amount_paid_quantized,
+                    "amount_paid": amount_paid,
                     "created_by": request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
                 }
-
                 if custom_receipt:
                     create_kwargs["receipt_number"] = custom_receipt
 
                 sale = SaleTransaction.objects.create(**create_kwargs)
 
+                sale_items = []
+                stock_movements = []
                 calculated_total = ZERO
+                sale_day = parsed_date.date() if hasattr(parsed_date, "date") else parsed_date
+                created_by = create_kwargs["created_by"]
 
-                for item_data in items_payload:
-                    item_id = item_data.get("item") or item_data.get("item_id") or item_data.get("id")
-                    if not item_id:
-                        continue
+                for line in normalized_lines:
+                    item_obj = locked_items[line["item_id"]]
+                    pricing = pricing_by_item.get(item_obj.pk)
+                    cost_price = quantize_money(
+                        pricing.unit_cost_price if pricing else getattr(item_obj, "unit_cost_price", ZERO) or ZERO
+                    )
+                    retail_price = line["retail_price"]
+                    discount = line["discount"]
+                    qty = line["quantity"]
 
-                    item_obj = Item.objects.select_for_update().filter(pk=item_id).first()
-                    if not item_obj:
-                        continue
-
-                    qty = Decimal(str(item_data.get("quantity") or item_data.get("quantity_sold") or 1))
-                    if qty <= ZERO:
-                        continue
-
-                    pricing = BranchItemPricing.objects.filter(item=item_obj, branch=branch_obj).first()
-                    cost_price = quantize_money(pricing.unit_cost_price if pricing else getattr(item_obj, "unit_cost_price", ZERO) or ZERO)
-                    retail_price = quantize_money(item_data.get("unit_selling_price") or item_data.get("unit_retail_price") or (pricing.unit_selling_price if pricing else ZERO) or ZERO)
-                    discount = quantize_money(item_data.get("discount_per_item") or "0.00")
-
-                    line_total = qty * (retail_price - discount)
-                    calculated_total += line_total
-
-                    SaleItem.objects.create(
+                    calculated_total += qty * (retail_price - discount)
+                    sale_items.append(SaleItem(
                         transaction=sale,
                         item=item_obj,
                         quantity_sold=qty,
                         unit_cost_price=cost_price,
                         unit_selling_price=retail_price,
                         discount_per_item=discount,
-                    )
+                    ))
+                    stock_movements.append(StockMovement(
+                        branch=branch_obj,
+                        item=item_obj,
+                        movement_type=StockMovement.MovementType.SALE,
+                        quantity=qty,
+                        unit_cost_price=cost_price,
+                        date=sale_day,
+                        reference=f"SALE-{sale.pk}",
+                        reference_id=sale.pk,
+                        notes=f"Sale Receipt #{sale.receipt_number}",
+                        created_by=created_by,
+                    ))
 
                 calculated_total = quantize_money(calculated_total)
-                sale.total_amount = calculated_total
 
-                # Route child SalePayment entries ONLY for true multi-channel split payments
+                # Bulk inserts intentionally bypass SaleItem.save(); its two
+                # essential side effects (stock ledger row + WAC replay) are
+                # performed explicitly below, once per affected product.
+                SaleItem.objects.bulk_create(sale_items, batch_size=500)
+                StockMovement.objects.bulk_create(stock_movements, batch_size=500)
+
                 if final_pm == "SPLIT" and valid_splits:
                     split_sum = ZERO
-                    for sp in valid_splits:
-                        sp_raw = sp.get("method") or sp.get("payment_method") or sp.get("channel")
-                        sp_method = self._normalize_payment_method(sp_raw)
-                        sp_amount = quantize_money(sp.get("amount", ZERO))
-
-                        split_sum += sp_amount
-                        SalePayment.objects.create(
-                            transaction=sale,
-                            method=sp_method,
-                            amount=sp_amount,
-                            reference_code=sp.get("reference_code") or sp.get("reference") or sale.receipt_number or ""
+                    payment_rows = []
+                    for split in valid_splits:
+                        split_method = self._normalize_payment_method(
+                            split.get("method") or split.get("payment_method") or split.get("channel")
                         )
-                    
-                    # Update amount_paid and is_paid status directly for SPLIT transactions
+                        split_amount = quantize_money(split.get("amount", ZERO))
+                        if split_amount <= ZERO:
+                            continue
+                        split_sum += split_amount
+                        payment_rows.append(SalePayment(
+                            transaction=sale,
+                            method=split_method,
+                            amount=split_amount,
+                            reference_code=(
+                                split.get("reference_code")
+                                or split.get("reference")
+                                or sale.receipt_number
+                                or ""
+                            ),
+                        ))
+                    if payment_rows:
+                        SalePayment.objects.bulk_create(payment_rows, batch_size=200)
                     sale.amount_paid = split_sum
                     sale.is_paid = split_sum >= calculated_total
+                elif final_pm == "CREDIT":
+                    sale.amount_paid = amount_paid
+                    sale.is_paid = (sale.amount_paid >= calculated_total) and calculated_total > ZERO
                 else:
-                    if final_pm != "CREDIT" and (sale.amount_paid == ZERO or sale.amount_paid is None):
+                    if amount_paid == ZERO:
                         sale.amount_paid = calculated_total
-                        sale.is_paid = True
-                    elif final_pm == "CREDIT":
-                        sale.amount_paid = quantize_money(sale.amount_paid or ZERO)
-                        sale.is_paid = (sale.amount_paid >= calculated_total) and (calculated_total > ZERO)
                     else:
-                        sale.amount_paid = quantize_money(sale.amount_paid)
+                        sale.amount_paid = amount_paid
+                    sale.is_paid = sale.amount_paid >= calculated_total
 
-                # ALWAYS persist final total_amount, amount_paid, and is_paid to database
+                sale.total_amount = calculated_total
                 sale.save(update_fields=["total_amount", "amount_paid", "is_paid"])
 
-            # 7. Broadcast Real-time WebSocket Event
+                # Re-run the existing ledger-based WAC algorithm once per
+                # affected product. It still updates historical sale COGS as
+                # the current model implementation intends.
+                for item_id in sorted(item_ids):
+                    recalculate_wac_sales_cost(branch_obj, locked_items[item_id])
+
+            # Notify only after the transaction has committed. The channel
+            # send is kept outside the DB transaction so it cannot hold locks.
             channel_layer = get_channel_layer()
             if channel_layer:
                 try:
@@ -3532,6 +3622,13 @@ class SaleTransactionViewSet(viewsets.ModelViewSet):
                 except Exception as ws_err:
                     logger.warning("WebSocket broadcast failed: %s", ws_err)
 
+            # Re-fetch related rows for the response without N+1 item queries.
+            sale = (
+                SaleTransaction.objects
+                .select_related("branch", "customer")
+                .prefetch_related("items__item", "split_payments")
+                .get(pk=sale.pk)
+            )
             serializer = self.get_serializer(sale)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
