@@ -7679,21 +7679,6 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                         pass
                 return False
 
-            def allocate_to_channel(norm_m, amount_val):
-                nonlocal cash_total, paybill_total, send_money_total, mpesa_std_total, bank_total, other_total
-                if norm_m == "CASH":
-                    cash_total += amount_val
-                elif norm_m == "PAYBILL":
-                    paybill_total += amount_val
-                elif norm_m == "SEND_MONEY":
-                    send_money_total += amount_val
-                elif norm_m == "MPESA":
-                    mpesa_std_total += amount_val
-                elif norm_m == "BANK_TRANSFER":
-                    bank_total += amount_val
-                else:
-                    other_total += amount_val
-
             # -----------------------------------------------------------------
             # 1. STRICT UNFILTERED BASE QUERYSETS BY BRANCH
             # -----------------------------------------------------------------
@@ -7745,6 +7730,83 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             credit_transaction_ids = set(repaid_by_tx.keys())
 
+            def compute_cash_receipts_and_channels(s_qs, r_qs):
+                ch = {
+                    "CASH": ZERO,
+                    "PAYBILL": ZERO,
+                    "SEND_MONEY": ZERO,
+                    "MPESA": ZERO,
+                    "BANK_TRANSFER": ZERO,
+                    "OTHER": ZERO,
+                    "CREDIT_EXPOSURE": ZERO,
+                }
+
+                def add_ch(norm_m, amt_v):
+                    if norm_m in ch and norm_m != "CREDIT_EXPOSURE":
+                        ch[norm_m] += amt_v
+                    else:
+                        ch["OTHER"] += amt_v
+
+                for sale in s_qs.select_related("customer", "branch").prefetch_related("split_payments"):
+                    amt = quantize_money(sale.total_amount or ZERO)
+                    method = self._normalize_payment_method(getattr(sale, "payment_method", None))
+                    split_records = extract_split_payments(sale)
+                    is_credit = is_credit_sale_check(sale, credit_transaction_ids)
+
+                    credit_splits = [
+                        sp for sp in split_records
+                        if self._normalize_payment_method(extract_sp_method(sp)) == "CREDIT"
+                    ]
+
+                    if credit_splits:
+                        for sp in split_records:
+                            sp_method = self._normalize_payment_method(extract_sp_method(sp))
+                            sp_amount = quantize_money(sp.amount or ZERO)
+                            if sp_method == "CREDIT":
+                                ch["CREDIT_EXPOSURE"] += sp_amount
+                            else:
+                                add_ch(sp_method, sp_amount)
+                    elif is_credit or method == "CREDIT":
+                        recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
+                        upfront_paid = max(ZERO, recorded_paid - repaid_by_tx.get(sale.id, ZERO))
+                        ch["CREDIT_EXPOSURE"] += max(ZERO, amt - upfront_paid)
+                        if upfront_paid > ZERO:
+                            ch["OTHER"] += min(amt, upfront_paid)
+                    elif method == "SPLIT" or split_records:
+                        for sp in split_records:
+                            sp_method = self._normalize_payment_method(extract_sp_method(sp))
+                            sp_amount = quantize_money(sp.amount or ZERO)
+                            add_ch(sp_method, sp_amount)
+                    else:
+                        add_ch(method, amt)
+
+                for rep in r_qs.select_related("customer", "transaction").prefetch_related("splits"):
+                    rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
+                    split_rows = list(rep.splits.all()) if hasattr(rep, "splits") else []
+
+                    if rep_method == "SPLIT" and split_rows:
+                        for sp in split_rows:
+                            sp_amt = quantize_money(sp.amount or ZERO)
+                            if sp_amt <= ZERO:
+                                continue
+                            sp_method = self._normalize_payment_method(extract_sp_method(sp))
+                            add_ch(sp_method, sp_amt)
+                    else:
+                        rep_amt = quantize_money(rep.amount or ZERO)
+                        if rep_amt <= ZERO:
+                            continue
+                        add_ch(rep_method, rep_amt)
+
+                total_receipts = quantize_money(
+                    ch["CASH"]
+                    + ch["PAYBILL"]
+                    + ch["SEND_MONEY"]
+                    + ch["MPESA"]
+                    + ch["BANK_TRANSFER"]
+                    + ch["OTHER"]
+                )
+                return total_receipts, ch
+
             # -----------------------------------------------------------------
             # 2. FINANCIAL PERFORMANCE METRICS
             # -----------------------------------------------------------------
@@ -7771,79 +7833,18 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             net_profit = operating_profit
 
             # -----------------------------------------------------------------
-            # 3. CASH MOVEMENT & PAYMENT CHANNEL BREAKDOWN
+            # 3. CASH MOVEMENT & PAYMENT CHANNEL BREAKDOWN (SELECTED PERIOD)
             # -----------------------------------------------------------------
-            cash_total = ZERO
-            paybill_total = ZERO
-            send_money_total = ZERO
-            mpesa_std_total = ZERO
-            bank_total = ZERO
-            other_total = ZERO
-            period_credit_sales_total = ZERO
-
-            sales_with_payments = sales_qs.select_related("customer", "branch").prefetch_related("split_payments")
-
-            for sale in sales_with_payments:
-                amt = quantize_money(sale.total_amount or ZERO)
-                method = self._normalize_payment_method(getattr(sale, "payment_method", None))
-                split_records = extract_split_payments(sale)
-                is_credit = is_credit_sale_check(sale, credit_transaction_ids)
-
-                credit_splits = [
-                    sp for sp in split_records
-                    if self._normalize_payment_method(extract_sp_method(sp)) == "CREDIT"
-                ]
-
-                if credit_splits:
-                    # True checkout split sale with an explicit CREDIT leg
-                    for sp in split_records:
-                        sp_method = self._normalize_payment_method(extract_sp_method(sp))
-                        sp_amount = quantize_money(sp.amount or ZERO)
-                        if sp_method == "CREDIT":
-                            period_credit_sales_total += sp_amount
-                        else:
-                            allocate_to_channel(sp_method, sp_amount)
-                elif is_credit or method == "CREDIT":
-                    # Credit sale (including INV invoices whose payment_method/splits changed upon repayment)
-                    recorded_paid = quantize_money(getattr(sale, "amount_paid", ZERO) or ZERO)
-                    upfront_paid = max(ZERO, recorded_paid - repaid_by_tx.get(sale.id, ZERO))
-                    period_credit_sales_total += max(ZERO, amt - upfront_paid)
-                    if upfront_paid > ZERO:
-                        other_total += min(amt, upfront_paid)
-                elif method == "SPLIT" or split_records:
-                    # Pure non-credit split sale at checkout
-                    for sp in split_records:
-                        sp_method = self._normalize_payment_method(extract_sp_method(sp))
-                        sp_amount = quantize_money(sp.amount or ZERO)
-                        allocate_to_channel(sp_method, sp_amount)
-                else:
-                    allocate_to_channel(method, amt)
-
-            for rep in customer_repayments_qs.select_related("customer", "transaction").prefetch_related("splits"):
-                rep_method = self._normalize_payment_method(getattr(rep, "payment_method", None))
-                split_rows = list(rep.splits.all()) if hasattr(rep, "splits") else []
-
-                if rep_method == "SPLIT" and split_rows:
-                    for sp in split_rows:
-                        sp_amt = quantize_money(sp.amount or ZERO)
-                        if sp_amt <= ZERO:
-                            continue
-                        sp_method = self._normalize_payment_method(extract_sp_method(sp))
-                        allocate_to_channel(sp_method, sp_amt)
-                else:
-                    rep_amt = quantize_money(rep.amount or ZERO)
-                    if rep_amt <= ZERO:
-                        continue
-                    allocate_to_channel(rep_method, rep_amt)
-
-            actual_cash_receipts = quantize_money(
-                cash_total
-                + paybill_total
-                + send_money_total
-                + mpesa_std_total
-                + bank_total
-                + other_total
+            actual_cash_receipts, period_channels = compute_cash_receipts_and_channels(
+                sales_qs, customer_repayments_qs
             )
+            cash_total = period_channels["CASH"]
+            paybill_total = period_channels["PAYBILL"]
+            send_money_total = period_channels["SEND_MONEY"]
+            mpesa_std_total = period_channels["MPESA"]
+            bank_total = period_channels["BANK_TRANSFER"]
+            other_total = period_channels["OTHER"]
+            period_credit_sales_total = period_channels["CREDIT_EXPOSURE"]
 
             # -----------------------------------------------------------------
             # 4. UNIFIED RECEIVABLES LEDGER (SINGLE SOURCE OF TRUTH)
@@ -7921,7 +7922,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             total_cataloged_skus = pricings_qs.values('item_id').distinct().count()
 
             # -----------------------------------------------------------------
-            # 6. PURCHASES & OUTFLOWS
+            # 6. PURCHASES, OUTFLOWS & CUMULATIVE AVAILABLE FUNDS (CARRY-FORWARD)
             # -----------------------------------------------------------------
             dir_purch_agg = purchases_qs.exclude(
                 payment_method='CREDIT'
@@ -7934,7 +7935,29 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             supplier_repayments = quantize_money(supp_pmt_agg['total'] or ZERO)
 
             purchases_total = direct_purchases + supplier_repayments
-            available_funds = actual_cash_receipts - operating_expenses - purchases_total
+            period_net_cash = actual_cash_receipts - operating_expenses - purchases_total
+
+            # Cumulative cash position up to effective_end_date (includes prior months & prior days)
+            cum_sales_qs = base_sales_qs.filter(sale_date__lte=effective_end_dt)
+            cum_repayments_qs = dedup_base_repay_qs.filter(date__lte=effective_end_date)
+            cum_expenses_qs = base_expenses_qs.filter(date__lte=effective_end_date)
+            cum_purchases_qs = base_purchases_qs.filter(purchase_date__lte=effective_end_dt)
+            cum_supplier_pmts_qs = base_supplier_pmts_qs.filter(created_at__lte=effective_end_dt)
+
+            cum_cash_receipts, _ = compute_cash_receipts_and_channels(cum_sales_qs, cum_repayments_qs)
+            cum_expenses = quantize_money(cum_expenses_qs.aggregate(total=Sum('amount'))['total'] or ZERO)
+            cum_direct_purchases = quantize_money(
+                cum_purchases_qs.exclude(payment_method='CREDIT')
+                .filter(supplier_payments__isnull=True)
+                .aggregate(total=Sum('amount_paid'))['total'] or ZERO
+            )
+            cum_supplier_repayments = quantize_money(
+                cum_supplier_pmts_qs.aggregate(total=Sum('amount'))['total'] or ZERO
+            )
+            cum_purchases_total = cum_direct_purchases + cum_supplier_repayments
+
+            available_funds = quantize_money(cum_cash_receipts - cum_expenses - cum_purchases_total)
+            opening_cash_balance = quantize_money(available_funds - period_net_cash)
 
             # -----------------------------------------------------------------
             # 7. GRANULAR DAILY TRAJECTORY COMPUTATION
@@ -8019,6 +8042,10 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                     "payments_formatted": f"KSh {operating_expenses:,.2f}",
                     "purchases": float(purchases_total),
                     "purchases_formatted": f"KSh {purchases_total:,.2f}",
+                    "opening_cash": float(opening_cash_balance),
+                    "opening_cash_formatted": f"KSh {opening_cash_balance:,.2f}",
+                    "period_net_cash": float(period_net_cash),
+                    "period_net_cash_formatted": f"KSh {period_net_cash:,.2f}",
                     "total_available_funds": float(available_funds),
                     "total_available_funds_formatted": f"KSh {available_funds:,.2f}",
                 },
