@@ -13004,46 +13004,19 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 previous_discounts = ZERO
                 previous_cogs = ZERO
                 previous_units = ZERO
-
-                # Read the previous-period sale lines in bounded PK batches.
-                # QuerySet.iterator() opens a PostgreSQL server-side cursor;
-                # that cursor can disappear when the database connection is
-                # behind transaction-pooling/proxy infrastructure.
-                previous_lines_qs = (
-                    SaleItem.objects.filter(transaction__in=previous_sales)
-                    .only(
-                        "id",
-                        "quantity_sold",
-                        "unit_selling_price",
-                        "discount_per_item",
-                        "unit_cost_price",
-                    )
-                    .order_by("pk")
-                )
-
-                last_pk = None
-                batch_size = 2000
-
-                while True:
-                    batch_qs = previous_lines_qs
-                    if last_pk is not None:
-                        batch_qs = batch_qs.filter(pk__gt=last_pk)
-
-                    previous_batch = list(batch_qs[:batch_size])
-                    if not previous_batch:
-                        break
-
-                    for previous_line in previous_batch:
-                        previous_qty = Decimal(str(previous_line.quantity_sold or ZERO))
-                        previous_price = Decimal(str(previous_line.unit_selling_price or ZERO))
-                        previous_discount = Decimal(str(previous_line.discount_per_item or ZERO))
-                        previous_cost = Decimal(str(previous_line.unit_cost_price or ZERO))
-                        previous_gross += previous_qty * previous_price
-                        previous_discounts += previous_qty * previous_discount
-                        previous_cogs += previous_qty * previous_cost
-                        previous_units += previous_qty
-
-                    last_pk = previous_batch[-1].pk
+                for previous_line in SaleItem.objects.filter(
+                    transaction__in=previous_sales
+                ).only(
+                    "quantity_sold", "unit_selling_price", "discount_per_item", "unit_cost_price"
+                ).iterator(chunk_size=2000):
+                    previous_qty = Decimal(str(previous_line.quantity_sold or ZERO))
+                    previous_price = Decimal(str(previous_line.unit_selling_price or ZERO))
+                    previous_discount = Decimal(str(previous_line.discount_per_item or ZERO))
+                    previous_cost = Decimal(str(previous_line.unit_cost_price or ZERO))
+                    previous_gross += previous_qty * previous_price
+                    previous_discounts += previous_qty * previous_discount
+                    previous_cogs += previous_qty * previous_cost
+                    previous_units += previous_qty
 
                 previous_net = previous_gross - previous_discounts
                 previous_profit = previous_net - previous_cogs
