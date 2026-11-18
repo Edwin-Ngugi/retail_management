@@ -12610,8 +12610,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
         if slow_movers:
             notes.append({
                 "type": "info",
-                "title": "Inventory Velocity Action",
-                "message": f"{len(slow_movers)} items exhibit low turnover. Consider bundling stagnant stock."
+                "title": "Lower Sales Contributors",
+                "message": f"{len(slow_movers)} products had lower sales contribution than the leading products in this selected period. Review current stock levels and a longer sales window before classifying them as slow-moving."
             })
 
         return notes
@@ -12736,8 +12736,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     "amount": float(rep_amt)
                 })
 
-            net_credit_balance = max(ZERO, gross_credit_sales - period_credit_repayments_total)
-
             # -----------------------------------------------------------------
             # 3. SALE ITEMS AGGREGATION & DAILY TRENDS
             # -----------------------------------------------------------------
@@ -12773,11 +12771,15 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     unit_cost = getattr(line.item, 'cost_price', ZERO)
                 cost = Decimal(str(unit_cost or 0))
 
-                line_rev = qty * (price - disc)
-                line_cost = qty * cost
+                # SaleItem.total_before_discount = quantity * unit selling price.
+                # Keep gross sales, discounts and net sales separate so discounts
+                # are deducted exactly once throughout the report.
+                line_gross_revenue = qty * price
                 line_disc_total = qty * disc
+                line_rev = line_gross_revenue - line_disc_total
+                line_cost = qty * cost
 
-                total_gross_revenue += line_rev
+                total_gross_revenue += line_gross_revenue
                 total_cogs += line_cost
                 total_discounts += line_disc_total
                 total_units_sold += qty
@@ -12790,11 +12792,13 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         "item_name": name,
                         "units_sold": ZERO,
                         "gross_revenue": ZERO,
+                        "net_revenue": ZERO,
                         "cogs": ZERO,
                         "discounts": ZERO,
                     }
                 products_map[i_id]["units_sold"] += qty
-                products_map[i_id]["gross_revenue"] += line_rev
+                products_map[i_id]["gross_revenue"] += line_gross_revenue
+                products_map[i_id]["net_revenue"] += line_rev
                 products_map[i_id]["cogs"] += line_cost
                 products_map[i_id]["discounts"] += line_disc_total
 
@@ -12841,10 +12845,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     daily_map[bucket_key] = {
                         "date": bucket_label,
                         "period_start": bucket_key,
+                        "gross_revenue": ZERO,
                         "revenue": ZERO,
+                        "discounts": ZERO,
                         "cogs": ZERO,
                     }
+                daily_map[bucket_key]["gross_revenue"] += line_gross_revenue
                 daily_map[bucket_key]["revenue"] += line_rev
+                daily_map[bucket_key]["discounts"] += line_disc_total
                 daily_map[bucket_key]["cogs"] += line_cost
 
                 if line.transaction_id:
@@ -12865,7 +12873,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 daily_map.setdefault(key, {
                     "date": label,
                     "period_start": key,
+                    "gross_revenue": ZERO,
                     "revenue": ZERO,
+                    "discounts": ZERO,
                     "cogs": ZERO,
                 })
 
@@ -12923,34 +12933,42 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             for k, v in sorted(daily_map.items()):
                 if k == "Unknown":
                     continue
+                gross_val = float(quantize_money(v.get("gross_revenue", ZERO)))
                 rev_val = float(quantize_money(v["revenue"]))
+                discount_val = float(quantize_money(v.get("discounts", ZERO)))
                 cogs_val = float(quantize_money(v["cogs"]))
                 profit_val = float(quantize_money(v["revenue"] - v["cogs"]))
                 daily_trends.append({
                     "date": v["date"],
                     "period_start": v["period_start"],
+                    "gross_revenue": gross_val,
                     "revenue": rev_val,
+                    "net_revenue": rev_val,
+                    "discounts": discount_val,
                     "cogs": cogs_val,
                     "profit": profit_val
                 })
 
-            gross_profit = total_gross_revenue - total_cogs
+            # Net sales are gross sales less discounts, exactly once.
             net_revenue = total_gross_revenue - total_discounts
-            profit_margin_pct = float((gross_profit / total_gross_revenue * Decimal("100.0")) if total_gross_revenue > ZERO else ZERO)
-            discount_rate_pct = float((total_discounts / (total_gross_revenue + total_discounts) * Decimal("100.0")) if (total_gross_revenue + total_discounts) > ZERO else ZERO)
-            avg_basket_value = quantize_money(total_gross_revenue / transaction_count) if transaction_count > 0 else ZERO
+            gross_profit = net_revenue - total_cogs
+            profit_margin_pct = float((gross_profit / net_revenue * Decimal("100.0")) if net_revenue > ZERO else ZERO)
+            discount_rate_pct = float((total_discounts / total_gross_revenue * Decimal("100.0")) if total_gross_revenue > ZERO else ZERO)
+            avg_basket_value = quantize_money(net_revenue / transaction_count) if transaction_count > 0 else ZERO
             avg_items_per_basket = round(float(total_units_sold / transaction_count), 2) if transaction_count > 0 else 0.0
 
             performers = []
             for v in products_map.values():
-                rev_val = v["gross_revenue"]
-                profit_val = rev_val - v["cogs"]
-                m_pct = float((profit_val / rev_val * Decimal("100.0")) if rev_val > ZERO else ZERO)
+                gross_val = v["gross_revenue"]
+                net_val = v["net_revenue"]
+                profit_val = net_val - v["cogs"]
+                m_pct = float((profit_val / net_val * Decimal("100.0")) if net_val > ZERO else ZERO)
                 performers.append({
                     "item_id": v["item_id"],
                     "item_name": v["item_name"],
                     "units_sold": float(v["units_sold"]),
-                    "gross_revenue": float(quantize_money(rev_val)),
+                    "gross_revenue": float(quantize_money(gross_val)),
+                    "net_revenue": float(quantize_money(net_val)),
                     "cogs": float(quantize_money(v["cogs"])),
                     "profit": float(quantize_money(profit_val)),
                     "discounts": float(quantize_money(v["discounts"])),
@@ -12967,6 +12985,62 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 fast_movers = sorted_by_velocity[:10]
                 slow_movers = sorted(sorted_by_velocity[10:], key=lambda x: (x["units_sold"], x["gross_revenue"]))[:10]
 
+            # Compare the selected window with the immediately preceding
+            # window of equal length. Values are calculated from SaleItem's
+            # stored unit price, per-unit discount and stored unit COGS.
+            period_comparison = None
+            if start_date and end_date:
+                period_days = (end_date - start_date).days + 1
+                previous_end = start_date - timedelta(days=1)
+                previous_start = previous_end - timedelta(days=period_days - 1)
+                previous_sales = SaleTransaction.objects.filter(
+                    sale_date__date__gte=previous_start,
+                    sale_date__date__lte=previous_end,
+                )
+                if branch_obj:
+                    previous_sales = previous_sales.filter(branch=branch_obj)
+
+                previous_gross = ZERO
+                previous_discounts = ZERO
+                previous_cogs = ZERO
+                previous_units = ZERO
+                for previous_line in SaleItem.objects.filter(
+                    transaction__in=previous_sales
+                ).only(
+                    "quantity_sold", "unit_selling_price", "discount_per_item", "unit_cost_price"
+                ).iterator(chunk_size=2000):
+                    previous_qty = Decimal(str(previous_line.quantity_sold or ZERO))
+                    previous_price = Decimal(str(previous_line.unit_selling_price or ZERO))
+                    previous_discount = Decimal(str(previous_line.discount_per_item or ZERO))
+                    previous_cost = Decimal(str(previous_line.unit_cost_price or ZERO))
+                    previous_gross += previous_qty * previous_price
+                    previous_discounts += previous_qty * previous_discount
+                    previous_cogs += previous_qty * previous_cost
+                    previous_units += previous_qty
+
+                previous_net = previous_gross - previous_discounts
+                previous_profit = previous_net - previous_cogs
+
+                def percentage_change(current, previous):
+                    if previous == ZERO:
+                        return None if current == ZERO else None
+                    return round(float((current - previous) / abs(previous) * Decimal("100")), 2)
+
+                period_comparison = {
+                    "previous_start_date": str(previous_start),
+                    "previous_end_date": str(previous_end),
+                    "gross_revenue": float(quantize_money(previous_gross)),
+                    "discounts": float(quantize_money(previous_discounts)),
+                    "net_revenue": float(quantize_money(previous_net)),
+                    "cogs": float(quantize_money(previous_cogs)),
+                    "gross_profit": float(quantize_money(previous_profit)),
+                    "units_sold": float(previous_units),
+                    "transaction_count": previous_sales.count(),
+                    "net_revenue_change_percent": percentage_change(net_revenue, previous_net),
+                    "gross_profit_change_percent": percentage_change(gross_profit, previous_profit),
+                    "comparison_available": previous_net != ZERO or previous_profit != ZERO,
+                }
+
             summary_payload = {
                 "start_date": str(start_date) if start_date else None,
                 "end_date": str(end_date) if end_date else None,
@@ -12982,20 +13056,29 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "avg_items_per_basket": avg_items_per_basket,
                 "total_units_sold": float(total_units_sold),
                 "credit_sales_exposure": float(quantize_money(gross_credit_sales)),
-                "net_credit_exposure": float(quantize_money(net_credit_balance)),
                 "total_credit_repayments": float(quantize_money(period_credit_repayments_total)),
-                "returned_orders_count": returns_qs.count()
+                "returned_orders_count": returns_qs.count(),
+                "total_direct_sales_collected": float(quantize_money(
+                    cash_total + paybill_total + send_money_total + bank_total + other_total
+                )),
+                "total_credit_collections": float(quantize_money(period_credit_repayments_total)),
             }
 
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
+            # Keep sales tender and later debt collections separate. Combining
+            # them overstates sales by counting repayment cash as new revenue.
             channel_map = {
-                "CASH": cash_total + repayments_by_channel["CASH"],
-                "PAYBILL": paybill_total + repayments_by_channel["PAYBILL"],
-                "SEND_MONEY": send_money_total + repayments_by_channel["SEND_MONEY"],
-                "BANK_TRANSFER": bank_total + repayments_by_channel["BANK_TRANSFER"],
+                "CASH": cash_total,
+                "PAYBILL": paybill_total,
+                "SEND_MONEY": send_money_total,
+                "BANK_TRANSFER": bank_total,
                 "CREDIT": gross_credit_sales,
-                "OTHER": other_total + repayments_by_channel["OTHER"],
+                "OTHER": other_total,
+            }
+            repayment_channel_map = {
+                key: quantize_money(value)
+                for key, value in repayments_by_channel.items()
             }
 
             payment_breakdown = [
@@ -13054,6 +13137,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             return Response({
                 "summary": summary_payload,
+                "period_comparison": period_comparison,
                 "daily_trends": daily_trends,
                 "trend_granularity": {
                     "day": "hour",
@@ -13068,6 +13152,10 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 }.get(trend_granularity, trend_granularity),
                 "payment_breakdown": payment_breakdown,
                 "payment_channel_breakdown": payment_channel_breakdown,
+                "repayment_breakdown": [
+                    {"method": key, "amount": float(value)}
+                    for key, value in repayment_channel_map.items()
+                ],
                 "fast_movers": fast_movers,
                 "top_performers": fast_movers,
                 "slow_movers": slow_movers,
@@ -13104,6 +13192,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             slow_movers = data.get("slow_movers", [])
             transactions = data.get("transactions", [])
             repayments_list = data.get("credit_repayments_list", [])
+            repayment_breakdown = data.get("repayment_breakdown", [])
+            period_comparison = data.get("period_comparison") or {}
 
             export_type = (request.query_params.get("export_type") or request.query_params.get("type") or "summary").lower()
 
@@ -13233,15 +13323,24 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             # 2. Financial KPI Summary Table
             elements.append(Paragraph("<b>FINANCIAL SUMMARY</b>", section_heading))
             summary_data = [
-                [Paragraph("Gross Revenue", tbl_header), fmt_pdf_curr(summary.get("gross_revenue"))],
+                [Paragraph("Gross Sales Before Discounts", tbl_header), fmt_pdf_curr(summary.get("gross_revenue"))],
+                [Paragraph("Discounts Given", tbl_cell), fmt_pdf_curr(summary.get("total_discounts"))],
+                [Paragraph("Net Sales After Discounts", tbl_header), fmt_pdf_curr(summary.get("net_revenue"))],
                 [Paragraph("Cost of Goods Sold (COGS)", tbl_cell), fmt_pdf_curr(summary.get("total_cogs"))],
                 [Paragraph("Gross Profit", tbl_header), fmt_pdf_curr(summary.get("gross_profit"))],
                 [Paragraph("Profit Margin Rate", tbl_header), f"{summary.get('profit_margin_percent', 0)}%"],
                 [Paragraph("Total Orders Processed", tbl_cell), f"{summary.get('transaction_count', 0)} Txns"],
-                [Paragraph("Average Basket Value", tbl_cell), fmt_pdf_curr(summary.get("avg_basket_value"))],
-                [Paragraph("Credit Sales Exposure", tbl_cell), fmt_pdf_curr(summary.get("credit_sales_exposure"))],
-                [Paragraph("Credit Repayments Collected", tbl_cell), fmt_pdf_curr(summary.get("total_credit_repayments"))],
+                [Paragraph("Credit Sales Issued During Period", tbl_cell), fmt_pdf_curr(summary.get("credit_sales_exposure"))],
+                [Paragraph("Credit Repayments Collected (Separate Inflow)", tbl_cell), fmt_pdf_curr(summary.get("total_credit_repayments"))],
+                [Paragraph("Discount Rate", tbl_cell), f"{summary.get('discount_rate_percent', 0)}%"],
             ]
+            if period_comparison:
+                comparison_change = period_comparison.get("net_revenue_change_percent")
+                comparison_label = "Not available" if comparison_change is None else f"{comparison_change:+.2f}%"
+                summary_data.append([
+                    Paragraph("Net Sales Change vs Previous Equal-Length Period", tbl_cell),
+                    comparison_label,
+                ])
 
             sum_table = Table(summary_data, colWidths=[350, 202])
             sum_table.setStyle(TableStyle([
@@ -13269,14 +13368,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(Paragraph("<b>PERIOD TRENDS BREAKDOWN</b>", section_heading))
                 trend_data = [[
                     Paragraph("Date", tbl_header),
-                    Paragraph("Gross Revenue", tbl_header),
+                    Paragraph("Net Sales", tbl_header),
                     Paragraph("COGS", tbl_header),
                     Paragraph("Gross Profit", tbl_header)
                 ]]
                 for dt in daily_trends:
                     trend_data.append([
                         Paragraph(safe_text(dt.get("date")), tbl_cell),
-                        fmt_pdf_curr(dt.get("revenue")),
+                        fmt_pdf_curr(dt.get("net_revenue", dt.get("revenue"))),
                         fmt_pdf_curr(dt.get("cogs")),
                         fmt_pdf_curr(dt.get("profit"))
                     ])
@@ -13293,7 +13392,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             # 5. Fast & Slow Movers Tables
             if fast_movers:
-                elements.append(Paragraph("<b>FAST-MOVING PRODUCTS (TOP PERFORMERS)</b>", section_heading))
+                elements.append(Paragraph("<b>TOP REVENUE-CONTRIBUTING PRODUCTS</b>", section_heading))
                 fm_data = [[
                     Paragraph("Product", tbl_header),
                     Paragraph("Units Sold", tbl_header),
@@ -13319,7 +13418,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 elements.append(Spacer(1, 10))
 
             if slow_movers:
-                elements.append(Paragraph("<b>SLOW-MOVING PRODUCTS (STAGNANT INVENTORY)</b>", section_heading))
+                elements.append(Paragraph("<b>LOWER SALES-CONTRIBUTING PRODUCTS</b>", section_heading))
                 sm_data = [[
                     Paragraph("Product", tbl_header),
                     Paragraph("Units Sold", tbl_header),
@@ -13458,10 +13557,10 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             # 8. Payment Channel Distribution
             if payment_breakdown:
-                elements.append(Paragraph("<b>RESOLVED PAYMENT CHANNEL DISTRIBUTION</b>", section_heading))
+                elements.append(Paragraph("<b>SALES AMOUNT BY PAYMENT METHOD (CREDIT ISSUED INCLUDED)</b>", section_heading))
                 pm_data = [[
                     Paragraph("Channel / Method", tbl_header),
-                    Paragraph("Settled Total", tbl_header)
+                    Paragraph("Sales Amount", tbl_header)
                 ]]
                 for pm in payment_breakdown:
                     pm_data.append([
@@ -13477,6 +13576,30 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#E2E8F0')),
                 ]))
                 elements.append(pm_table)
+                elements.append(Spacer(1, 8))
+
+            # Repayment collections are cash inflows against prior credit sales,
+            # not sales revenue. Present them in a separate reconciliation table.
+            if repayment_breakdown:
+                elements.append(Paragraph("<b>CREDIT REPAYMENT COLLECTIONS BY CHANNEL (SEPARATE FROM SALES)</b>", section_heading))
+                repayment_channel_data = [[
+                    Paragraph("Collection Channel", tbl_header),
+                    Paragraph("Amount Collected", tbl_header)
+                ]]
+                for entry in repayment_breakdown:
+                    repayment_channel_data.append([
+                        Paragraph(safe_text(entry.get("method")), tbl_cell),
+                        fmt_pdf_curr(entry.get("amount"))
+                    ])
+                repayment_channel_table = Table(repayment_channel_data, colWidths=[350, 202])
+                repayment_channel_table.setStyle(TableStyle([
+                    ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#ECFDF5')),
+                    ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.HexColor('#D1FAE5')),
+                ]))
+                elements.append(repayment_channel_table)
 
             doc.build(elements)
             buffer.seek(0)
