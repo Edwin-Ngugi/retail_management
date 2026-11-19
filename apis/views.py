@@ -12629,7 +12629,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 sales_qs = sales_qs.filter(sale_date__gte=start_dt, sale_date__lte=end_dt)
             elif start_date and end_date:
                 sales_qs = sales_qs.filter(sale_date__date__gte=start_date, sale_date__date__lte=end_date)
-            
+
             if start_date and end_date:
                 returns_qs = returns_qs.filter(date__gte=start_date, date__lte=end_date)
                 repayment_qs = repayment_qs.filter(date__gte=start_date, date__lte=end_date)
@@ -12637,7 +12637,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 returns_qs = returns_qs.filter(branch=branch_obj)
-                # ✅ STRICT BRANCH FILTERING (Removed Q(branch__isnull=True) leak)
                 repayment_qs = repayment_qs.filter(
                     Q(branch=branch_obj) | Q(transaction__branch=branch_obj)
                 )
@@ -12718,7 +12717,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                             sp_raw = self._extract_sp_method(sp)
                             sp_channel = self._normalize_payment_method(sp_raw)
                             sp_amt = self._extract_sp_amount(sp)
-                            
+
                             target = sp_channel if sp_channel in repayments_by_channel else "OTHER"
                             repayments_by_channel[target] += sp_amt
                     else:
@@ -12747,10 +12746,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             daily_map = {}
             transaction_items_map = {}
 
-            trend_granularity = period_type
+            raw_period = str(request.query_params.get("period_type") or period_type or "").lower()
+            trend_granularity = "total" if raw_period in ("day", "total") else period_type
+
             if trend_granularity == "custom":
                 span_days = (end_date - start_date).days + 1
-                if span_days <= 14:
+                if span_days <= 1:
+                    trend_granularity = "total"
+                elif span_days <= 14:
                     trend_granularity = "custom_day"
                 elif span_days <= 62:
                     trend_granularity = "custom_week"
@@ -12759,7 +12762,14 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 else:
                     trend_granularity = "custom_year"
             elif trend_granularity == "all":
-                trend_granularity = "all_year"
+                trend_granularity = "total"
+
+            single_total_label = (
+                start_date.strftime("%d %b %Y")
+                if (raw_period == "day" and start_date)
+                else "Total"
+            )
+            single_total_key = start_date.strftime("%Y-%m-%d") if start_date else "total"
 
             for line in sale_items_qs:
                 qty = self._extract_qty(line, default=ZERO)
@@ -12771,9 +12781,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     unit_cost = getattr(line.item, 'cost_price', ZERO)
                 cost = Decimal(str(unit_cost or 0))
 
-                # SaleItem.total_before_discount = quantity * unit selling price.
-                # Keep gross sales, discounts and net sales separate so discounts
-                # are deducted exactly once throughout the report.
                 line_gross_revenue = qty * price
                 line_disc_total = qty * disc
                 line_rev = line_gross_revenue - line_disc_total
@@ -12811,9 +12818,9 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
                 granularity = trend_granularity
 
-                if granularity == "day":
-                    bucket_key = sale_dt.strftime("%Y-%m-%d-%H")
-                    bucket_label = sale_dt.strftime("%H:00")
+                if granularity == "total":
+                    bucket_key = single_total_key
+                    bucket_label = single_total_label
                 elif granularity == "week":
                     bucket_key = sale_dt.strftime("%Y-%m-%d")
                     bucket_label = sale_dt.strftime("%a")
@@ -12838,8 +12845,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     bucket_key = week_start.strftime("%Y-%m-%d")
                     bucket_label = f"Week of {week_start.strftime('%d %b')}"
                 else:
-                    bucket_key = sale_dt.strftime("%Y")
-                    bucket_label = sale_dt.strftime("%Y")
+                    bucket_key = single_total_key
+                    bucket_label = single_total_label
 
                 if bucket_key not in daily_map:
                     daily_map[bucket_key] = {
@@ -12858,7 +12865,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 if line.transaction_id:
                     if line.transaction_id not in transaction_items_map:
                         transaction_items_map[line.transaction_id] = []
-                    
+
                     transaction_items_map[line.transaction_id].append({
                         "item_name": name,
                         "quantity": float(qty),
@@ -12879,10 +12886,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     "cogs": ZERO,
                 })
 
-            if trend_granularity == "day":
-                for hour in range(24):
-                    key = f"{start_date:%Y-%m-%d}-{hour:02d}"
-                    ensure_trend_bucket(key, f"{hour:02d}:00")
+            if trend_granularity == "total":
+                ensure_trend_bucket(single_total_key, single_total_label)
             elif trend_granularity == "week":
                 cursor = start_date
                 while cursor <= end_date:
@@ -12949,7 +12954,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     "profit": profit_val
                 })
 
-            # Net sales are gross sales less discounts, exactly once.
             net_revenue = total_gross_revenue - total_discounts
             gross_profit = net_revenue - total_cogs
             profit_margin_pct = float((gross_profit / net_revenue * Decimal("100.0")) if net_revenue > ZERO else ZERO)
@@ -12985,11 +12989,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 fast_movers = sorted_by_velocity[:10]
                 slow_movers = sorted(sorted_by_velocity[10:], key=lambda x: (x["units_sold"], x["gross_revenue"]))[:10]
 
-            # Compare the selected window with the immediately preceding
-            # window of equal length. Values are calculated from SaleItem's
-            # stored unit price, per-unit discount and stored unit COGS.
             period_comparison = None
-            if start_date and end_date:
+            if start_date and end_date and raw_period != "total":
                 period_days = (end_date - start_date).days + 1
                 previous_end = start_date - timedelta(days=1)
                 previous_start = previous_end - timedelta(days=period_days - 1)
@@ -13023,7 +13024,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
                 def percentage_change(current, previous):
                     if previous == ZERO:
-                        return None if current == ZERO else None
+                        return None
                     return round(float((current - previous) / abs(previous) * Decimal("100")), 2)
 
                 period_comparison = {
@@ -13066,8 +13067,6 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
 
             insights = self._generate_executive_insights(summary_payload, fast_movers, slow_movers)
 
-            # Keep sales tender and later debt collections separate. Combining
-            # them overstates sales by counting repayment cash as new revenue.
             channel_map = {
                 "CASH": cash_total,
                 "PAYBILL": paybill_total,
@@ -13094,7 +13093,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
             transactions_list = []
             for sale in sales_with_payments:
                 items_data = transaction_items_map.get(sale.id, [])
-                
+
                 rec_num = str(sale.receipt_number or f"REC-{sale.id}")
                 norm_method = self._normalize_payment_method(sale.payment_method)
                 split_records = self._get_split_payments(sale)
@@ -13106,7 +13105,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                     for sp in split_records:
                         sp_raw = self._extract_sp_method(sp)
                         distinct_methods.add(self._normalize_payment_method(sp_raw))
-                    
+
                     if len(distinct_methods) > 1:
                         disp_channel = "SPLIT"
                     elif len(distinct_methods) == 1:
@@ -13121,7 +13120,7 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                         disp_channel = norm_method
 
                 cust_disp_name = (
-                    sale.customer.name if getattr(sale, 'customer', None) 
+                    sale.customer.name if getattr(sale, 'customer', None)
                     else (sale.customer_name or "Walk-in Customer")
                 )
 
@@ -13140,7 +13139,8 @@ class DetailedSalesAnalysisViewSet(viewsets.ViewSet):
                 "period_comparison": period_comparison,
                 "daily_trends": daily_trends,
                 "trend_granularity": {
-                    "day": "hour",
+                    "total": "total",
+                    "day": "total",
                     "week": "day",
                     "month": "week",
                     "year": "month",
