@@ -7695,12 +7695,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             base_purchases_qs = Purchase.objects.all()
             base_supplier_pmts_qs = SupplierPayment.objects.all()
             base_credit_repay_qs = CreditRepayment.objects.all()
+            base_other_receipts_qs = OtherReceipt.objects.all()
 
             if branch_obj:
                 base_sales_qs = base_sales_qs.filter(branch=branch_obj)
                 base_expenses_qs = base_expenses_qs.filter(branch=branch_obj)
                 base_purchases_qs = base_purchases_qs.filter(branch=branch_obj)
                 base_supplier_pmts_qs = base_supplier_pmts_qs.filter(purchase__branch=branch_obj)
+                base_other_receipts_qs = base_other_receipts_qs.filter(branch=branch_obj)
                 if hasattr(CreditRepayment, 'branch'):
                     base_credit_repay_qs = base_credit_repay_qs.filter(
                         Q(branch=branch_obj)
@@ -7716,12 +7718,16 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             purchases_qs = base_purchases_qs
             supplier_payments_qs = base_supplier_pmts_qs
             customer_repayments_qs = dedup_base_repay_qs
+            other_receipts_qs = base_other_receipts_qs
 
             if start_date and end_date:
                 sales_qs = sales_qs.filter(sale_date__range=(start_dt, end_dt))
                 expenses_qs = expenses_qs.filter(date__range=(start_date, end_date))
                 purchases_qs = purchases_qs.filter(purchase_date__range=(start_dt, end_dt))
                 customer_repayments_qs = customer_repayments_qs.filter(
+                    date__range=(start_date, end_date)
+                )
+                other_receipts_qs = other_receipts_qs.filter(
                     date__range=(start_date, end_date)
                 )
             if start_dt and end_dt:
@@ -7738,7 +7744,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
 
             credit_transaction_ids = set(repaid_by_tx.keys())
 
-            def compute_cash_receipts_and_channels(s_qs, r_qs):
+            def compute_cash_receipts_and_channels(s_qs, r_qs, o_qs):
                 ch = {
                     "CASH": ZERO,
                     "PAYBILL": ZERO,
@@ -7805,6 +7811,13 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
                             continue
                         add_ch(rep_method, rep_amt)
 
+                for oth in o_qs:
+                    oth_amt = quantize_money(oth.amount or ZERO)
+                    if oth_amt <= ZERO:
+                        continue
+                    oth_method = self._normalize_payment_method(getattr(oth, "payment_method", None))
+                    add_ch(oth_method, oth_amt)
+
                 total_receipts = quantize_money(
                     ch["CASH"]
                     + ch["PAYBILL"]
@@ -7844,7 +7857,7 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # 3. CASH MOVEMENT & PAYMENT CHANNEL BREAKDOWN (SELECTED PERIOD)
             # -----------------------------------------------------------------
             actual_cash_receipts, period_channels = compute_cash_receipts_and_channels(
-                sales_qs, customer_repayments_qs
+                sales_qs, customer_repayments_qs, other_receipts_qs
             )
             cash_total = period_channels["CASH"]
             paybill_total = period_channels["PAYBILL"]
@@ -7948,11 +7961,14 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
             # Cumulative cash position up to effective_end_date (includes prior months & prior days)
             cum_sales_qs = base_sales_qs.filter(sale_date__lte=effective_end_dt)
             cum_repayments_qs = dedup_base_repay_qs.filter(date__lte=effective_end_date)
+            cum_other_receipts_qs = base_other_receipts_qs.filter(date__lte=effective_end_date)
             cum_expenses_qs = base_expenses_qs.filter(date__lte=effective_end_date)
             cum_purchases_qs = base_purchases_qs.filter(purchase_date__lte=effective_end_dt)
             cum_supplier_pmts_qs = base_supplier_pmts_qs.filter(created_at__lte=effective_end_dt)
 
-            cum_cash_receipts, _ = compute_cash_receipts_and_channels(cum_sales_qs, cum_repayments_qs)
+            cum_cash_receipts, _ = compute_cash_receipts_and_channels(
+                cum_sales_qs, cum_repayments_qs, cum_other_receipts_qs
+            )
             cum_expenses = quantize_money(cum_expenses_qs.aggregate(total=Sum('amount'))['total'] or ZERO)
             cum_direct_purchases = quantize_money(
                 cum_purchases_qs.exclude(payment_method='CREDIT')
@@ -8382,35 +8398,90 @@ class ManagementAnalyticsViewSet(viewsets.ViewSet):
     # =========================================================================
     # CASHVIEW ENDPOINTS
     # =========================================================================
-    @action(detail=False, methods=['get'], url_path='cash-overview')
-    def cash_overview(self, request):
+    @action(detail=False, methods=['get'], url_path='cash-inflows')
+    def cash_inflows(self, request):
         try:
             branch_obj, start_date, end_date, start_dt, end_dt, _period = self._get_branch_and_dates(request)
-
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).exclude(payment_method='CREDIT')
-            expenses_qs = Expense.objects.filter(Q(date__range=(start_date, end_date)))
             repayments_qs = CreditRepayment.objects.filter(Q(date__range=(start_date, end_date)))
+            other_receipts_qs = OtherReceipt.objects.filter(date__range=(start_date, end_date))
 
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
-                expenses_qs = expenses_qs.filter(branch=branch_obj)
                 repayments_qs = repayments_qs.filter(branch=branch_obj)
+                other_receipts_qs = other_receipts_qs.filter(branch=branch_obj)
 
-            total_inflows = sum((quantize_money(s.total_amount) for s in sales_qs), ZERO) + sum((quantize_money(r.amount) for r in repayments_qs), ZERO)
-            total_outflows = sum((quantize_money(e.amount) for e in expenses_qs), ZERO)
+            entries = []
+            tot_in = ZERO
+
+            for s in sales_qs.order_by('-sale_date')[:50]:
+                amt = quantize_money(s.total_amount or ZERO)
+                tot_in += amt
+                local_sale_dt = timezone.localtime(s.sale_date) if timezone.is_aware(s.sale_date) else s.sale_date
+                entries.append({
+                    "id": f"SALE-{s.id}",
+                    "reference": s.receipt_number or f"REC-{s.id}",
+                    "date": local_sale_dt.strftime('%Y-%m-%d %H:%M'),
+                    "description": f"Sale ({s.customer_name or 'Walk-in'})",
+                    "payment_method": s.payment_method,
+                    "inflow": float(amt),
+                    "outflow": 0.0,
+                    "amount": float(amt),
+                    "type": "INFLOW",
+                })
+
+            for r in repayments_qs.order_by('-date')[:50]:
+                amt = quantize_money(r.amount or ZERO)
+                tot_in += amt
+                cust_name = r.customer.name if r.customer else "Customer"
+                entries.append({
+                    "id": f"REPAY-{r.id}",
+                    "reference": r.reference_code or f"REPAY-{r.id}",
+                    "date": r.date.strftime('%Y-%m-%d'),
+                    "description": f"Credit Repayment - {cust_name}",
+                    "payment_method": r.payment_method,
+                    "inflow": float(amt),
+                    "outflow": 0.0,
+                    "amount": float(amt),
+                    "type": "INFLOW",
+                })
+
+            for o in other_receipts_qs.order_by('-date', '-created_at')[:50]:
+                amt = quantize_money(o.amount or ZERO)
+                tot_in += amt
+                entries.append({
+                    "id": f"OTHER-{o.id}",
+                    "reference": f"RCPT-{o.id}",
+                    "date": o.date.strftime('%Y-%m-%d'),
+                    "description": f"Other Income - {o.description}",
+                    "payment_method": o.payment_method,
+                    "inflow": float(amt),
+                    "outflow": 0.0,
+                    "amount": float(amt),
+                    "type": "INFLOW",
+                })
+
+            entries.sort(key=lambda x: x["date"], reverse=True)
+            tot_in_float = float(quantize_money(tot_in))
 
             return Response({
-                "total_cash_inflows": float(total_inflows),
-                "total_cash_outflows": float(total_outflows),
-                "net_cash_flow": float(total_inflows - total_outflows),
                 "summary": {
-                    "total_cash_inflows": float(total_inflows),
-                    "total_cash_outflows": float(total_outflows),
-                    "net_cash_flow": float(total_inflows - total_outflows),
-                }
+                    "total_inflow": tot_in_float,
+                    "total_outflow": 0.0,
+                    "net_cash_flow": tot_in_float,
+                },
+                "count": len(entries),
+                "results": entries,
+                "entries": entries,
             }, status=status.HTTP_200_OK)
         except Exception:
-            return Response({"total_cash_inflows": 0.0, "total_cash_outflows": 0.0, "net_cash_flow": 0.0}, status=status.HTTP_200_OK)
+            return Response(
+                {
+                    "summary": {"total_inflow": 0.0, "total_outflow": 0.0, "net_cash_flow": 0.0},
+                    "entries": [],
+                },
+                status=status.HTTP_200_OK,
+            )
 
     @action(detail=False, methods=['get'], url_path='cash-inflows')
     def cash_inflows(self, request):
@@ -10159,12 +10230,15 @@ class ManagementReportsViewSet(viewsets.ViewSet):
 
             sales_qs = SaleTransaction.objects.filter(sale_date__range=(start_dt, end_dt)).prefetch_related("split_payments")
             all_repay_qs = CreditRepayment.objects.all()
+            other_receipts_qs = OtherReceipt.objects.filter(date__range=(clean_start, clean_end))
+
             if branch_obj:
                 sales_qs = sales_qs.filter(branch=branch_obj)
                 all_repay_qs = all_repay_qs.filter(
                     Q(branch=branch_obj)
                     | (Q(branch__isnull=True) & Q(transaction__branch=branch_obj))
                 )
+                other_receipts_qs = other_receipts_qs.filter(branch=branch_obj)
 
             dedup_repay_ids = list(all_repay_qs.values_list("id", flat=True).distinct())
             dedup_repay_qs = CreditRepayment.objects.filter(id__in=dedup_repay_ids)
@@ -10223,6 +10297,9 @@ class ManagementReportsViewSet(viewsets.ViewSet):
                         route_to_channel(get_sp_method(sp), sp.amount)
                 else:
                     route_to_channel(rep_method, rep.amount)
+
+            for oth in other_receipts_qs:
+                route_to_channel(oth.payment_method, oth.amount)
 
             # 2. Outflows from _cash_period_data
             period = _cash_period_data(branch_obj, clean_start, clean_end)

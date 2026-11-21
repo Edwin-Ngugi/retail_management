@@ -39,6 +39,7 @@ from .models import (
     StockTransfer,
     Supplier,
     SupplierPayment,
+    OtherReceipt,
     SupplierReturn,
     recalculate_wac_sales_cost,
 )
@@ -874,6 +875,22 @@ class SaleTransactionAdmin(TenantAwareModelAdmin):
     def delete_queryset(self, request, queryset):
         self.delete_sales_safely(request, queryset)
 
+@admin.register(OtherReceipt)
+class OtherReceiptAdmin(admin.ModelAdmin):
+    list_display = (
+        "date",
+        "description",
+        "branch",
+        "payment_method",
+        "amount",
+        "created_by",
+        "created_at",
+    )
+    list_filter = ("branch", "payment_method", "date")
+    search_fields = ("description", "branch__name", "created_by__username")
+    date_hierarchy = "date"
+    ordering = ("-date", "-created_at")
+    readonly_fields = ("created_at",)
 
 @admin.register(Sale)
 class SaleAdmin(TenantAwareModelAdmin):
