@@ -94,6 +94,7 @@ from stocks.models import (
     SupplierReturn,
     SupplierPayment,
     PasswordResetOTP,
+    OtherReceipt,
 
     recalculate_wac_sales_cost,
 )
@@ -108,6 +109,7 @@ from .serializers import (
     StockMovementSerializer,
     UserRegistrationSerializer,
     UserSerializer,
+    OtherReceiptSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -3811,6 +3813,26 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+class OtherReceiptViewSet(viewsets.ModelViewSet):
+    serializer_class = OtherReceiptSerializer
+    permission_classes = [permissions.AllowAny]
+
+    def get_queryset(self):
+        qs = OtherReceipt.objects.select_related("branch").all()
+        branch_param = (
+            self.request.query_params.get("branch")
+            or self.request.query_params.get("branch_id")
+        )
+        if branch_param and str(branch_param).strip().lower() not in ("all", "null", "undefined", ""):
+            if str(branch_param).isdigit():
+                qs = qs.filter(branch_id=int(branch_param))
+            else:
+                qs = qs.filter(branch__name__iexact=str(branch_param).strip())
+        return qs.order_by("-date", "-created_at")
+
+    def perform_create(self, serializer):
+        user = self.request.user if getattr(self.request, "user", None) and self.request.user.is_authenticated else None
+        serializer.save(created_by=user)
 
 from apis.serializers import PendingApprovalSerializer, RejectionReasonSerializer
 from apis.emails import send_management_review_email, send_submitter_status_email

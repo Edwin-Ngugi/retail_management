@@ -2862,6 +2862,64 @@ class Expense(models.Model):
         branch_name = self.branch.name if self.branch else "General"
         return f"{self.description} - KSh {self.amount} ({branch_name})"
 
+class OtherReceipt(models.Model):
+    class PaymentMethod(models.TextChoices):
+        CASH = "CASH", "Cash"
+        MPESA = "MPESA", "M-Pesa"
+        PAYBILL = "PAYBILL", "Paybill"
+        SEND_MONEY = "SEND_MONEY", "Send Money"
+        BANK_TRANSFER = "BANK_TRANSFER", "Bank Transfer"
+
+    retailer = models.ForeignKey(
+        Retailer,
+        on_delete=models.CASCADE,
+        related_name="other_receipts",
+        null=True,
+        blank=True,
+    )
+    branch = models.ForeignKey(
+        RetailBranch,
+        on_delete=models.CASCADE,
+        related_name="other_receipts",
+        null=True,
+        blank=True,
+    )
+    date = models.DateField(default=date.today)
+    description = models.CharField(max_length=255)
+    payment_method = models.CharField(
+        max_length=30,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.CASH,
+    )
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="other_receipts_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date", "-created_at"]
+
+    def save(self, *args, **kwargs):
+        if isinstance(self.date, datetime):
+            self.date = self.date.date()
+        if not self.retailer_id and self.branch and self.branch.retailer_id:
+            self.retailer = self.branch.retailer
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        branch_name = self.branch.name if self.branch else "General"
+        return f"{self.description} - KSh {self.amount} ({branch_name})"
+
 
 class PendingApproval(models.Model):
     class RequestType(models.TextChoices):

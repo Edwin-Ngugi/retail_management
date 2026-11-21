@@ -33,6 +33,7 @@ from stocks.models import (
     SaleTransaction,
     StockBatch,
     StockMovement,
+    OtherReceipt,
     StockTransfer,
     Supplier,
     SupplierReturn,
@@ -1647,6 +1648,24 @@ class ExpenseSerializer(serializers.ModelSerializer):
         except IntegrityError as e:
             raise _integrity_error(e)
 
+class OtherReceiptSerializer(serializers.ModelSerializer):
+    branch_name = serializers.CharField(source="branch.name", read_only=True)
+
+    class Meta:
+        model = OtherReceipt
+        fields = [
+            "id",
+            "retailer",
+            "branch",
+            "branch_name",
+            "date",
+            "description",
+            "payment_method",
+            "amount",
+            "created_by",
+            "created_at",
+        ]
+        read_only_fields = ["id", "retailer", "created_by", "created_at"]
 
 class StockTransferSerializer(serializers.ModelSerializer):
     from_branch_detail = RetailBranchSerializer(source="from_branch", read_only=True)
