@@ -29,6 +29,7 @@ from .views import (
     ManagementReportsViewSet,
     RequestOTPView,
     VerifyOTPAndResetPassword,
+    OtherReceiptViewSet,
     AdminAuthViewSet,
     DetailedSalesAnalysisViewSet,
     PurchaseAnalyticsViewSet,
@@ -53,6 +54,7 @@ router.register(r'sales', SaleTransactionViewSet, basename='sale')
 router.register(r'credit-sales', CreditRepaymentViewSet, basename='credit-sale')
 router.register(r'credit-repayments', CreditRepaymentViewSet, basename='credit-repayment')
 router.register(r'sales-analysis-detailed', DetailedSalesAnalysisViewSet, basename='sales-analysis-detailed')
+router.register(r"other-receipts", OtherReceiptViewSet, basename="other-receipts")
 
 # Business operations
 router.register(r'expenses', ExpenseViewSet, basename='expenses')
