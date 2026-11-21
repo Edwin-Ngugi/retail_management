@@ -398,21 +398,9 @@ class RetailBranchSerializer(serializers.ModelSerializer):
         read_only_fields = ["retailer"]
 
     def create(self, validated_data):
-        user = _get_request_user(self)
-        if not user:
-            request = self.context.get("request")
-            if request and hasattr(request, "user") and request.user.is_authenticated:
-                user = request.user
-        if not user:
-            user = User.objects.filter(is_superuser=True).first() or User.objects.first()
-
-        if not user:
-            raise serializers.ValidationError(
-                {"retailer": "A valid retailer user is required to create a branch."}
-            )
-
-        if "retailer" not in validated_data:
-            validated_data["retailer"] = user
+        # RetailBranch.save() automatically creates or links the Retailer instance
+        # based on branch name when retailer is omitted.
+        validated_data.pop("retailer", None)
 
         try:
             return super().create(validated_data)
